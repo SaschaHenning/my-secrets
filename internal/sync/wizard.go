@@ -267,7 +267,11 @@ func configureRepo(ctx context.Context, out io.Writer, opts WizardOptions, cfg *
 	// setup. Quiet failure — the user can still run `gh auth setup-git`
 	// by hand if this step is unavailable for some reason.
 	if style == RemoteHTTPS {
-		if _, err := opts.Runner.Run(ctx, "gh", "auth", "setup-git"); err == nil {
+		r := opts.Runner
+		if r == nil {
+			r = ExecRunner{}
+		}
+		if _, err := r.Run(ctx, "gh", "auth", "setup-git"); err == nil {
 			fmt.Fprintln(out, "Git-Credential-Helper via `gh auth setup-git` gesetzt (HTTPS-Pushes gehen jetzt mit dem gh-Token).")
 		}
 	}
