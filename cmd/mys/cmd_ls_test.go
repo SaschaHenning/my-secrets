@@ -76,7 +76,6 @@ func TestRunLs_StaleFilter(t *testing.T) {
 	if strings.Contains(out, "zuhause/router") {
 		t.Errorf("no-policy entry leaked into --stale output:\n%s", out)
 	}
-	// Enriched format includes age + rotate_after.
 	if !strings.Contains(out, "rotate_after=90d") {
 		t.Errorf("--stale output missing rotate_after= suffix:\n%s", out)
 	}
@@ -118,11 +117,6 @@ func TestRunLs_RotatingInFilter(t *testing.T) {
 }
 
 func TestRunLs_StaleAndRotatingInCombined(t *testing.T) {
-	// Combining both filters is AND: an entry must be stale and due
-	// within the window. A stale entry is always "due within" any
-	// positive window (DueWithin treats past-due as in-window), so the
-	// combined filter collapses to --stale; but we still must not
-	// emit entries that are fresh + merely soon.
 	now := time.Date(2026, 4, 20, 12, 0, 0, 0, time.UTC)
 	stale := &store.Entry{
 		Path: "jasp/stale", Password: "p",
@@ -169,5 +163,78 @@ func TestRunLs_NoFiltersListsAll(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in output:\n%s", want, out)
 		}
+	}
+}
+
+func TestMatchesFields_ExactAND(t *testing.T) {
+	entry := map[string]string{
+		"account_id": "12345",
+		"region":     "eu-central-1",
+		"tenant":     "acme",
+	}
+	cases := []struct {
+		name    string
+		filters map[string]string
+		want    bool
+	}{
+		{"single match", map[string]string{"region": "eu-central-1"}, true},
+		{"case-insensitive value", map[string]string{"region": "EU-Central-1"}, true},
+		{"multi AND match", map[string]string{"region": "eu-central-1", "tenant": "acme"}, true},
+		{"one mismatch fails all", map[string]string{"region": "eu-central-1", "tenant": "other"}, false},
+		{"missing key fails", map[string]string{"nope": "x"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := matchesFields(entry, tc.filters)
+			if got != tc.want {
+				t.Errorf("matchesFields = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Review finding I3: --field region= must be a presence check that
+// matches any non-empty value, not a literal empty-string comparison.
+func TestMatchesFields_EmptyValueIsPresenceCheck(t *testing.T) {
+	withRegion := map[string]string{"region": "eu-central-1"}
+	emptyRegion := map[string]string{"region": ""}
+	noRegion := map[string]string{"other": "x"}
+
+	filters := map[string]string{"region": ""}
+
+	if !matchesFields(withRegion, filters) {
+		t.Error("empty filter value should match any non-empty value")
+	}
+	if matchesFields(emptyRegion, filters) {
+		t.Error("empty filter value must not match an entry whose field is also empty")
+	}
+	if matchesFields(noRegion, filters) {
+		t.Error("empty filter value must not match an entry missing the key entirely")
+	}
+}
+
+func TestHasTag(t *testing.T) {
+	tags := []string{"infra", "ci"}
+	if !hasTag(tags, "infra") {
+		t.Error("expected hit for infra")
+	}
+	if hasTag(tags, "INFRA") {
+		t.Error("tag match must be case-sensitive to match existing behaviour")
+	}
+	if hasTag(nil, "x") {
+		t.Error("nil tag list must not match")
+	}
+}
+
+// Integration-ish: exercise the matching helpers against an Entry-like
+// seed that mirrors what cmd_ls would filter over.
+func TestDomainSubdomainMatchViaMatchDomain(t *testing.T) {
+	tier, _, ok := store.MatchDomain("amazon.com", "aws.amazon.com")
+	if !ok || tier != store.TierSubdomain {
+		t.Errorf("amazon.com vs aws.amazon.com: tier=%q ok=%v, want subdomain/true", tier, ok)
+	}
+	_, _, ok = store.MatchDomain("amazon.com", "jasp.eu")
+	if ok {
+		t.Error("amazon.com vs jasp.eu must not match")
 	}
 }

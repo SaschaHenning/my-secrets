@@ -119,6 +119,9 @@ func (s *Store) Search(_ context.Context, query string, allow func(path string) 
 
 // entryMatches returns true if the query substring appears in the path or any
 // metadata field. Password VALUES are intentionally excluded from matching.
+// Fields keyed on a name containing "password" or "secret" are matched by
+// key-name only — never by value — matching the rule the real store applies
+// through secretMatches/isSecretLikeKey.
 func entryMatches(path string, e *store.Entry, q string) bool {
 	if strings.Contains(strings.ToLower(path), q) {
 		return true
@@ -126,17 +129,41 @@ func entryMatches(path string, e *store.Entry, q string) bool {
 	if e == nil {
 		return false
 	}
-	fields := []string{
+	plain := []string{
 		e.Username, e.URL, e.Kind, e.GitHubProject, e.Notes,
 		e.TOTPIssuer, e.TOTPLabel,
 	}
-	for _, f := range fields {
+	for _, f := range plain {
 		if f != "" && strings.Contains(strings.ToLower(f), q) {
+			return true
+		}
+	}
+	if e.Domain != "" {
+		// Raw substring match on the stored domain (case-insensitive) plus
+		// normalised-form match so queries like "amazon.com/" still hit an
+		// entry stored as "aws.amazon.com".
+		if strings.Contains(strings.ToLower(e.Domain), q) {
+			return true
+		}
+		if n := store.NormalizeDomain(e.Domain); n != "" && strings.Contains(strings.ToLower(n), q) {
 			return true
 		}
 	}
 	for _, t := range e.Tags {
 		if strings.Contains(strings.ToLower(t), q) {
+			return true
+		}
+	}
+	// Fields: key-name is always searchable, value only for non-secret keys.
+	for k, v := range e.Fields {
+		lk := strings.ToLower(k)
+		if strings.Contains(lk, q) {
+			return true
+		}
+		if strings.Contains(lk, "password") || strings.Contains(lk, "secret") {
+			continue
+		}
+		if v != "" && strings.Contains(strings.ToLower(v), q) {
 			return true
 		}
 	}
@@ -231,6 +258,12 @@ func cloneEntry(e *store.Entry) *store.Entry {
 	c := *e // copies RotateAfter (string) and RotatedAt (time.Time) by value.
 	if len(e.Tags) > 0 {
 		c.Tags = append([]string(nil), e.Tags...)
+	}
+	if len(e.Fields) > 0 {
+		c.Fields = make(map[string]string, len(e.Fields))
+		for k, v := range e.Fields {
+			c.Fields[k] = v
+		}
 	}
 	return &c
 }

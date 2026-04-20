@@ -164,6 +164,38 @@ so dass wiederholte Aufrufe im selben 30-s-Fenster erkennbar bleiben.
 Die Scope-Policy greift identisch zu `mys get`: AI-Aufrufer kommen nicht
 an `private/**`.
 
+## Domains und strukturierte Felder
+
+Jeder Eintrag kann jenseits von `username` / `password` eine **Domain** und
+eine Map von **Custom Fields** tragen. Die Domain wird aus `--url` automatisch
+abgeleitet, wenn sie nicht explizit gesetzt ist; Felder haben frei wählbare
+Keys, die dem Schema `^[a-z][a-z0-9_]{0,30}$` folgen müssen. Das Domain-
+Matching kennt vier Tiers — exact, subdomain, substring und Levenshtein-
+Fuzzy — damit auch Tippfehler und Teil-URLs den richtigen Eintrag finden.
+
+```bash
+# Speichern mit Domain + zwei strukturierten Feldern
+mys add jasp/aws --domain aws.amazon.com \
+  --field account_id=123 --field region=eu-central-1
+
+# Subdomain-Treffer
+mys ls --domain amazon.com             # findet alle Amazon-Einträge
+
+# Fuzzy-Vorschlag bei Typo
+mys ls --domain jazp.eu --similar      # schlägt jasp.eu als Typo-Korrektur vor
+
+# Feld-Filter
+mys ls --field region=eu-central-1     # AND-Filter über Fields-Map
+
+# Einzelnes Custom-Feld lesen
+mys get jasp/aws --field account_id    # druckt "123"
+```
+
+Für KI-Caller liefert der MCP-Server zusätzlich ein `similar[]`-Array mit
+`tier` und `hint`, sobald `creds_search` keine direkten Treffer hat oder
+`include_similar` explizit gesetzt ist — Passwörter tauchen darin niemals
+auf, sondern nur Pfad, Tier und Begründung.
+
 ## Checking your setup: `mys doctor`
 
 Ein einzelner Befehl, der elf Checks durchläuft und beantwortet: „Ist

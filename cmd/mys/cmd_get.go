@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
@@ -40,7 +41,7 @@ func getCmd(requester *string) *cobra.Command {
 			return printEntry(cmd.OutOrStdout(), e, field, reveal, format)
 		},
 	}
-	c.Flags().StringVar(&field, "field", "", "print only one field: password | username | url | notes")
+	c.Flags().StringVar(&field, "field", "", "print only one field: password | username | url | notes | <custom>")
 	c.Flags().BoolVar(&reveal, "reveal", false, "reveal password in output (default: masked)")
 	c.Flags().StringVar(&format, "format", "text", "output format: text | json | env")
 	return c
@@ -55,9 +56,11 @@ func printEntry(w io.Writer, e *store.Entry, field string, reveal bool, format s
 			"kind":           e.Kind,
 			"username":       e.Username,
 			"url":            e.URL,
+			"domain":         e.Domain,
 			"github_project": e.GitHubProject,
 			"tags":           e.Tags,
 			"notes":          e.Notes,
+			"fields":         e.Fields,
 		}
 		if reveal {
 			payload["password"] = e.Password
@@ -90,9 +93,18 @@ func printEntry(w io.Writer, e *store.Entry, field string, reveal bool, format s
 			fmt.Fprintln(w, e.Username)
 		case "url":
 			fmt.Fprintln(w, e.URL)
+		case "domain":
+			fmt.Fprintln(w, e.Domain)
 		case "notes":
 			fmt.Fprintln(w, e.Notes)
 		default:
+			// Fall back to the custom Fields map so `--field account_id`
+			// prints the matching value. An unknown key (not a well-known
+			// one and not in Fields) is a real user error — surface it.
+			if v, ok := e.Fields[field]; ok {
+				fmt.Fprintln(w, v)
+				return nil
+			}
 			return fmt.Errorf("unknown field %q", field)
 		}
 		return nil
@@ -102,6 +114,9 @@ func printEntry(w io.Writer, e *store.Entry, field string, reveal bool, format s
 	fmt.Fprintf(w, "kind:     %s\n", e.Kind)
 	fmt.Fprintf(w, "username: %s\n", e.Username)
 	fmt.Fprintf(w, "url:      %s\n", e.URL)
+	if e.Domain != "" {
+		fmt.Fprintf(w, "domain:   %s\n", e.Domain)
+	}
 	if e.GitHubProject != "" {
 		fmt.Fprintf(w, "github:   %s\n", e.GitHubProject)
 	}
@@ -110,6 +125,25 @@ func printEntry(w io.Writer, e *store.Entry, field string, reveal bool, format s
 	}
 	if e.Notes != "" {
 		fmt.Fprintf(w, "notes:    %s\n", e.Notes)
+	}
+	if e.Domain != "" {
+		fmt.Fprintf(w, "domain:   %s\n", e.Domain)
+	}
+	if len(e.Fields) > 0 {
+		// Sorted for stable output across rewrites.
+		keys := make([]string, 0, len(e.Fields))
+		maxLen := 0
+		for k := range e.Fields {
+			keys = append(keys, k)
+			if len(k) > maxLen {
+				maxLen = len(k)
+			}
+		}
+		sort.Strings(keys)
+		fmt.Fprintln(w, "fields:")
+		for _, k := range keys {
+			fmt.Fprintf(w, "  %-*s  %s\n", maxLen, k, e.Fields[k])
+		}
 	}
 	if e.Kind == store.KindTOTP {
 		// TOTP metadata: the password field holds the base32 seed; show it

@@ -906,7 +906,6 @@ func totpEntry(path string) *store.Entry {
 func TestGenerateTOTP_OK(t *testing.T) {
 	a, _ := appWithFake(t, "human", totpEntry("jasp/github"))
 	ctx := context.Background()
-	// Frozen time inside a deterministic window.
 	now := time.Unix(1700000000, 0)
 	code, secondsLeft, err := a.GenerateTOTP(ctx, "jasp/github", now)
 	if err != nil {
@@ -936,7 +935,6 @@ func TestGenerateTOTP_OK(t *testing.T) {
 	if rows[0].SecretPath != "jasp/github" {
 		t.Errorf("secret_path = %q", rows[0].SecretPath)
 	}
-	// Determinism — same `now` produces same code.
 	code2, _, err := a.GenerateTOTP(ctx, "jasp/github", now)
 	if err != nil {
 		t.Fatal(err)
@@ -947,7 +945,6 @@ func TestGenerateTOTP_OK(t *testing.T) {
 }
 
 func TestGenerateTOTP_Denied(t *testing.T) {
-	// AI caller must be denied for private/** TOTP paths.
 	a, _ := appWithFake(t, "claude-code", totpEntry("private/bank-2fa"))
 	ctx := context.Background()
 	_, _, err := a.GenerateTOTP(ctx, "private/bank-2fa", time.Unix(1700000000, 0))
@@ -965,7 +962,6 @@ func TestGenerateTOTP_Denied(t *testing.T) {
 }
 
 func TestGenerateTOTP_NotTOTP(t *testing.T) {
-	// A regular password entry must not be treated as a TOTP seed.
 	a, _ := appWithFake(t, "human", &store.Entry{
 		Path: "jasp/not-totp", Kind: store.KindPassword, Password: "plain-pw",
 	})
@@ -993,6 +989,165 @@ func TestGenerateTOTP_StoreError(t *testing.T) {
 	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionTOTPGenerate, Limit: 5})
 	if len(rows) != 1 || rows[0].Result != audit.ResultError {
 		t.Fatalf("want error row, got %+v", rows)
+	}
+}
+
+// --- Domain search ---------------------------------------------------------
+
+// domainSeed returns entries covering each tier MatchDomain classifies on.
+func domainSeed() []*store.Entry {
+	return []*store.Entry{
+		{Path: "jasp/aws", Domain: "aws.amazon.com", Password: "p1"},
+		{Path: "jasp/site", Domain: "jasp.eu", Password: "p2"},
+		{Path: "jasp/mail", Domain: "mail.jasp.eu", Password: "p3"},
+		{Path: "jasp/github", Domain: "github.com", Password: "p4"},
+	}
+}
+
+func TestSearchByDomain_Exact(t *testing.T) {
+	a, _ := appWithFake(t, "human", domainSeed()...)
+	ctx := context.Background()
+	matches, sim, err := a.SearchByDomain(ctx, "jasp.eu", false)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 matches (jasp.eu exact + mail.jasp.eu subdomain), got %d: %+v", len(matches), matches)
+	}
+	paths := map[string]string{}
+	for _, m := range matches {
+		paths[m.Entry.Path] = m.Tier
+	}
+	if paths["jasp/site"] != store.TierExact {
+		t.Errorf("jasp/site tier = %q, want exact", paths["jasp/site"])
+	}
+	if paths["jasp/mail"] != store.TierSubdomain {
+		t.Errorf("jasp/mail tier = %q, want subdomain", paths["jasp/mail"])
+	}
+	if len(sim) != 0 {
+		t.Errorf("expected no similar when includeSimilar=false, got %+v", sim)
+	}
+}
+
+func TestSearchByDomain_FuzzyTypo(t *testing.T) {
+	a, _ := appWithFake(t, "human", domainSeed()...)
+	ctx := context.Background()
+	matches, sim, err := a.SearchByDomain(ctx, "jazp.eu", true)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("expected no direct matches for typo, got %+v", matches)
+	}
+	var foundFuzzy bool
+	for _, m := range sim {
+		if m.Entry.Path == "jasp/site" && m.Tier == store.TierFuzzy {
+			foundFuzzy = true
+			if !strings.Contains(m.Hint, "typo") {
+				t.Errorf("fuzzy hint missing 'typo': %q", m.Hint)
+			}
+		}
+	}
+	if !foundFuzzy {
+		t.Errorf("expected fuzzy match for jasp.eu, got similar=%+v", sim)
+	}
+}
+
+func TestSearchByDomain_SubstringOnly(t *testing.T) {
+	a, _ := appWithFake(t, "human", domainSeed()...)
+	ctx := context.Background()
+	matches, sim, err := a.SearchByDomain(ctx, "amazon", true)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("expected no exact/subdomain matches for 'amazon', got %+v", matches)
+	}
+	var foundSub bool
+	for _, m := range sim {
+		if m.Entry.Path == "jasp/aws" && m.Tier == store.TierSubstring {
+			foundSub = true
+		}
+	}
+	if !foundSub {
+		t.Errorf("expected substring match for aws.amazon.com, got similar=%+v", sim)
+	}
+}
+
+func TestSearchByDomain_ExactWithSimilar(t *testing.T) {
+	a, _ := appWithFake(t, "human", domainSeed()...)
+	ctx := context.Background()
+	matches, sim, err := a.SearchByDomain(ctx, "jasp.eu", true)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	// matches contain jasp.eu exact + mail.jasp.eu subdomain
+	if len(matches) != 2 {
+		t.Fatalf("matches = %+v", matches)
+	}
+	// similar should be empty — every match was covered by primary tiers.
+	for _, m := range sim {
+		if m.Entry.Path == "jasp/site" || m.Entry.Path == "jasp/mail" {
+			t.Errorf("primary-tier match leaked into similar: %+v", m)
+		}
+	}
+}
+
+func TestSearchByDomain_EmptyQuery(t *testing.T) {
+	a, _ := appWithFake(t, "human", domainSeed()...)
+	matches, sim, err := a.SearchByDomain(context.Background(), "   ", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 || len(sim) != 0 {
+		t.Errorf("empty query must return empty slices, got %+v / %+v", matches, sim)
+	}
+}
+
+func TestSearchByDomain_AuditReason(t *testing.T) {
+	a, _ := appWithFake(t, "human", domainSeed()...)
+	ctx := context.Background()
+	_, _, err := a.SearchByDomain(ctx, "jasp.eu", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSearch, Limit: 10})
+	var found bool
+	for _, r := range rows {
+		if strings.Contains(r.Reason, "domain=\"jasp.eu\"") && strings.Contains(r.Reason, "exact=1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected domain audit row with tier breakdown, got %+v", rows)
+	}
+}
+
+func TestAdd_AutoDerivesDomainFromURL(t *testing.T) {
+	a, f := appWithFake(t, "human")
+	ctx := context.Background()
+	e := &store.Entry{Path: "jasp/new", URL: "https://aws.amazon.com:443/console", Password: "p"}
+	if err := a.Add(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := f.Get(ctx, "jasp/new")
+	if got.Domain != "aws.amazon.com" {
+		t.Errorf("domain was not auto-derived: %q", got.Domain)
+	}
+}
+
+func TestAdd_DoesNotOverwriteExplicitDomain(t *testing.T) {
+	a, f := appWithFake(t, "human")
+	ctx := context.Background()
+	e := &store.Entry{
+		Path: "jasp/new", URL: "https://aws.amazon.com", Domain: "override.example.com", Password: "p",
+	}
+	if err := a.Add(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := f.Get(ctx, "jasp/new")
+	if got.Domain != "override.example.com" {
+		t.Errorf("explicit domain was overwritten: %q", got.Domain)
 	}
 }
 

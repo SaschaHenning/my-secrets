@@ -183,6 +183,52 @@ func TestEntryFromSecret_TOTPFieldsMissing(t *testing.T) {
 	}
 }
 
+func TestEntryFromSecret_DomainAndFields(t *testing.T) {
+	sec := buildSecret("p1", map[string]string{
+		"username":         "alice",
+		"domain":           "aws.amazon.com",
+		"field.account_id": "123456",
+		"field.region":     "eu-central-1",
+		"field.api_secret": "do-not-leak",
+	})
+	e := entryFromSecret("jasp/aws", sec)
+	if e.Domain != "aws.amazon.com" {
+		t.Errorf("domain = %q, want aws.amazon.com", e.Domain)
+	}
+	if len(e.Fields) != 3 {
+		t.Fatalf("fields = %+v", e.Fields)
+	}
+	if e.Fields["account_id"] != "123456" {
+		t.Errorf("account_id = %q", e.Fields["account_id"])
+	}
+	if e.Fields["region"] != "eu-central-1" {
+		t.Errorf("region = %q", e.Fields["region"])
+	}
+	if e.Fields["api_secret"] != "do-not-leak" {
+		t.Errorf("api_secret value must be preserved on read: %q", e.Fields["api_secret"])
+	}
+}
+
+func TestSecretMatches_SecretLikeFieldValueHidden(t *testing.T) {
+	sec := buildSecret("shh", map[string]string{
+		"username":         "alice",
+		"field.account_id": "12345",
+		"field.api_secret": "leaky-value",
+	})
+	// The account_id VALUE is searchable.
+	if !secretMatches(sec, "12345") {
+		t.Error("account_id value should match")
+	}
+	// The api_secret VALUE must NOT be searchable.
+	if secretMatches(sec, "leaky-value") {
+		t.Error("api_secret value leaked through search")
+	}
+	// The api_secret KEY still matches.
+	if !secretMatches(sec, "api_secret") {
+		t.Error("api_secret key name should match")
+	}
+}
+
 // Close on a nil Store must not panic.
 func TestStore_Close_Nil(t *testing.T) {
 	var s *Store

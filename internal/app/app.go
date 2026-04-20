@@ -269,6 +269,12 @@ func (a *App) Add(ctx context.Context, e *store.Entry) error {
 		return &ErrDenied{Path: e.Path, Reason: decision.Reason}
 	}
 	e.RotatedAt = time.Now().UTC()
+	// Auto-derive Domain from URL if the caller did not set it explicitly.
+	// Keeps the happy-path "echo pw | mys add --url https://…" flow working
+	// without forcing every caller to pass --domain.
+	if e.Domain == "" && e.URL != "" {
+		e.Domain = store.DeriveDomain(e.URL)
+	}
 	if err := a.Store.Set(ctx, e); err != nil {
 		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultError, err.Error())
 		return err
@@ -370,6 +376,90 @@ func (a *App) stderr() io.Writer {
 		return a.Stderr
 	}
 	return os.Stderr
+}
+
+// DomainMatch is the app-layer view of a domain search hit. It reuses
+// store.DomainMatch so CLI and MCP callers do not have to juggle two
+// parallel types, but keeps a small adapter for clarity at the call site.
+type DomainMatch = store.DomainMatch
+
+// SearchByDomain walks every entry visible to the caller, classifies it
+// against the query with store.MatchDomain, and returns two ordered
+// slices:
+//
+//   - matches  — tier exact or subdomain. These are what the user "almost
+//     certainly" wanted.
+//   - similar  — tier substring or fuzzy. These are candidates the caller
+//     can suggest to the user or to an AI, with tier + hint so
+//     the consumer can render an explanation.
+//
+// When includeSimilar is false the similar slice is nil to save work on
+// large stores. Policy filtering happens at the List() step — denied
+// paths never enter either slice. A single audit row records the search
+// with a tier breakdown in the reason; no per-path rows are written for
+// this read-only metadata walk (each Get() inside would produce its own
+// row, which would spam the log on big stores).
+func (a *App) SearchByDomain(ctx context.Context, query string, includeSimilar bool) (matches []DomainMatch, similar []DomainMatch, err error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, nil, nil
+	}
+	d := caller.Identify(a.Override)
+	paths, err := a.Store.List(ctx, "")
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionSearch, "", d, audit.ResultError, err.Error())
+		return nil, nil, err
+	}
+	matches = make([]DomainMatch, 0)
+	similar = make([]DomainMatch, 0)
+	var exact, subdomain, substring, fuzzy int
+	for _, p := range paths {
+		// Policy pre-filter. Denied paths are silently skipped — the
+		// aggregate audit row at the end still records the search, and
+		// a denied caller never sees which paths exist.
+		if !a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p).Allowed {
+			continue
+		}
+		e, gerr := a.Store.Get(ctx, p)
+		if gerr != nil {
+			continue
+		}
+		tier, hint, ok := store.MatchDomain(query, e.Domain)
+		if !ok {
+			continue
+		}
+		m := DomainMatch{Entry: e, Tier: tier, Hint: hint}
+		switch tier {
+		case store.TierExact:
+			exact++
+			matches = append(matches, m)
+		case store.TierSubdomain:
+			subdomain++
+			matches = append(matches, m)
+		case store.TierSubstring:
+			substring++
+			if includeSimilar {
+				similar = append(similar, m)
+			}
+		case store.TierFuzzy:
+			fuzzy++
+			if includeSimilar {
+				similar = append(similar, m)
+			}
+		}
+	}
+	// Log the canonicalised form of the query rather than the raw user
+	// input. If the user typed a full URL with credentials in it, or a
+	// password by mistake, the plain-string form would otherwise end up
+	// in the append-only audit DB (review finding I7). The normalised
+	// value carries enough information for audit review.
+	logged := store.NormalizeDomain(query)
+	if logged == "" {
+		logged = fmt.Sprintf("len=%d", len(strings.TrimSpace(query)))
+	}
+	reason := fmt.Sprintf("domain=%q exact=%d subdomain=%d substring=%d fuzzy=%d similar=%t",
+		logged, exact, subdomain, substring, fuzzy, includeSimilar)
+	a.writeAudit(ctx, audit.ActionSearch, "", d, audit.ResultOK, reason)
+	return matches, similar, nil
 }
 
 // AuditInit records a one-time init event.

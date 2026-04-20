@@ -402,3 +402,93 @@ func TestSearch_MatchesTOTPIssuerAndLabel(t *testing.T) {
 		t.Errorf("TOTP seed must not be searchable, got %v", got)
 	}
 }
+
+// domainEntries returns a fixture covering the four tiers MatchDomain
+// cares about plus fields-based search cases (including a secret-named
+// key that must NOT be matched by value).
+func domainEntries() []*store.Entry {
+	return []*store.Entry{
+		{
+			Path:     "jasp/aws",
+			Domain:   "aws.amazon.com",
+			Fields:   map[string]string{"account_id": "123456", "region": "eu-central-1"},
+			Password: "p1",
+		},
+		{
+			Path:     "jasp/site",
+			Domain:   "jasp.eu",
+			Fields:   map[string]string{"tenant": "acme"},
+			Password: "p2",
+		},
+		{
+			Path:     "jasp/mail",
+			Domain:   "mail.jasp.eu",
+			Password: "p3",
+		},
+		{
+			Path:     "jasp/github",
+			Domain:   "github.com",
+			Fields:   map[string]string{"api_secret": "shhh-secret-value"},
+			Password: "p4",
+		},
+	}
+}
+
+func TestCloneEntry_CopiesFields(t *testing.T) {
+	orig := &store.Entry{
+		Path:   "a/b",
+		Domain: "example.com",
+		Fields: map[string]string{"k": "v"},
+	}
+	clone := cloneEntry(orig)
+	if clone == orig {
+		t.Fatal("clone must not be the same pointer")
+	}
+	if clone.Domain != "example.com" {
+		t.Errorf("domain not copied: %q", clone.Domain)
+	}
+	clone.Fields["k"] = "mutated"
+	if orig.Fields["k"] != "v" {
+		t.Errorf("field mutation leaked to original: %q", orig.Fields["k"])
+	}
+}
+
+func TestSearch_DomainMatch(t *testing.T) {
+	s := NewWithEntries(domainEntries()...)
+	// Substring in raw Domain field.
+	got, _, _ := s.Search(ctx(), "amazon", nil)
+	if !reflect.DeepEqual(got, []string{"jasp/aws"}) {
+		t.Errorf("domain substring search = %v, want [jasp/aws]", got)
+	}
+	// Normalised form of a URL-ish query still hits the stored bare host.
+	got, _, _ = s.Search(ctx(), "github.com", nil)
+	if len(got) != 1 || got[0] != "jasp/github" {
+		t.Errorf("domain search github.com = %v", got)
+	}
+}
+
+func TestSearch_FieldValues(t *testing.T) {
+	s := NewWithEntries(domainEntries()...)
+	// Plain field-value match.
+	got, _, _ := s.Search(ctx(), "eu-central-1", nil)
+	if !reflect.DeepEqual(got, []string{"jasp/aws"}) {
+		t.Errorf("field value search = %v, want [jasp/aws]", got)
+	}
+	// Field-key match.
+	got, _, _ = s.Search(ctx(), "account_id", nil)
+	if !reflect.DeepEqual(got, []string{"jasp/aws"}) {
+		t.Errorf("field key search = %v, want [jasp/aws]", got)
+	}
+	// Secret-named field: key hits, value does NOT.
+	got, _, _ = s.Search(ctx(), "api_secret", nil)
+	if !reflect.DeepEqual(got, []string{"jasp/github"}) {
+		t.Errorf("secret-named key search = %v, want [jasp/github]", got)
+	}
+	got, _, _ = s.Search(ctx(), "shhh-secret-value", nil)
+	// "secret" is a substring of the value, which would also normally match
+	// via the password-key fallback. But "shhh-secret-value" is not the
+	// string "password" and is a value — it must NOT match.
+	if len(got) != 0 {
+		t.Errorf("secret-named field value must not match; got %v", got)
+	}
+}
