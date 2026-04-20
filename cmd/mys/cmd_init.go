@@ -47,6 +47,10 @@ type initOptions struct {
 	// interactive mode. Cobra sets the flag via Changed().
 	installSkillExplicit bool
 
+	// Same marker for --with-sync. When the user did not pass it and
+	// we are interactive, we prompt at the end; in --yes mode we skip.
+	withSyncExplicit bool
+
 	// I/O — overrideable so tests can drive prompts without a tty.
 	In  io.Reader
 	Out io.Writer
@@ -82,6 +86,7 @@ Re-running is idempotent: no duplicate keys, no config churn.`,
 			// Cobra tracks which flags were explicitly set vs. defaulted —
 			// we need that for the „prompt for skill install?" decision.
 			opts.installSkillExplicit = cmd.Flags().Changed("install-skill")
+			opts.withSyncExplicit = cmd.Flags().Changed("with-sync")
 			if opts.Out == nil {
 				opts.Out = cmd.OutOrStdout()
 			}
@@ -430,8 +435,31 @@ func stepPinentry(ctx context.Context, opts *initOptions, _ *initState) error {
 		return nil
 	}
 	if _, err := exec.LookPath("pinentry-touchid"); err != nil {
-		fmt.Fprintln(opts.Out, "[!] pinentry-touchid not on PATH — `brew install pinentry-touchid` for Touch ID prompts")
-		return nil
+		// Missing binary. In interactive mode explain what it is and
+		// offer to install it via brew. In --yes mode just skip with a
+		// short line so the log stays quiet.
+		if opts.Yes {
+			fmt.Fprintln(opts.Out, "[!] pinentry-touchid not installed (skipped in --yes mode)")
+			return nil
+		}
+		install, err := promptInstallPinentryTouchID(opts)
+		if err != nil {
+			return err
+		}
+		if !install {
+			fmt.Fprintln(opts.Out, "[!] pinentry-touchid übersprungen — Passphrase-Prompts bleiben textbasiert.")
+			return nil
+		}
+		if err := installPinentryTouchIDViaBrew(ctx, opts); err != nil {
+			fmt.Fprintf(opts.Out, "[!] pinentry-touchid Installation fehlgeschlagen: %s\n", err.Error())
+			fmt.Fprintln(opts.Out, "    Manuell: `brew install pinentry-touchid` + Re-run von `mys init`.")
+			return nil
+		}
+		// LookPath again after install.
+		if _, err := exec.LookPath("pinentry-touchid"); err != nil {
+			fmt.Fprintln(opts.Out, "[!] pinentry-touchid nach Installation nicht auf PATH — neue Shell öffnen und `mys init` nochmal laufen lassen.")
+			return nil
+		}
 	}
 	configured, err := gpgsetup.EnsurePinentryTouchID(ctx)
 	if err != nil {
@@ -446,6 +474,57 @@ func stepPinentry(ctx context.Context, opts *initOptions, _ *initState) error {
 		fmt.Fprintf(opts.Out, "[v] pinentry-touchid already configured in %s\n", prettyPath(confPath))
 	}
 	return nil
+}
+
+// promptInstallPinentryTouchID explains what Touch-ID integration buys
+// and asks whether to run `brew install pinentry-touchid` right now.
+func promptInstallPinentryTouchID(opts *initOptions) (bool, error) {
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, "Touch-ID für GPG einrichten?")
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, "`pinentry-touchid` leitet GPG-Passphrase-Abfragen auf den")
+	fmt.Fprintln(opts.Out, "Touch-ID-Sensor deines Mac um. Statt „Passphrase tippen")
+	fmt.Fprintln(opts.Out, "im Terminal\" tippst du jede `mys get`/`mys totp`/Git-Sync-Entsperrung")
+	fmt.Fprintln(opts.Out, "mit dem Finger weg — spürbar schneller, und die Passphrase")
+	fmt.Fprintln(opts.Out, "liegt in der macOS-Keychain statt im Shell-Verlauf.")
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, "Ohne pinentry-touchid funktioniert my-secrets genauso,")
+	fmt.Fprintln(opts.Out, "nur eben mit Text-Passphrase-Prompt. Später nachrüstbar")
+	fmt.Fprintln(opts.Out, "mit `brew install pinentry-touchid` + Re-run von `mys init`.")
+	fmt.Fprintln(opts.Out, "")
+	if _, err := exec.LookPath("brew"); err != nil {
+		fmt.Fprintln(opts.Out, "`brew` ist nicht auf PATH — Installation wird hier übersprungen.")
+		fmt.Fprintln(opts.Out, "Installiere Homebrew unter https://brew.sh und re-run.")
+		return false, nil
+	}
+	br := bufio.NewReader(opts.In)
+	for {
+		fmt.Fprint(opts.Out, "Jetzt `brew install pinentry-touchid`? [j/N]: ")
+		line, err := br.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return false, err
+		}
+		choice := strings.ToLower(strings.TrimSpace(line))
+		switch choice {
+		case "", "n", "nein", "no":
+			return false, nil
+		case "j", "ja", "y", "yes":
+			return true, nil
+		}
+		fmt.Fprintln(opts.Out, "Bitte j oder n.")
+	}
+}
+
+// installPinentryTouchIDViaBrew runs `brew install pinentry-touchid`
+// with stdout/stderr piped through opts.Out so the user sees the progress.
+// Returns any non-zero exit as an error; the caller decides how to
+// surface it.
+func installPinentryTouchIDViaBrew(ctx context.Context, opts *initOptions) error {
+	fmt.Fprintln(opts.Out, "[+] Installing pinentry-touchid via brew...")
+	cmd := exec.CommandContext(ctx, "brew", "install", "pinentry-touchid")
+	cmd.Stdout = opts.Out
+	cmd.Stderr = opts.Out
+	return cmd.Run()
 }
 
 // ----- Step 4: policy + audit DB + init audit row -----
@@ -592,12 +671,23 @@ func writeSkillInstallAudit(ctx context.Context, requester, scope, dst string) {
 // ----- Step 6: optional sync setup -----
 
 func stepSync(ctx context.Context, opts *initOptions, state *initState) error {
-	if !opts.WithSync {
+	// Decision tree matches the skill-install flow exactly:
+	//   --with-sync           explicit yes, run wizard non-interactively if --yes
+	//   --with-sync=false     explicit no, skip
+	//   no flag + --yes       skip (non-interactive, no prompt)
+	//   no flag + interactive prompt the user; run wizard on „y"
+	shouldRun := opts.WithSync
+	if !opts.withSyncExplicit && !opts.Yes {
+		want, err := promptSync(opts)
+		if err != nil {
+			return err
+		}
+		shouldRun = want
+	}
+	if !shouldRun {
 		return nil
 	}
-	// Use the same wizard as `mys sync setup`, in non-interactive mode
-	// if --yes was passed. Errors here are treated as fatal: the user
-	// explicitly asked for sync.
+	// Errors from here on are fatal — the user asked for sync.
 	cfg, err := syncpkg.RunWizard(ctx, syncpkg.WizardIO{In: opts.In, Out: opts.Out},
 		syncpkg.WizardOptions{
 			NonInteractive: opts.Yes,
@@ -614,6 +704,41 @@ func stepSync(ctx context.Context, opts *initOptions, state *initState) error {
 		fmt.Fprintf(opts.Out, "[v] git sync set up → %s\n", state.SyncRepoURL)
 	}
 	return nil
+}
+
+// promptSync asks the user whether to run the sync wizard right now.
+// Output mirrors the skill-install prompt so both end-of-init questions
+// feel the same. Returns true on y/yes/ja, false on the default (n).
+func promptSync(opts *initOptions) (bool, error) {
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, "Git-Sync nach GitHub einrichten?")
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, "Der Sync spiegelt die verschlüsselten gopass-Dateien in")
+	fmt.Fprintln(opts.Out, "ein privates GitHub-Repo. Damit sind deine Secrets auf")
+	fmt.Fprintln(opts.Out, "einem zweiten Gerät wiederherstellbar, falls dieser Rechner")
+	fmt.Fprintln(opts.Out, "ausfällt. Ohne den GPG-Key bleiben die Dateien auf GitHub")
+	fmt.Fprintln(opts.Out, "nutzloser Kryptotext — nur für dich lesbar.")
+	fmt.Fprintln(opts.Out, "")
+	fmt.Fprintln(opts.Out, "Der Wizard fragt danach: ein gemeinsames Repo für alle")
+	fmt.Fprintln(opts.Out, "Orgs, oder ein eigenes Repo pro Org (jasp, zuhause, …).")
+	fmt.Fprintln(opts.Out, "Scope bleibt persönlich: für Team-Sharing gibt es Bitwarden.")
+	fmt.Fprintln(opts.Out, "")
+	br := bufio.NewReader(opts.In)
+	for {
+		fmt.Fprint(opts.Out, "Jetzt einrichten? [j/N]: ")
+		line, err := br.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return false, err
+		}
+		choice := strings.ToLower(strings.TrimSpace(line))
+		switch choice {
+		case "", "n", "nein", "no":
+			return false, nil
+		case "j", "ja", "y", "yes":
+			return true, nil
+		}
+		fmt.Fprintln(opts.Out, "Bitte j oder n.")
+	}
 }
 
 // prettyPath replaces the user's HOME prefix with ~ for a more compact
