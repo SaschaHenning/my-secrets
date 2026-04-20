@@ -90,33 +90,54 @@ func (s *Store) List(ctx context.Context, org string) ([]string, error) {
 
 // Search returns all secret paths whose path or metadata contains the query
 // (case-insensitive). An empty query matches nothing.
-func (s *Store) Search(ctx context.Context, query string) ([]string, error) {
+//
+// The allow callback, if non-nil, is consulted for every candidate path
+// BEFORE the entry is decrypted. Paths for which allow returns false are
+// never passed to gp.Get — i.e. denied secrets never enter process memory.
+// Such paths are returned in the denied slice so callers (typically the
+// app layer) can write per-path audit rows without themselves having to
+// enumerate the store.
+//
+// When allow is nil no policy filter is applied and every candidate path
+// is inspected as before; denied will then be empty.
+func (s *Store) Search(ctx context.Context, query string, allow func(path string) bool) (allowed []string, denied []string, err error) {
 	if strings.TrimSpace(query) == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	all, err := s.gp.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list for search: %w", err)
+		return nil, nil, fmt.Errorf("list for search: %w", err)
 	}
 	q := strings.ToLower(query)
-	out := make([]string, 0)
+	allowed = make([]string, 0)
+	denied = make([]string, 0)
 	for _, p := range all {
-		if strings.Contains(strings.ToLower(p), q) {
-			out = append(out, p)
+		pathMatches := strings.Contains(strings.ToLower(p), q)
+		if allow != nil && !allow(p) {
+			// Policy denies this path. Never decrypt, and never surface it
+			// in allowed even if the query matches the path literally —
+			// policy has absolute priority.
+			denied = append(denied, p)
+			continue
+		}
+		if pathMatches {
+			allowed = append(allowed, p)
 			continue
 		}
 		// Inspect metadata without decrypting? Decrypting is the only way for
-		// gopass — we accept the cost for explicit searches.
-		sec, err := s.gp.Get(ctx, p, "latest")
-		if err != nil {
+		// gopass — we accept the cost for explicit searches, but only on
+		// paths that policy has cleared.
+		sec, gerr := s.gp.Get(ctx, p, "latest")
+		if gerr != nil {
 			continue
 		}
 		if secretMatches(sec, q) {
-			out = append(out, p)
+			allowed = append(allowed, p)
 		}
 	}
-	sort.Strings(out)
-	return out, nil
+	sort.Strings(allowed)
+	sort.Strings(denied)
+	return allowed, denied, nil
 }
 
 func secretMatches(sec gopass.Secret, q string) bool {

@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/SaschaHenning/my-secrets/internal/audit"
@@ -74,6 +76,135 @@ func TestOrgPathSentinel(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("orgPath(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// fakeSearcher mimics the contract of store.Store.Search: it walks a
+// pre-defined path list, applies the allow callback BEFORE "decryption",
+// and records which paths the caller attempted to inspect. Decryption
+// itself is a no-op — the match is decided by a simple path substring
+// test, good enough to prove the filter wiring.
+type fakeSearcher struct {
+	paths     []string
+	decrypted []string // paths that were passed through the allow gate
+}
+
+func (f *fakeSearcher) Search(_ context.Context, query string, allow func(path string) bool) ([]string, []string, error) {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil, nil, nil
+	}
+	allowed := make([]string, 0)
+	denied := make([]string, 0)
+	for _, p := range f.paths {
+		if allow != nil && !allow(p) {
+			denied = append(denied, p)
+			continue
+		}
+		// simulate decryption cost only for cleared paths
+		f.decrypted = append(f.decrypted, p)
+		if strings.Contains(strings.ToLower(p), q) {
+			allowed = append(allowed, p)
+		}
+	}
+	sort.Strings(allowed)
+	sort.Strings(denied)
+	return allowed, denied, nil
+}
+
+func TestSearchPrefiltersDeniedPathsBeforeDecrypting(t *testing.T) {
+	a := appWithAuditOnly(t) // Override=claude-code, so kind=ai
+	ctx := context.Background()
+
+	fs := &fakeSearcher{paths: []string{
+		"private/secret1",
+		"jasp/foo-secret",
+		"zuhause/bar-secret",
+	}}
+
+	got, err := a.searchWith(ctx, "secret", fs)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+
+	// The AI caller must not see private paths.
+	for _, p := range got {
+		if strings.HasPrefix(p, "private/") {
+			t.Errorf("allowed slice leaked denied path %q", p)
+		}
+	}
+	wantAllowed := []string{"jasp/foo-secret", "zuhause/bar-secret"}
+	if len(got) != len(wantAllowed) {
+		t.Fatalf("allowed = %v, want %v", got, wantAllowed)
+	}
+	for i := range wantAllowed {
+		if got[i] != wantAllowed[i] {
+			t.Errorf("allowed[%d] = %q, want %q", i, got[i], wantAllowed[i])
+		}
+	}
+
+	// Prove that the private path never passed the allow gate, i.e.
+	// was never decrypted.
+	for _, p := range fs.decrypted {
+		if strings.HasPrefix(p, "private/") {
+			t.Fatalf("denied path %q was decrypted — policy prefilter bypassed", p)
+		}
+	}
+
+	// Check the per-path denied audit row exists.
+	deniedRows, err := a.Audit.Tail(ctx, audit.Filter{
+		Action: audit.ActionSearch,
+		Path:   "private/secret1",
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, r := range deniedRows {
+		if r.SecretPath == "private/secret1" && r.Result == audit.ResultDenied {
+			found = true
+			if r.Reason == "" {
+				t.Error("denied search audit row has empty reason")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected a denied search audit row for private/secret1, got %+v", deniedRows)
+	}
+
+	// The aggregate summary row should also be present.
+	summaryRows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSearch, Limit: 20})
+	var summarySeen bool
+	for _, r := range summaryRows {
+		if r.SecretPath == "" && r.Result == audit.ResultOK &&
+			strings.Contains(r.Reason, "query=\"secret\"") &&
+			strings.Contains(r.Reason, "2 of 3 visible") {
+			summarySeen = true
+			break
+		}
+	}
+	if !summarySeen {
+		t.Errorf("expected aggregate search audit row with '2 of 3 visible', got %+v", summaryRows)
+	}
+}
+
+// TestSearchNilAllowIsBackwardCompatibleAtStoreLayer documents the
+// backward-compat contract of the store-level API: a nil allow must
+// inspect every path. App.Search always supplies a non-nil allow, so
+// this test exercises the fake searcher directly.
+func TestSearchNilAllowIsBackwardCompatibleAtStoreLayer(t *testing.T) {
+	fs := &fakeSearcher{paths: []string{"private/a", "jasp/b"}}
+	allowed, denied, err := fs.Search(context.Background(), "a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(denied) != 0 {
+		t.Errorf("denied = %v, want empty with nil allow", denied)
+	}
+	if len(allowed) == 0 {
+		t.Error("allowed should not be empty with nil allow")
 	}
 }
 
