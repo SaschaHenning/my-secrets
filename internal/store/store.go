@@ -15,9 +15,27 @@ import (
 	"github.com/gopasspw/gopass/pkg/gopass/secrets"
 )
 
+// Interface defines the storage operations used by the app layer.
+// Both the real gopass-backed *Store and the in-memory fake in the
+// subpackage store/fake implement this interface, so app/mcp/web code
+// paths can be exercised in tests without a live GPG setup.
+type Interface interface {
+	Close(ctx context.Context) error
+	List(ctx context.Context, org string) ([]string, error)
+	Search(ctx context.Context, query string, allow func(path string) bool) (allowed, denied []string, err error)
+	Get(ctx context.Context, path string) (*Entry, error)
+	Set(ctx context.Context, e *Entry) error
+	Remove(ctx context.Context, path string) error
+	Rotate(ctx context.Context, path, newPassword string) error
+	Orgs(ctx context.Context) ([]string, error)
+}
+
 type Store struct {
 	gp *api.Gopass
 }
+
+// Compile-time assertion: *Store satisfies Interface.
+var _ Interface = (*Store)(nil)
 
 // Kinds classify the type of secret stored.
 const (

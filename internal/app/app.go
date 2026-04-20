@@ -19,7 +19,7 @@ import (
 
 // App wires everything together.
 type App struct {
-	Store    *store.Store
+	Store    store.Interface
 	Audit    *audit.Log
 	Policy   *policy.Policy
 	Override string // explicit --requester value for this invocation
