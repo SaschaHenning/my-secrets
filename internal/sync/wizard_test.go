@@ -126,6 +126,31 @@ func TestWizardInteractiveAbortsOnScopeDecline(t *testing.T) {
 	}
 }
 
+// TestWizardHTTPSStyle_NoRunnerPanic guards against the v0.6.1
+// regression where the HTTPS-path tried to call opts.Runner.Run on a
+// nil runner. RunWizard is a public entry point and callers (e.g.
+// `mys init`) pass WizardOptions without populating Runner.
+func TestWizardHTTPSStyle_NoRunnerPanic(t *testing.T) {
+	var out bytes.Buffer
+	input := strings.Join([]string{"j", "1", ""}, "\n") + "\n"
+	cfg, err := RunWizard(context.Background(), WizardIO{
+		In:  strings.NewReader(input),
+		Out: &out,
+	}, WizardOptions{
+		Owner:       "carol",
+		RemoteStyle: RemoteHTTPS,
+		// Runner intentionally left nil — must not panic.
+		DryRun: true,
+	})
+	if err != nil {
+		t.Fatalf("wizard: %v", err)
+	}
+	if len(cfg.Remotes) != 1 ||
+		cfg.Remotes[0].URL != "https://github.com/carol/my-secrets-store.git" {
+		t.Errorf("remote URL: %+v", cfg.Remotes)
+	}
+}
+
 func TestWizardPerOrgRequiresOrgs(t *testing.T) {
 	var out bytes.Buffer
 	_, err := RunWizard(context.Background(), WizardIO{
