@@ -42,34 +42,26 @@ Standard-`pinentry`-Prompt statt Touch ID.
 
 ## Install
 
+**TL;DR — one-shot:**
+
 ```bash
-# Einmalig
-brew install go gopass gnupg
-gopass setup                  # nur beim ersten Mal, erzeugt GPG-Key + Store
 git clone https://github.com/SaschaHenning/my-secrets ~/Code/my-secrets
 cd ~/Code/my-secrets
-make build                    # → ./bin/mys
-sudo cp bin/mys /usr/local/bin/
-
-# Konfiguration + Claude-Skill installieren
-mys init                      # legt scope-policy.yaml und audit.sqlite an
-mys install-skill             # verlinkt skills/my-secrets/ nach ~/.claude/skills/my-secrets
+./install.sh
 ```
 
-### Claude Code MCP aktivieren
+Das Skript installiert alle Homebrew-Pakete, baut das Binary, legt es
+nach `/usr/local/bin`, initialisiert gopass (falls nötig), führt
+`mys init` und `mys install-skill` aus und trägt den MCP-Server in
+`~/.claude/settings.json` ein.
 
-In der globalen Claude-Code-Settings-Datei oder im Projekt:
+Für den **manuellen Weg**, alle Voraussetzungen, Update-/Deinstall-Schritte
+und Troubleshooting siehe [`INSTALL.md`](INSTALL.md).
 
-```jsonc
-{
-  "mcpServers": {
-    "my-secrets": { "command": "mys", "args": ["mcp"] }
-  }
-}
-```
-
-Ab dem Moment kann Claude nur noch per MCP auf Secrets zugreifen — jeder
-Zugriff taucht im Audit-Log als `actor_kind=ai` auf.
+**Claude Code**: Nach der Installation findet Claude den MCP-Server
+automatisch beim nächsten Session-Start. Alle Zugriffe laufen dann über
+`creds_list` / `creds_search` / `creds_get` und landen als
+`actor_kind=ai` im Audit-Log.
 
 ## Schnellstart
 
