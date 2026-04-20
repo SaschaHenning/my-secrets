@@ -16,7 +16,8 @@ import (
 
 // initCmd builds the `mys init` subcommand.
 func initCmd(requester *string) *cobra.Command {
-	return &cobra.Command{
+	var installSkillFlag bool
+	c := &cobra.Command{
 		Use:   "init",
 		Short: "Initialise gopass, default org folders, policy, audit DB",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -56,7 +57,21 @@ func initCmd(requester *string) *cobra.Command {
 			a.AuditInit(ctx, "mys init")
 
 			fmt.Fprintf(cmd.OutOrStdout(), "my-secrets initialised.\n  policy: %s\n  audit:  %s\n", pp, ap)
+
+			// 5. Optionally install the Claude Code skill in the same step so
+			// users get a one-command setup. A failure here must surface as
+			// an error — the flag has no value if it silently no-ops.
+			if installSkillFlag {
+				dst, _, err := installSkill(cmd)
+				if err != nil {
+					return fmt.Errorf("install skill: %w", err)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "  skill:  %s\n", dst)
+			}
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&installSkillFlag, "install-skill", false,
+		"also install the Claude Code skill (symlink ~/.claude/skills/my-secrets → repo)")
+	return c
 }

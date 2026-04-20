@@ -103,27 +103,29 @@ Der Assistent fragt:
 Wenn du schon `gopass` nutzt oder einen alten `pass`-Store hast, wird
 der erkannt.
 
-## Schritt 5 · my-secrets initialisieren
+## Schritt 5 · my-secrets initialisieren (inkl. Claude-Skill)
 
 ```bash
-mys init
+mys init --install-skill
 ```
 
 Das schreibt:
 - `~/.config/my-secrets/scope-policy.yaml` — YAML mit Default-Regeln (AI-Caller dürfen `jasp/**` und `zuhause/**`, nicht `private/**`).
 - `~/.local/share/my-secrets/audit.sqlite` — append-only SQLite-Log.
+- `~/.claude/skills/my-secrets` — Symlink auf das Skill-Verzeichnis im Repo.
 
-Beides mit Mode `0o600` / Verzeichnis `0o700`.
+Policy und Audit mit Mode `0o600` / Verzeichnis `0o700`. Claude lädt den
+Skill beim nächsten Session-Start.
 
-## Schritt 6 · Claude-Code-Skill installieren
+Wer das Init und den Skill getrennt fahren will (z.B. Skill später
+nachziehen), kann stattdessen weiterhin zweistufig vorgehen:
 
 ```bash
-mys install-skill
+mys init                  # nur Policy + Audit
+mys install-skill         # später Skill nachinstallieren (alternative)
 ```
 
-Legt einen Symlink `~/.claude/skills/my-secrets` auf das Skill-Verzeichnis im Repo an. Claude lädt den Skill beim nächsten Session-Start.
-
-## Schritt 7 · MCP-Server in Claude registrieren
+## Schritt 6 · MCP-Server in Claude registrieren
 
 Datei `~/.claude/settings.json` um folgenden Block ergänzen (oder das
 `install.sh` hat es schon für dich gemacht):

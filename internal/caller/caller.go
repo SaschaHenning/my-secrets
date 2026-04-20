@@ -22,16 +22,16 @@ const (
 
 // Detail is serialised into the audit log's actor_detail column.
 type Detail struct {
-	Kind        Kind     `json:"kind"`
-	AgentLabel  string   `json:"agent_label,omitempty"` // e.g. claude-code, cursor
-	PID         int      `json:"pid"`
-	PPID        int      `json:"ppid"`
-	PPIDChain   []string `json:"ppid_chain"` // executable names, child-to-parent
-	TTY         bool     `json:"tty"`
-	EnvFlags    []string `json:"env_flags,omitempty"`
-	Executable  string   `json:"executable,omitempty"`
-	Override    string   `json:"override,omitempty"` // --requester value if any
-	Reason      string   `json:"reason,omitempty"`   // human-readable classification reason
+	Kind       Kind     `json:"kind"`
+	AgentLabel string   `json:"agent_label,omitempty"` // e.g. claude-code, cursor
+	PID        int      `json:"pid"`
+	PPID       int      `json:"ppid"`
+	PPIDChain  []string `json:"ppid_chain"` // executable names, child-to-parent
+	TTY        bool     `json:"tty"`
+	EnvFlags   []string `json:"env_flags,omitempty"`
+	Executable string   `json:"executable,omitempty"`
+	Override   string   `json:"override,omitempty"` // --requester value if any
+	Reason     string   `json:"reason,omitempty"`   // human-readable classification reason
 }
 
 // Identify classifies the current caller.
