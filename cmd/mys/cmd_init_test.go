@@ -309,3 +309,32 @@ func TestPrettyPath(t *testing.T) {
 		t.Fatalf("prettyPath outside = %q", got)
 	}
 }
+
+// TestInitStepsOrder protects the invariant that pinentry-mac is
+// configured before the GPG keygen step runs. If someone re-orders the
+// init sequence and the pinentry step moves back after GPG, Touch-ID
+// integration silently stops working on fresh installs — this test is
+// the guardrail.
+func TestInitStepsOrder(t *testing.T) {
+	steps := initSteps()
+	idx := func(name string) int {
+		for i, s := range steps {
+			if s.name == name {
+				return i
+			}
+		}
+		return -1
+	}
+	pin := idx("configure pinentry-mac")
+	gpg := idx("detect or generate GPG key")
+	gopass := idx("initialise gopass store")
+	if pin < 0 || gpg < 0 || gopass < 0 {
+		t.Fatalf("expected named steps present: pinentry=%d gpg=%d gopass=%d", pin, gpg, gopass)
+	}
+	if pin >= gpg {
+		t.Errorf("pinentry-mac (idx %d) must come before GPG keygen (idx %d)", pin, gpg)
+	}
+	if gpg >= gopass {
+		t.Errorf("GPG keygen (idx %d) must come before gopass init (idx %d)", gpg, gopass)
+	}
+}

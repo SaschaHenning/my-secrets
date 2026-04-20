@@ -167,15 +167,7 @@ func runInit(ctx context.Context, opts *initOptions) error {
 	fmt.Fprintf(opts.Out, "mys init %s\n\n", Version)
 
 	state := &initState{}
-	steps := []initStep{
-		{name: "detect or generate GPG key", run: stepGPG},
-		{name: "initialise gopass store", run: stepGopass},
-		{name: "configure pinentry-mac", run: stepPinentry},
-		{name: "write policy + audit", run: stepState},
-		{name: "install Claude skill", run: stepSkill},
-		{name: "set up git sync", run: stepSync},
-	}
-	if err := runSteps(ctx, opts, state, steps); err != nil {
+	if err := runSteps(ctx, opts, state, initSteps()); err != nil {
 		return err
 	}
 
@@ -186,6 +178,24 @@ func runInit(ctx context.Context, opts *initOptions) error {
 	fmt.Fprintln(opts.Out, "  mys doctor")
 	fmt.Fprintln(opts.Out, "  mys sync setup")
 	return nil
+}
+
+// initSteps returns the ordered bootstrap sequence. Exported-via-test
+// so the ordering invariant below can be verified. The order matters:
+// pinentry-mac MUST be configured before the first GPG keygen,
+// otherwise the passphrase prompt during keygen is handled by whatever
+// pinentry GPG finds on PATH (typically curses / plain tty) and the
+// Touch-ID-ready pinentry-mac binding never takes effect for this
+// session.
+func initSteps() []initStep {
+	return []initStep{
+		{name: "configure pinentry-mac", run: stepPinentry},
+		{name: "detect or generate GPG key", run: stepGPG},
+		{name: "initialise gopass store", run: stepGopass},
+		{name: "write policy + audit", run: stepState},
+		{name: "install Claude skill", run: stepSkill},
+		{name: "set up git sync", run: stepSync},
+	}
 }
 
 // runSteps runs the given sequence, printing a failure marker on the
