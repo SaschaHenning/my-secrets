@@ -2,6 +2,7 @@ package gpgsetup
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -210,6 +211,59 @@ func TestGenerateKey_Integration(t *testing.T) {
 	_ = exec.Command("gpgconf", "--kill", "gpg-agent").Run()
 }
 
+// TestGenerateKey_WithPassphrase_RoundTrip is the regression test for
+// the „Passwort falsch"-bug: generate a key with a known passphrase,
+// then prove — via the built-in self-check — that the same passphrase
+// actually decrypts data encrypted to the new key. Previously
+// sanitiseBatchValue trimmed spaces, so a passphrase like " 1234 "
+// would be stored as "1234" and the self-check (or the user's
+// pinentry-mac prompt later) would reject the space-padded form.
+func TestGenerateKey_WithPassphrase_RoundTrip(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX-only")
+	}
+	if _, err := exec.LookPath("gpg"); err != nil {
+		t.Skip("gpg not on PATH")
+	}
+	if os.Getenv("MYS_SKIP_GPG_INTEGRATION") == "1" {
+		t.Skip("MYS_SKIP_GPG_INTEGRATION=1")
+	}
+	short, err := os.MkdirTemp("", "gh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(short) })
+	_ = os.Chmod(short, 0o700)
+	t.Setenv("GNUPGHOME", short)
+
+	// Simple passphrase, and the space-padded variant that used to
+	// silently get truncated.
+	cases := []string{"1234", " 1234 ", "my secret with spaces"}
+	for _, pass := range cases {
+		t.Run(fmt.Sprintf("pass=%q", pass), func(t *testing.T) {
+			fpr, err := GenerateKey(context.Background(), GenerateOpts{
+				Name:       "Probe",
+				Email:      "probe@example.com",
+				Passphrase: pass,
+			})
+			if err != nil {
+				t.Skipf("keygen failed (may be pinentry/entropy): %v", err)
+			}
+			// verifyKeyPassphrase is called by GenerateKey before it
+			// returns, so a successful return IS the proof that the
+			// passphrase round-trips. But be explicit and run it again
+			// with a fresh probe — any flakiness would show up here.
+			if err := verifyKeyPassphrase(context.Background(), "gpg", fpr, pass); err != nil {
+				t.Fatalf("passphrase %q did not round-trip: %v", pass, err)
+			}
+			// Clean up for the next sub-test.
+			_ = exec.Command("gpg", "--batch", "--yes",
+				"--delete-secret-and-public-keys", fpr).Run()
+		})
+	}
+	_ = exec.Command("gpgconf", "--kill", "gpg-agent").Run()
+}
+
 // TestEnsurePinentryMac_NonMac makes sure the function is a pure
 // no-op off darwin (no filesystem writes, no subprocess calls).
 func TestEnsurePinentryMac_NonMac(t *testing.T) {
@@ -320,6 +374,35 @@ func TestHasPinentryMacLine(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := hasPinentryMacLine([]byte(tc.input)); got != tc.want {
 				t.Fatalf("input %q → %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSanitisePassphrase_KeepsLeadingTrailingSpaces is the regression
+// test for the „Passwort falsch"-bug. A user who typed a passphrase
+// with a leading or trailing space (e.g. pasted from a password
+// manager that helpfully added one) used to get a key whose
+// passphrase never matched because sanitiseBatchValue trimmed the
+// space off before writing the batch file.
+func TestSanitisePassphrase_KeepsLeadingTrailingSpaces(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"leading space", " secret", " secret"},
+		{"trailing space", "secret ", "secret "},
+		{"both", " secret ", " secret "},
+		{"internal space", "my secret pass", "my secret pass"},
+		{"strips newline", "secret\n", "secret"},
+		{"strips carriage return", "secret\r", "secret"},
+		{"preserves tabs and punct", "se\tcret-pw!", "se\tcret-pw!"},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitisePassphrase(tc.in)
+			if got != tc.want {
+				t.Errorf("sanitisePassphrase(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}

@@ -239,7 +239,62 @@ func generateKeyWithGPG(ctx context.Context, gpgBin string, opts GenerateOpts) (
 	if fpr == "" {
 		return "", fmt.Errorf("could not find KEY_CREATED fingerprint in gpg output (stdout: %q)", strings.TrimSpace(string(out)))
 	}
+	// Self-check: encrypt a tiny probe to the new key and decrypt it
+	// again with the same passphrase. If this fails, the key is unusable
+	// — typically because the passphrase the user typed cannot be
+	// replayed exactly (trailing newline, hidden unicode, etc.). Delete
+	// the half-baked key so the user can retry instead of ending up
+	// stuck with a key that needs a passphrase nobody knows.
+	if err := verifyKeyPassphrase(ctx, gpgBin, fpr, opts.Passphrase); err != nil {
+		// Best-effort cleanup.
+		_ = exec.CommandContext(ctx, gpgBin, "--batch", "--yes",
+			"--delete-secret-and-public-keys", fpr).Run()
+		return "", fmt.Errorf("key passphrase self-check failed — key deleted; please retry mys init: %w", err)
+	}
 	return fpr, nil
+}
+
+// verifyKeyPassphrase encrypts and then decrypts a 5-byte probe with
+// the freshly-minted key. It uses the same loopback-pinentry mechanism
+// as the keygen, so the passphrase is tested via the exact same path
+// gpg took when it was set.
+func verifyKeyPassphrase(ctx context.Context, gpgBin, fpr, passphrase string) error {
+	// Encrypt: does not need the passphrase (public-key operation).
+	enc := exec.CommandContext(ctx, gpgBin,
+		"--batch", "--yes",
+		"--trust-model", "always",
+		"--recipient", fpr,
+		"--encrypt",
+		"--armor",
+	)
+	enc.Stdin = strings.NewReader("probe")
+	encOut, err := enc.Output()
+	if err != nil {
+		return fmt.Errorf("probe encrypt: %w", err)
+	}
+
+	// Decrypt: passphrase required. Feed it via --passphrase-fd 0 along
+	// with --pinentry-mode loopback — same as keygen.
+	dec := exec.CommandContext(ctx, gpgBin,
+		"--batch", "--yes",
+		"--pinentry-mode", "loopback",
+		"--passphrase-fd", "0",
+		"--decrypt",
+	)
+	// Wire: first line passphrase, then the ciphertext.
+	dec.Stdin = strings.NewReader(passphrase + "\n" + string(encOut))
+	out, err := dec.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("probe decrypt: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	// gpg emits status lines to stderr (captured in CombinedOutput) plus
+	// the plaintext to stdout. When CombinedOutput is used everything is
+	// interleaved — we just need to know that "probe" appears in the
+	// output somewhere.
+	if !strings.Contains(string(out), "probe") {
+		return fmt.Errorf("probe decrypt succeeded but output did not contain the probe token")
+	}
+	return nil
 }
 
 // buildKeygenBatch assembles the batch control file. See `man gpg` →
@@ -264,23 +319,37 @@ func buildKeygenBatch(opts GenerateOpts) string {
 	b.WriteString("\n")
 	b.WriteString("Expire-Date: 0\n")
 	if opts.Passphrase != "" {
+		// Passphrase is written verbatim (minus CR/LF which would break
+		// the batch-file grammar). It MUST NOT be trimmed — a passphrase
+		// with leading/trailing spaces is perfectly valid, and silently
+		// discarding them produces a key whose passphrase the user can
+		// never re-enter. That was the „Passwort falsch"-bug.
 		b.WriteString("Passphrase: ")
-		b.WriteString(sanitiseBatchValue(opts.Passphrase))
+		b.WriteString(sanitisePassphrase(opts.Passphrase))
 		b.WriteString("\n")
 	}
 	b.WriteString("%commit\n")
 	return b.String()
 }
 
-// sanitiseBatchValue strips carriage returns and newlines from values
-// that would otherwise break the batch file grammar. We do NOT attempt
-// to escape further — the batch format has no quoting, and the values
-// my-secrets uses (a person's name, an email, a passphrase) never
-// legitimately contain newlines.
+// sanitiseBatchValue strips carriage returns, newlines, and surrounding
+// whitespace from a name / email string. Whitespace in these fields is
+// never semantically meaningful to gpg and users sometimes paste values
+// with a stray trailing newline.
 func sanitiseBatchValue(s string) string {
 	s = strings.ReplaceAll(s, "\r", "")
 	s = strings.ReplaceAll(s, "\n", " ")
 	return strings.TrimSpace(s)
+}
+
+// sanitisePassphrase is the passphrase-safe variant of sanitiseBatchValue.
+// It removes ONLY CR and LF (anything that would terminate the
+// Passphrase: line in the batch file); every other byte — including
+// leading/trailing spaces — is preserved exactly as the user typed it.
+func sanitisePassphrase(s string) string {
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	return s
 }
 
 // parseKeyCreatedLine scans a blob of gpg status output and returns the
