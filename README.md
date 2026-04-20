@@ -153,6 +153,35 @@ mys bw-export --org jasp --out jasp-backup.json
 Schreibt eine Bitwarden-kompatible JSON-Datei, die du bei Bedarf manuell
 in Bitwarden importieren kannst. Einseitig — kein Live-Sync.
 
+## Syncing across your own devices
+
+`my-secrets` ist ein **persönlicher** Credential-Manager. Der eingebaute
+Git-Sync dient ausschließlich der Redundanz zwischen deinen eigenen
+Geräten — **nicht** dem Teilen mit Kolleg:innen. Für Team-Secrets ist
+Bitwarden (oder ein vergleichbarer Tresor mit personalisiertem Login)
+das richtige Werkzeug; ein gemeinsam genutzter GPG-Key würde das
+Audit-Log unbrauchbar machen.
+
+```bash
+# Einmalig: GitHub-Repo anlegen, gopass-Remote setzen, initialer Push
+mys sync setup
+
+# Im CI / non-interaktiv (Defaults: single-repo, SSH):
+mys sync setup --yes
+
+# Alltag
+mys sync push      # alle konfigurierten Stores hochladen
+mys sync pull      # nur herunterziehen (auf dem Zweitgerät)
+mys sync status    # zeigt letzten Sync + Remote-Erreichbarkeit
+```
+
+Der Wizard fragt zuerst, ob du einen einzigen Store oder ein Repo pro
+Org willst. Er erzeugt über `gh repo create --private` ein privates
+GitHub-Repo (ein `gh auth login` muss vorher gelaufen sein), verdrahtet
+den gopass-Remote und führt einen ersten Sync aus. Der Zustand landet
+in `~/.config/my-secrets/sync.yaml`; jede Sync-Aktion schreibt eine
+Zeile ins Audit-Log (`action=sync_push|sync_pull|sync_setup`).
+
 ## Projektstruktur
 
 ```

@@ -44,6 +44,7 @@ func rootCmd() *cobra.Command {
 		webCmd(),
 		mcpCmd(),
 		bwExportCmd(&requester),
+		syncCmd(&requester),
 		installSkillCmd(),
 	)
 	return root

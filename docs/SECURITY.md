@@ -176,6 +176,34 @@ can obviously set it to whatever it wants — the flag is **not** a
 security boundary. The security boundary for AI callers is the MCP
 server itself, which ignores the flag and enforces `actor_kind=ai`.
 
+## Git-based sync
+
+`mys sync setup` optionally turns the local gopass store into a
+git-backed store pushed to a private GitHub repo. The feature is
+deliberately scoped to **personal device redundancy** — keeping your
+own secrets mirrored across your own machines.
+
+Non-goals (explicitly): sharing credentials with colleagues. A gopass
+store encrypted to a single GPG key cannot distinguish between humans
+who hold that key, which means:
+
+- The audit log loses its „who accessed this secret" signal the moment
+  a second human shares the key.
+- Revocation would require rotating every credential in the store.
+- There is no per-user policy — the scope-policy YAML here only gates
+  machine-local callers (human vs. AI).
+
+For team-shared credentials, use Bitwarden (or a comparable hosted
+vault) that enforces per-user identity. The setup wizard prints this
+scope anchor before any destructive step and requires explicit
+confirmation.
+
+Sync-related subprocess calls (`gh`, `gopass git …`, `gopass sync`) are
+an explicit exception to the library-only rule. They run outside the
+hot secret-access path, do not read or write decrypted secret values,
+and every invocation writes an audit row with
+`action=sync_{setup,push,pull}`.
+
 ## Known limitations
 
 - No secure-enclave signing of audit entries (Ansatz A/B feature).
