@@ -80,3 +80,32 @@ func TestParseFieldFilters_EqualsSignRequired(t *testing.T) {
 		t.Error("expected error for filter without =")
 	}
 }
+
+func TestTrimLastRune(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		want []byte
+	}{
+		{"empty", nil, nil},
+		{"ascii", []byte("abc"), []byte("ab")},
+		{"two-byte umlaut", []byte{0xc3, 0xa4}, []byte{}},
+		{"mixed trailing umlaut", []byte{'a', 0xc3, 0xb6}, []byte{'a'}},
+		{"three-byte cjk", []byte{0xe4, 0xb8, 0xad}, []byte{}},
+		{"four-byte emoji", []byte{0xf0, 0x9f, 0x92, 0xa1}, []byte{}},
+		{"codepoint then ascii", []byte{0xc3, 0xb6, 'a'}, []byte{0xc3, 0xb6}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := trimLastRune(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("length: got %d, want %d", len(got), len(tc.want))
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("byte[%d]: got 0x%02x, want 0x%02x", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
