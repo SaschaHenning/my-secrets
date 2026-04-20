@@ -4,6 +4,22 @@ Schritt-für-Schritt-Anleitung für ein frisches macOS-Setup.
 
 ## TL;DR
 
+Komplett von Null (kein GPG-Key, kein gopass-Store, kein my-secrets):
+
+```bash
+brew install gopass pinentry-touchid
+git clone https://github.com/SaschaHenning/my-secrets ~/Code/my-secrets
+cd ~/Code/my-secrets
+make build && sudo cp bin/mys /usr/local/bin/
+mys init --install-skill
+```
+
+Das reicht. `mys init` generiert den GPG-Key, initialisiert den
+gopass-Store, setzt `pinentry-touchid` in Gang, legt Policy + Audit-DB
+an und verlinkt den Claude-Skill.
+
+Oder komplett automatisiert via Installer:
+
 ```bash
 git clone https://github.com/SaschaHenning/my-secrets ~/Code/my-secrets
 cd ~/Code/my-secrets
@@ -11,8 +27,9 @@ cd ~/Code/my-secrets
 ```
 
 Das Skript prüft Voraussetzungen, installiert Homebrew-Pakete, baut das
-Binary, legt es nach `/usr/local/bin`, richtet gopass ein, initialisiert
-my-secrets und registriert den MCP-Server in `~/.claude/settings.json`.
+Binary, legt es nach `/usr/local/bin`, ruft `mys init --install-skill`
+(das erledigt inzwischen auch GPG-Key + gopass-Store) und trägt den
+MCP-Server in `~/.claude/settings.json` ein.
 
 Wenn du es manuell machen willst, siehe unten.
 
@@ -87,45 +104,69 @@ automatisch nachzieht:
 sudo ln -sf "$PWD/bin/mys" /usr/local/bin/mys
 ```
 
-## Schritt 4 · gopass initialisieren
+## Schritt 4 · my-secrets initialisieren (GPG-Key, gopass-Store, Policy, Skill)
 
-Wenn du noch keinen gopass-Store hast, jetzt einmalig:
-
-```bash
-gopass setup
-```
-
-Der Assistent fragt:
-- Nach einem GPG-Key (oder erzeugt einen neuen).
-- Nach dem Store-Pfad (Default: `~/.password-store`).
-- Ob ein Git-Remote dranhängen soll (für Backup/Sync) — optional.
-
-Wenn du schon `gopass` nutzt oder einen alten `pass`-Store hast, wird
-der erkannt.
-
-## Schritt 5 · my-secrets initialisieren (inkl. Claude-Skill)
+Ein einzelner Befehl bootstrappt alles:
 
 ```bash
 mys init --install-skill
 ```
 
-Das schreibt:
-- `~/.config/my-secrets/scope-policy.yaml` — YAML mit Default-Regeln (AI-Caller dürfen `jasp/**` und `zuhause/**`, nicht `private/**`).
-- `~/.local/share/my-secrets/audit.sqlite` — append-only SQLite-Log.
-- `~/.claude/skills/my-secrets` — Symlink auf das Skill-Verzeichnis im Repo.
+Er läuft als sechsstufiger Runner und bringt die Maschine in einen
+arbeitsfähigen Zustand:
 
-Policy und Audit mit Mode `0o600` / Verzeichnis `0o700`. Claude lädt den
-Skill beim nächsten Session-Start.
+1. **GPG-Key** — vorhandenen Secret-Key suchen; wenn keiner da ist,
+   einen Ed25519/Curve25519-Key erzeugen (Name + Email aus
+   `git config --global user.name|user.email`, bei Bedarf interaktiv
+   nachfragen).
+2. **gopass-Store** — `gopass init` gegen den gerade ermittelten
+   Fingerprint, wenn `~/.password-store/.gpg-id` noch fehlt.
+3. **pinentry-touchid** — falls das Binary auf PATH liegt, wird der
+   Eintrag in `~/.gnupg/gpg-agent.conf` gesetzt und `gpg-agent`
+   neugestartet. Sonst: kurzer Hinweis, kein Abbruch.
+4. **Policy + Audit-DB** — schreibt
+   `~/.config/my-secrets/scope-policy.yaml` (Default-Regeln: AI-Caller
+   dürfen `jasp/**` und `zuhause/**`, nicht `private/**`) und legt
+   `~/.local/share/my-secrets/audit.sqlite` an.
+5. **Claude-Skill** — nur wenn `--install-skill` gesetzt. Neu: im
+   interaktiven Modus fragt `mys init`, ob der Skill **global**
+   (`~/.claude/skills/my-secrets`, empfohlen) oder **lokal**
+   (`<CWD>/.claude/skills/my-secrets`) installiert werden soll.
+6. **git sync** (optional) — nur mit `--with-sync`: ruft den gleichen
+   Wizard wie `mys sync setup`.
 
-Wer das Init und den Skill getrennt fahren will (z.B. Skill später
-nachziehen), kann stattdessen weiterhin zweistufig vorgehen:
+Re-Runs sind idempotent: existierende Keys werden wiederverwendet, der
+gopass-Store nicht neu initialisiert, gpg-agent.conf nicht dupliziert,
+Policy und Audit-DB nicht überschrieben.
+
+Flags:
 
 ```bash
-mys init                  # nur Policy + Audit
-mys install-skill         # später Skill nachinstallieren (alternative)
+# Non-interactive (CI, fresh Mac):
+mys init --yes                          # fehlt user.name/email in git config → Fehler
+mys init --yes --no-passphrase          # Key ohne Passphrase (via pinentry-touchid)
+
+# Explizite Angaben:
+mys init --name "Sascha" --email garry@jasp.eu
+
+# Skill direkt mit einziehen:
+mys init --install-skill                 # global (default)
+mys init --install-skill --skill-scope local
+
+# Alles auf einmal:
+mys init --yes --install-skill --with-sync
 ```
 
-## Schritt 6 · MCP-Server in Claude registrieren
+Wer das in kleinere Schritte trennen will:
+
+```bash
+mys init                  # Key + Store + Policy + Audit
+mys install-skill         # Skill nachinstallieren (global)
+mys install-skill --scope local  # Skill nur im aktuellen Projekt
+mys sync setup            # git sync separat
+```
+
+## Schritt 5 · MCP-Server in Claude registrieren
 
 Datei `~/.claude/settings.json` um folgenden Block ergänzen (oder das
 `install.sh` hat es schon für dich gemacht):
@@ -197,8 +238,17 @@ Nicht entfernt (das musst du explizit tun):
 
 ## Troubleshooting
 
-**`mys init` sagt „gopass store not initialised"**
-→ Vorher `gopass setup` laufen lassen. Siehe Schritt 4.
+**`mys init` bricht bei der GPG-Key-Generierung ab**
+→ Prüfe `gpg --list-secret-keys`. Häufige Ursachen: `gpg-agent` ohne
+gültigen `pinentry`-Pfad, oder ein existierender Key mit blockierender
+Passphrase-Eingabe. `brew install pinentry-mac` und
+`pinentry-program /opt/homebrew/bin/pinentry-mac` in
+`~/.gnupg/gpg-agent.conf` lösen 95 % der Fälle.
+
+**`mys init` bricht mit „cannot derive name/email in --yes mode" ab**
+→ Im `--yes`-Modus müssen `git config --global user.name` und
+`user.email` gesetzt sein, oder `--name`/`--email` explizit übergeben
+werden.
 
 **`mys get` hängt beim GPG-Passphrase-Prompt**
 → `gpg-agent` läuft nicht oder findet kein Display. Einmal

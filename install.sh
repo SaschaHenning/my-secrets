@@ -6,10 +6,11 @@
 #   2. Installs Homebrew packages: go, gopass, gnupg.
 #   3. Builds the mys binary.
 #   4. Copies it to /usr/local/bin (asks for sudo).
-#   5. Runs `gopass setup` if the store is not initialised yet.
-#   6. Runs `mys init` to create the policy file and audit DB.
-#   7. Installs the Claude Code skill.
-#   8. Registers `my-secrets` as an MCP server in the user's
+#   5. Runs `mys init --install-skill` which — in this one command —
+#      generates/picks a GPG key, initialises the gopass store, wires
+#      up pinentry-touchid (macOS), writes the scope policy, creates
+#      the audit DB, and installs the Claude Code skill.
+#   6. Registers `my-secrets` as an MCP server in the user's
 #      Claude Code settings.
 #
 # Safe to re-run — every step is idempotent.
@@ -85,43 +86,26 @@ else
 fi
 ok "mys → $INSTALL_PATH"
 
-# --- 5. gopass setup -----------------------------------------------------
+# --- 5. mys init (GPG key + gopass store + policy + audit + skill) ------
 
-banner "Configuring gopass"
+banner "Running 'mys init --install-skill'"
 
-# Detect if gopass already has a configured store.
-if gopass ls >/dev/null 2>&1; then
-  ok "gopass store already initialised — skipping setup"
-else
-  warn "gopass store not yet initialised."
-  echo "    Running 'gopass setup' now — follow the prompts."
-  echo "    If you already have a GPG key, gopass will offer to use it."
-  echo "    Otherwise it will generate a new one."
-  read -r -p "    Press Enter to continue (Ctrl-C to abort and run 'gopass setup' manually later)..."
-  gopass setup
-  ok "gopass setup done"
-fi
-
-# --- 6. mys init ---------------------------------------------------------
-
-banner "Running 'mys init'"
-
-mys init
-ok "policy + audit DB in place"
-
-# --- 7. Install Claude Code skill ----------------------------------------
-
-banner "Installing Claude Code skill"
-
+# mys init is the single entry point: it detects or generates a GPG key,
+# initialises the gopass store, configures pinentry-touchid (best-effort),
+# writes the scope policy, creates the audit DB, and — because of
+# --install-skill — symlinks the Claude Code skill into ~/.claude/skills.
+# The command is idempotent, so re-running the installer is safe.
 if [[ -d "$HOME/.claude" ]]; then
-  mys install-skill
-  ok "skill symlinked into ~/.claude/skills/my-secrets"
+  mys init --install-skill
+  ok "mys initialised (key, store, policy, audit, skill)"
 else
-  warn "~/.claude not found — skipping skill install."
+  warn "~/.claude not found — running 'mys init' without skill install."
+  mys init
+  ok "mys initialised (key, store, policy, audit)"
   warn "  After installing Claude Code, run:  mys install-skill"
 fi
 
-# --- 8. Register MCP server in Claude Code settings ---------------------
+# --- 6. Register MCP server in Claude Code settings ---------------------
 
 banner "Registering my-secrets as a Claude MCP server"
 

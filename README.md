@@ -42,7 +42,34 @@ Standard-`pinentry`-Prompt statt Touch ID.
 
 ## Install
 
-**TL;DR — one-shot:**
+### Zero-to-ready in one command
+
+Auf einer frischen Maschine ohne GPG-Key, ohne gopass-Store, ohne
+irgendwas:
+
+```bash
+brew install gopass pinentry-touchid
+mys init --install-skill
+```
+
+Das reicht. `mys init` erzeugt einen Ed25519-GPG-Key (Name/Email aus
+`git config --global` abgeleitet), initialisiert den gopass-Store, trägt
+`pinentry-touchid` in `~/.gnupg/gpg-agent.conf` ein, legt Policy + Audit-
+DB an und verlinkt den Claude-Skill nach `~/.claude/skills/my-secrets`.
+Danach funktionieren `mys add`, `mys get`, `mys doctor` sofort.
+
+Voll non-interactive (CI / Skript):
+
+```bash
+mys init --yes --install-skill --with-sync
+```
+
+Im `--yes`-Modus werden `git config user.name` / `user.email` als
+Defaults genommen; fehlen sie, bricht der Befehl ab statt zu fragen.
+`--no-passphrase` überspringt die Passphrase-Abfrage — sinnvoll, wenn
+`pinentry-touchid` die Authentisierung übernimmt.
+
+**TL;DR — one-shot install via Skript:**
 
 ```bash
 git clone https://github.com/SaschaHenning/my-secrets ~/Code/my-secrets
@@ -51,10 +78,12 @@ cd ~/Code/my-secrets
 ```
 
 Das Skript installiert alle Homebrew-Pakete, baut das Binary, legt es
-nach `/usr/local/bin`, initialisiert gopass (falls nötig), führt
-`mys init --install-skill` aus und trägt den MCP-Server in
+nach `/usr/local/bin`, ruft `mys init --install-skill` auf (das erledigt
+inzwischen auch GPG-Key + gopass-Init) und trägt den MCP-Server in
 `~/.claude/settings.json` ein. `mys install-skill` existiert weiterhin
-als eigenständiger Befehl für manuelles Nachinstallieren.
+als eigenständiger Befehl für manuelles Nachinstallieren — neu auch mit
+`--scope local`, um den Skill nur im aktuellen Projektcheckout zu
+verlinken.
 
 Für den **manuellen Weg**, alle Voraussetzungen, Update-/Deinstall-Schritte
 und Troubleshooting siehe [`INSTALL.md`](INSTALL.md).
@@ -413,7 +442,9 @@ steht in [`docs/plan.html`](docs/plan.html).
 ## Troubleshooting
 
 **`mys init` sagt „gopass store not initialised"**
-→ `gopass setup` davor laufen lassen (einmalig). Anschließend `mys init`.
+→ Neu: `mys init` bootstrappt Key + Store selbst. Sollte der Befehl
+trotzdem abbrechen, prüfe `gpg --list-secret-keys` (mindestens ein
+Secret-Key wird erwartet) und ob `gopass` auf PATH ist.
 
 **`mys get` hängt beim GPG-Passphrase-Prompt**
 → `gpg-agent` läuft nicht oder `pinentry` findet kein Display.
