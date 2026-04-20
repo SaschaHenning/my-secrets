@@ -128,6 +128,7 @@ func entryMatches(path string, e *store.Entry, q string) bool {
 	}
 	fields := []string{
 		e.Username, e.URL, e.Kind, e.GitHubProject, e.Notes,
+		e.TOTPIssuer, e.TOTPLabel,
 	}
 	for _, f := range fields {
 		if f != "" && strings.Contains(strings.ToLower(f), q) {

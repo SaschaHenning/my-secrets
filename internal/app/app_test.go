@@ -885,6 +885,117 @@ func TestRotate_UpdatesRotatedAt(t *testing.T) {
 	}
 }
 
+// --- TOTP ------------------------------------------------------------------
+
+// totpEntry returns a fully populated TOTP entry using the stable
+// base32 seed "JBSWY3DPEHPK3PXP" (the canonical rfc2-style test seed).
+func totpEntry(path string) *store.Entry {
+	return &store.Entry{
+		Path:          path,
+		Org:           store.OrgOf(path),
+		Kind:          store.KindTOTP,
+		Password:      "JBSWY3DPEHPK3PXP",
+		TOTPIssuer:    "GitHub",
+		TOTPLabel:     "sascha",
+		TOTPAlgorithm: "SHA1",
+		TOTPDigits:    6,
+		TOTPPeriod:    30,
+	}
+}
+
+func TestGenerateTOTP_OK(t *testing.T) {
+	a, _ := appWithFake(t, "human", totpEntry("jasp/github"))
+	ctx := context.Background()
+	// Frozen time inside a deterministic window.
+	now := time.Unix(1700000000, 0)
+	code, secondsLeft, err := a.GenerateTOTP(ctx, "jasp/github", now)
+	if err != nil {
+		t.Fatalf("GenerateTOTP: %v", err)
+	}
+	if len(code) != 6 {
+		t.Errorf("code length = %d, want 6 (%q)", len(code), code)
+	}
+	for _, r := range code {
+		if r < '0' || r > '9' {
+			t.Fatalf("code %q has non-digit rune", code)
+		}
+	}
+	if secondsLeft < 1 || secondsLeft > 30 {
+		t.Errorf("secondsLeft = %d, want 1..30", secondsLeft)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionTOTPGenerate, Limit: 5})
+	if len(rows) != 1 {
+		t.Fatalf("want one totp_generate row, got %d", len(rows))
+	}
+	if rows[0].Result != audit.ResultOK {
+		t.Errorf("result = %q, want ok", rows[0].Result)
+	}
+	if !strings.Contains(rows[0].Reason, "window=") {
+		t.Errorf("reason = %q, want to include window=", rows[0].Reason)
+	}
+	if rows[0].SecretPath != "jasp/github" {
+		t.Errorf("secret_path = %q", rows[0].SecretPath)
+	}
+	// Determinism — same `now` produces same code.
+	code2, _, err := a.GenerateTOTP(ctx, "jasp/github", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code2 != code {
+		t.Errorf("deterministic generate returned different codes: %q vs %q", code, code2)
+	}
+}
+
+func TestGenerateTOTP_Denied(t *testing.T) {
+	// AI caller must be denied for private/** TOTP paths.
+	a, _ := appWithFake(t, "claude-code", totpEntry("private/bank-2fa"))
+	ctx := context.Background()
+	_, _, err := a.GenerateTOTP(ctx, "private/bank-2fa", time.Unix(1700000000, 0))
+	var denied *ErrDenied
+	if !errors.As(err, &denied) {
+		t.Fatalf("want ErrDenied, got %v", err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionTOTPGenerate, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultDenied {
+		t.Fatalf("want one denied totp_generate row, got %+v", rows)
+	}
+	if rows[0].Org != "private" {
+		t.Errorf("org = %q, want private", rows[0].Org)
+	}
+}
+
+func TestGenerateTOTP_NotTOTP(t *testing.T) {
+	// A regular password entry must not be treated as a TOTP seed.
+	a, _ := appWithFake(t, "human", &store.Entry{
+		Path: "jasp/not-totp", Kind: store.KindPassword, Password: "plain-pw",
+	})
+	ctx := context.Background()
+	_, _, err := a.GenerateTOTP(ctx, "jasp/not-totp", time.Now())
+	if err == nil {
+		t.Fatal("want error for non-TOTP entry")
+	}
+	if !strings.Contains(err.Error(), "not a totp entry") {
+		t.Errorf("error = %v, want 'not a totp entry' substring", err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionTOTPGenerate, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultError {
+		t.Fatalf("want one error totp_generate row, got %+v", rows)
+	}
+}
+
+func TestGenerateTOTP_StoreError(t *testing.T) {
+	a, f := appWithFake(t, "human", totpEntry("jasp/github"))
+	f.GetErr = errors.New("gpg locked")
+	_, _, err := a.GenerateTOTP(context.Background(), "jasp/github", time.Now())
+	if err == nil {
+		t.Fatal("want error")
+	}
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionTOTPGenerate, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultError {
+		t.Fatalf("want error row, got %+v", rows)
+	}
+}
+
 func TestApp_AutoSync_StoreErrorDoesNotSync(t *testing.T) {
 	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
 	a, f := appWithFake(t, "human")

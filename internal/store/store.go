@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,7 @@ const (
 	KindSSHKey   = "ssh_key"
 	KindEnv      = "env"
 	KindNote     = "note"
+	KindTOTP     = "totp"
 )
 
 // Entry is the in-memory representation of a stored secret plus its metadata.
@@ -57,6 +59,11 @@ const (
 // staleness checks that `mys ls --stale` and `mys doctor` perform.
 // RotatedAt is maintained automatically by App.Add and App.Rotate — it
 // is not a user-facing field.
+//
+// For Kind=="totp" entries, Password holds the raw base32 TOTP seed and the
+// TOTP* fields carry the associated metadata (issuer, label, algorithm,
+// digits, period). Zero values of the numeric TOTP fields mean „library
+// default" (SHA1 / 6 digits / 30 seconds).
 type Entry struct {
 	Path          string
 	Org           string
@@ -69,6 +76,12 @@ type Entry struct {
 	Password      string
 	RotateAfter   string    // e.g. "90d", "6m", "1y" — empty = no policy.
 	RotatedAt     time.Time // last rotation timestamp (UTC); zero = never.
+	// TOTP metadata — populated when Kind == KindTOTP.
+	TOTPIssuer    string
+	TOTPLabel     string
+	TOTPAlgorithm string
+	TOTPDigits    int
+	TOTPPeriod    int
 }
 
 // Open opens the existing gopass store. Callers must have previously run
@@ -216,6 +229,16 @@ func (s *Store) Set(ctx context.Context, e *Entry) error {
 		// the first value for a key anyway.
 		_ = sec.Set("tags", strings.Join(e.Tags, ","))
 	}
+	// TOTP metadata.
+	setIfNotEmpty(sec, "totp_issuer", e.TOTPIssuer)
+	setIfNotEmpty(sec, "totp_label", e.TOTPLabel)
+	setIfNotEmpty(sec, "totp_algorithm", e.TOTPAlgorithm)
+	if e.TOTPDigits > 0 {
+		_ = sec.Set("totp_digits", fmt.Sprintf("%d", e.TOTPDigits))
+	}
+	if e.TOTPPeriod > 0 {
+		_ = sec.Set("totp_period", fmt.Sprintf("%d", e.TOTPPeriod))
+	}
 	return s.gp.Set(ctx, e.Path, sec)
 }
 
@@ -307,6 +330,25 @@ func entryFromSecret(path string, sec gopass.Secret) *Entry {
 		// error, so reminders degrade gracefully.
 		if t, perr := time.Parse(time.RFC3339, v); perr == nil {
 			e.RotatedAt = t.UTC()
+		}
+	}
+	if v, ok := sec.Get("totp_issuer"); ok {
+		e.TOTPIssuer = v
+	}
+	if v, ok := sec.Get("totp_label"); ok {
+		e.TOTPLabel = v
+	}
+	if v, ok := sec.Get("totp_algorithm"); ok {
+		e.TOTPAlgorithm = v
+	}
+	if v, ok := sec.Get("totp_digits"); ok && v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			e.TOTPDigits = n
+		}
+	}
+	if v, ok := sec.Get("totp_period"); ok && v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			e.TOTPPeriod = n
 		}
 	}
 	return e

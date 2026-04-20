@@ -111,6 +111,34 @@ func printEntry(w io.Writer, e *store.Entry, field string, reveal bool, format s
 	if e.Notes != "" {
 		fmt.Fprintf(w, "notes:    %s\n", e.Notes)
 	}
+	if e.Kind == store.KindTOTP {
+		// TOTP metadata: the password field holds the base32 seed; show it
+		// labelled explicitly and mask it unless --reveal.
+		fmt.Fprintf(w, "issuer:   %s\n", e.TOTPIssuer)
+		fmt.Fprintf(w, "label:    %s\n", e.TOTPLabel)
+		alg := e.TOTPAlgorithm
+		if alg == "" {
+			alg = "SHA1"
+		}
+		fmt.Fprintf(w, "algorithm:%s\n", alg)
+		digits := e.TOTPDigits
+		if digits == 0 {
+			digits = 6
+		}
+		fmt.Fprintf(w, "digits:   %d\n", digits)
+		period := e.TOTPPeriod
+		if period == 0 {
+			period = 30
+		}
+		fmt.Fprintf(w, "period:   %d\n", period)
+		if reveal {
+			fmt.Fprintf(w, "seed:     %s\n", e.Password)
+		} else {
+			fmt.Fprintf(w, "seed:     %s  (use --reveal to show)\n", store.MaskedPassword(e.Password))
+		}
+		fmt.Fprintf(w, "info:     use 'mys totp %s' to get the current code\n", e.Path)
+		return nil
+	}
 	if reveal {
 		fmt.Fprintf(w, "password: %s\n", e.Password)
 	} else {

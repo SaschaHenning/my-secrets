@@ -35,6 +35,7 @@ const (
 	ActionSyncSetup       = "sync_setup"
 	ActionSyncPush        = "sync_push"
 	ActionSyncPull        = "sync_pull"
+	ActionTOTPGenerate    = "totp_generate"
 )
 
 // Results recorded against each action.

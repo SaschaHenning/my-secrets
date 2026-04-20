@@ -137,6 +137,52 @@ func TestSetIfNotEmpty(t *testing.T) {
 	}
 }
 
+func TestEntryFromSecret_TOTPFields(t *testing.T) {
+	sec := buildSecret("JBSWY3DPEHPK3PXP", map[string]string{
+		"kind":           KindTOTP,
+		"totp_issuer":    "GitHub",
+		"totp_label":     "sascha",
+		"totp_algorithm": "SHA256",
+		"totp_digits":    "8",
+		"totp_period":    "60",
+	})
+	e := entryFromSecret("jasp/github-2fa", sec)
+	if e.Kind != KindTOTP {
+		t.Errorf("kind = %q, want totp", e.Kind)
+	}
+	if e.Password != "JBSWY3DPEHPK3PXP" {
+		t.Errorf("seed = %q", e.Password)
+	}
+	if e.TOTPIssuer != "GitHub" {
+		t.Errorf("issuer = %q", e.TOTPIssuer)
+	}
+	if e.TOTPLabel != "sascha" {
+		t.Errorf("label = %q", e.TOTPLabel)
+	}
+	if e.TOTPAlgorithm != "SHA256" {
+		t.Errorf("algorithm = %q", e.TOTPAlgorithm)
+	}
+	if e.TOTPDigits != 8 {
+		t.Errorf("digits = %d", e.TOTPDigits)
+	}
+	if e.TOTPPeriod != 60 {
+		t.Errorf("period = %d", e.TOTPPeriod)
+	}
+}
+
+func TestEntryFromSecret_TOTPFieldsMissing(t *testing.T) {
+	// A regular (non-TOTP) entry must leave all TOTP fields zero.
+	sec := buildSecret("p1", map[string]string{
+		"username": "alice",
+		"kind":     KindPassword,
+	})
+	e := entryFromSecret("jasp/github", sec)
+	if e.TOTPIssuer != "" || e.TOTPLabel != "" || e.TOTPAlgorithm != "" ||
+		e.TOTPDigits != 0 || e.TOTPPeriod != 0 {
+		t.Errorf("TOTP fields leaked on non-TOTP entry: %+v", e)
+	}
+}
+
 // Close on a nil Store must not panic.
 func TestStore_Close_Nil(t *testing.T) {
 	var s *Store

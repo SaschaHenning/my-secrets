@@ -19,6 +19,7 @@ import (
 	"github.com/SaschaHenning/my-secrets/internal/policy"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
+	totppkg "github.com/SaschaHenning/my-secrets/internal/totp"
 )
 
 // NoSyncFlag is set by the CLI when `--no-sync` is passed. It is a
@@ -126,6 +127,62 @@ func (a *App) Get(ctx context.Context, path string) (*store.Entry, error) {
 	}
 	a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultOK, decision.MatchedRule)
 	return e, nil
+}
+
+// GenerateTOTP computes the current TOTP code for a stored entry. Policy
+// is enforced the same way as for Get — AI callers hit the same allow/deny
+// gate. Every invocation writes a totp_generate audit row including the
+// time-window index so repeated calls within the same window are
+// identifiable. Non-TOTP entries produce a descriptive error plus an
+// error-result audit row.
+func (a *App) GenerateTOTP(ctx context.Context, path string, now time.Time) (string, int, error) {
+	d := caller.Identify(a.Override)
+	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
+	if !decision.Allowed {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultDenied, decision.Reason)
+		return "", 0, &ErrDenied{Path: path, Reason: decision.Reason}
+	}
+	e, err := a.Store.Get(ctx, path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, err.Error())
+		return "", 0, err
+	}
+	if e.Kind != store.KindTOTP {
+		msg := fmt.Sprintf("path %q is not a totp entry", path)
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, msg)
+		return "", 0, errors.New(msg)
+	}
+	alg, algErr := totppkg.ParseAlgorithm(e.TOTPAlgorithm)
+	if algErr != nil {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, algErr.Error())
+		return "", 0, algErr
+	}
+	digits, digErr := totppkg.ParseDigits(fmt.Sprintf("%d", e.TOTPDigits))
+	if digErr != nil {
+		// Treat zero as default here instead of an error.
+		if e.TOTPDigits == 0 {
+			digits, _ = totppkg.ParseDigits("")
+		} else {
+			a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, digErr.Error())
+			return "", 0, digErr
+		}
+	}
+	period := uint(e.TOTPPeriod)
+	if period == 0 {
+		period = 30
+	}
+	reason := fmt.Sprintf("window=%d", totppkg.WindowIndex(now, period))
+	code, secondsLeft, err := totppkg.GenerateCode(e.Password, totppkg.Options{
+		Algorithm: alg,
+		Digits:    digits,
+		Period:    period,
+	}, now)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, err.Error())
+		return "", 0, err
+	}
+	a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultOK, reason)
+	return code, secondsLeft, nil
 }
 
 // List returns paths filtered by the caller's policy. Paths that would be
