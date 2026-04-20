@@ -99,6 +99,60 @@ mys audit tail --actor ai
 mys audit verify                          # prüft Hash-Lücken
 ```
 
+## Checking your setup: `mys doctor`
+
+Ein einzelner Befehl, der zehn Checks durchläuft und beantwortet: „Ist
+meine Installation in Ordnung?"
+
+```bash
+mys doctor                         # Textausgabe
+mys doctor --json                  # maschinenlesbar (CI-tauglich)
+mys doctor --only policy,audit-gaps
+```
+
+Exit-Code ist ≠ 0, sobald ein Check `[FAIL]` meldet.
+
+**Geprüft werden:**
+
+| # | ID                | Kriterium                                          |
+|---|-------------------|----------------------------------------------------|
+| 1 | `store`           | `~/.password-store` oder `$PASSWORD_STORE_DIR`     |
+| 2 | `gpg-key`         | mindestens ein GPG-Secret-Key                      |
+| 3 | `recipients`      | ≥ 2 gopass-Recipients (1 = WARN, „kein Backup")   |
+| 4 | `git-remote`      | `gopass git remote -v` liefert einen Remote        |
+| 5 | `sync-age`        | letzter Fetch ≤ 7 Tage = PASS, ≤ 30 = WARN         |
+| 6 | `audit-writable`  | Audit-DB lässt sich öffnen + beschreiben           |
+| 7 | `audit-gaps`      | `audit.Verify` findet keine Lücken                 |
+| 8 | `signed-chain`    | wenn `MYS_AUDIT_SIGN=1`: Hash-Kette stimmt         |
+| 9 | `paperkey-backup` | `~/.local/share/my-secrets/backups.json` ≥ 1 Eintrag |
+| 10 | `policy`          | `scope-policy.yaml` existiert & parst sauber       |
+
+**Sample-Output** (leere HOME-Umgebung, demonstriert alle Status-Werte):
+
+```
+mys doctor — 2026-04-20 16:43:01
+
+[FAIL] gopass store exists — store directory missing: …/.password-store
+         -> run `gopass setup` to initialise the store
+[FAIL] GPG secret key available — gpg --list-secret-keys failed: exit status 2
+[WARN] gopass git remote — no git remote configured
+         -> configure a remote with `gopass git remote add origin <url>`
+[WARN] last sync age — 12 days ago (ref=HEAD)
+         -> run: mys sync push
+[PASS] audit DB writable — temp DB open+write ok
+[PASS] audit log gaps — no gaps (142 rows)
+[SKIP] signed audit chain — signed mode not enabled (MYS_AUDIT_SIGN unset)
+[WARN] paperkey backup recorded — no paperkey backup recorded
+         -> create one with `mys paperkey backup`
+[WARN] scope policy file — missing at …/scope-policy.yaml (using baked-in defaults)
+         -> run `mys init` to write the default policy
+
+Summary: 2 PASS / 4 WARN / 3 FAIL / 1 SKIP
+```
+
+Jeder `mys doctor`-Lauf schreibt eine einzelne Aggregat-Zeile
+(`action=doctor`, `reason=pass=… warn=… fail=… skip=…`) ins Audit-Log.
+
 ## Web-UI
 
 ```bash

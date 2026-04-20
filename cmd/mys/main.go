@@ -46,6 +46,7 @@ func rootCmd() *cobra.Command {
 		bwExportCmd(&requester),
 		syncCmd(&requester),
 		installSkillCmd(),
+		doctorCmd(&requester),
 	)
 	return root
 }

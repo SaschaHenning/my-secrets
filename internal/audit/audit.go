@@ -27,6 +27,7 @@ const (
 	ActionExport   = "export"
 	ActionWebOpen  = "web_open"
 	ActionMCPStart = "mcp_start"
+	ActionDoctor   = "doctor"
 )
 
 // Results recorded against each action.
