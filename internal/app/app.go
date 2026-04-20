@@ -124,23 +124,53 @@ func (a *App) List(ctx context.Context, org string) ([]string, error) {
 	return filtered, nil
 }
 
-// Search filters by caller policy.
+// storeSearcher is the minimal interface App.Search needs from the store.
+// Extracted so tests can exercise the audit + policy wiring without
+// requiring a real gopass store.
+type storeSearcher interface {
+	Search(ctx context.Context, query string, allow func(path string) bool) (allowed []string, denied []string, err error)
+}
+
+// Search filters by caller policy. Paths denied by policy are filtered out
+// BEFORE the store decrypts them — denied entries never enter process
+// memory. In addition to the aggregate audit row, one denied audit row is
+// written per rejected path so operators can see exactly which secrets a
+// caller attempted to reach.
 func (a *App) Search(ctx context.Context, query string) ([]string, error) {
+	return a.searchWith(ctx, query, a.Store)
+}
+
+func (a *App) searchWith(ctx context.Context, query string, ss storeSearcher) ([]string, error) {
 	d := caller.Identify(a.Override)
-	paths, err := a.Store.Search(ctx, query)
+	// Cache reasons for denied paths so we do not have to call Evaluate
+	// twice per path. The closure collects them as a side effect while
+	// the store walks the list.
+	denyReasons := make(map[string]string)
+	allow := func(p string) bool {
+		dec := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p)
+		if !dec.Allowed {
+			denyReasons[p] = dec.Reason
+			return false
+		}
+		return true
+	}
+	allowed, denied, err := ss.Search(ctx, query, allow)
 	if err != nil {
 		a.writeAudit(ctx, audit.ActionSearch, "", d, audit.ResultError, err.Error())
 		return nil, err
 	}
-	filtered := make([]string, 0, len(paths))
-	for _, p := range paths {
-		if a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p).Allowed {
-			filtered = append(filtered, p)
+	// Per-path denied audit rows.
+	for _, p := range denied {
+		reason := denyReasons[p]
+		if reason == "" {
+			reason = a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p).Reason
 		}
+		a.writeAudit(ctx, audit.ActionSearch, p, d, audit.ResultDenied, reason)
 	}
+	total := len(allowed) + len(denied)
 	a.writeAudit(ctx, audit.ActionSearch, "", d, audit.ResultOK,
-		fmt.Sprintf("query=%q %d of %d visible", query, len(filtered), len(paths)))
-	return filtered, nil
+		fmt.Sprintf("query=%q %d of %d visible", query, len(allowed), total))
+	return allowed, nil
 }
 
 // Add writes a new entry after policy check.
