@@ -6,8 +6,6 @@ package caller
 
 import (
 	"os"
-	"os/exec"
-	"strconv"
 	"strings"
 
 	"golang.org/x/term"
@@ -151,44 +149,26 @@ func executablePath() string {
 }
 
 // parentChain walks from ppid up to PID 1, returning executable names.
-// It uses `ps -o comm= -p <pid>` for cross-Unix portability (BSD ps on
-// macOS, procps ps on Linux).
+//
+// On macOS and Linux we use a per-platform native lookup (sysctl / procfs)
+// that returns both the process name and parent PID in a single call — one
+// syscall per hop instead of two ps(1) subprocess spawns on every mys
+// invocation. See caller_darwin.go and caller_linux.go. Unknown platforms
+// fall back to ps via caller_other.go.
 func parentChain(ppid int) []string {
 	chain := []string{}
 	for p := ppid; p > 1 && len(chain) < 12; {
-		name := processName(p)
-		if name == "" {
+		name, next, ok := processInfo(p)
+		if !ok || name == "" {
 			break
 		}
-		chain = append(chain, name)
-		next := parentOf(p)
+		// Mirror what `ps -o comm=` would print on macOS: trim any
+		// surrounding whitespace / trailing null bytes.
+		chain = append(chain, strings.TrimSpace(name))
 		if next == p || next <= 0 {
 			break
 		}
 		p = next
 	}
 	return chain
-}
-
-func processName(pid int) string {
-	if pid <= 0 {
-		return ""
-	}
-	out, err := exec.Command("ps", "-o", "comm=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
-func parentOf(pid int) int {
-	out, err := exec.Command("ps", "-o", "ppid=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return 0
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
-		return 0
-	}
-	return n
 }
