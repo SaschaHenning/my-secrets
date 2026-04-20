@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/spf13/cobra"
 )
 
@@ -22,15 +23,24 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	var requester string
+	var noSync bool
 	root := &cobra.Command{
 		Use:           "mys",
 		Short:         "my-secrets — local credential manager with audit log",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Version:       Version,
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			// Mirror the flag into the app package so that App.AutoSync
+			// can observe it without having to thread a parameter
+			// through every call site.
+			app.NoSyncFlag = noSync
+		},
 	}
 	root.PersistentFlags().StringVar(&requester, "requester", "",
 		"explicit caller label (claude-code | human | script | ai). Cannot downgrade detected AI signals.")
+	root.PersistentFlags().BoolVar(&noSync, "no-sync", false,
+		"skip auto-sync after add/rotate/rm (equivalent to MYS_AUTO_SYNC=0 for this invocation)")
 
 	root.AddCommand(
 		initCmd(&requester),

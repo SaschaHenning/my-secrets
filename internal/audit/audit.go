@@ -32,6 +32,9 @@ const (
 	ActionRecipientAdd    = "recipient_add"
 	ActionRecipientList   = "recipient_list"
 	ActionRecipientRemove = "recipient_remove"
+	ActionSyncSetup       = "sync_setup"
+	ActionSyncPush        = "sync_push"
+	ActionSyncPull        = "sync_pull"
 )
 
 // Results recorded against each action.

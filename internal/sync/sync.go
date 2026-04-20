@@ -210,6 +210,89 @@ func (ExecRunner) Run(ctx context.Context, name string, args ...string) ([]byte,
 	return out, nil
 }
 
+// LoadConfig is a convenience wrapper around Load("") that always reads
+// the default sync config path. Returns an empty *Config (no remotes) if
+// the file does not exist — callers can treat „no remotes" as „sync not
+// set up".
+func LoadConfig() (*Config, error) {
+	return Load("")
+}
+
+// PushAll iterates over every configured remote and runs `gopass sync`
+// against it. The context controls timeout/cancellation for the whole
+// batch; if one remote fails, the error is returned immediately and
+// subsequent remotes are skipped. Output is discarded — this function
+// is intended for automated hooks, not interactive reporting.
+func PushAll(ctx context.Context, r Runner) error {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	cfg, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+	if len(cfg.Remotes) == 0 {
+		return nil
+	}
+	for _, rem := range cfg.Remotes {
+		if _, err := GopassSync(ctx, r, rem.Mount); err != nil {
+			return fmt.Errorf("sync %s: %w", rem.Mount, err)
+		}
+	}
+	return nil
+}
+
+// IsAutoSyncDisabled reports whether the MYS_AUTO_SYNC env var is set to
+// a value that means „off": "0", "false", "no", "off" (case-insensitive).
+// Any other value — including the empty string (unset) — means enabled.
+func IsAutoSyncDisabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("MYS_AUTO_SYNC")))
+	switch v {
+	case "0", "false", "no", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+// AutoSync performs a best-effort `gopass sync` for every configured
+// remote. The context MUST already carry the caller's timeout (5 s in
+// the App layer).
+//
+// Returns:
+//   - skipped=true, err=nil when no sync should happen (no config file,
+//     no remotes configured, or MYS_AUTO_SYNC=0/false/off). Callers
+//     should NOT write an audit row in the skipped case.
+//   - skipped=false, err=nil on a successful push of every remote.
+//   - skipped=false, err!=nil if any remote failed (timeout, network,
+//     auth). The local gopass commit has already happened — the caller
+//     is expected to surface a warning and record an audit row with
+//     result=error but keep the CLI exit code at 0.
+//
+// The trigger argument is a free-form label ("add jasp/github",
+// "rotate zuhause/router") that the App layer uses to build the audit
+// reason; AutoSync itself does not consume it but accepting it keeps the
+// call site readable.
+func AutoSync(ctx context.Context, r Runner, trigger string) (skipped bool, err error) {
+	_ = trigger // used by callers for audit reason construction
+	if IsAutoSyncDisabled() {
+		return true, nil
+	}
+	cfg, cerr := LoadConfig()
+	if cerr != nil {
+		// A corrupt config is a real error — surface it. A missing file
+		// is handled inside Load() and returns an empty Config.
+		return false, cerr
+	}
+	if cfg == nil || len(cfg.Remotes) == 0 {
+		return true, nil
+	}
+	if err := PushAll(ctx, r); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 // GopassSync runs `gopass sync` (push + pull) for every configured store.
 // When mount is empty, syncs all mounts. Returns the combined output.
 func GopassSync(ctx context.Context, r Runner, mount string) ([]byte, error) {

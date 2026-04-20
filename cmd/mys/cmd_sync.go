@@ -17,13 +17,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Audit action names for sync operations. Kept local — the audit package
-// does not enumerate every possible action, and the sync actions are
-// not part of the core read/write/list/delete surface.
+// Audit action names for sync operations. Aliases for the exported
+// constants in the audit package, kept to minimise diff noise in the
+// rest of this file.
 const (
-	actionSyncSetup = "sync_setup"
-	actionSyncPush  = "sync_push"
-	actionSyncPull  = "sync_pull"
+	actionSyncSetup = audit.ActionSyncSetup
+	actionSyncPush  = audit.ActionSyncPush
+	actionSyncPull  = audit.ActionSyncPull
 )
 
 // syncCmd builds the `mys sync` subcommand tree.
