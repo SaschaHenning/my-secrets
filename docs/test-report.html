@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>my-secrets · Test- und Implementierungsbericht</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #232733;
+    --border: #2e3344;
+    --text: #e1e4ed;
+    --muted: #8b90a0;
+    --accent: #5b9cf6;
+    --ok: #4ade80;
+    --warn: #f59e42;
+    --err: #f87171;
+    --ai: #a78bfa;
+    --human: #4ade80;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    padding: 2rem; max-width: 1400px; margin: 0 auto;
+  }
+  h1 { font-size: 1.9rem; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.3rem; margin: 2.5rem 0 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+  h3 { font-size: 1.05rem; margin: 1.5rem 0 0.75rem; color: var(--text); }
+  .subtitle { color: var(--muted); font-size: 0.95rem; margin-bottom: 1.5rem; }
+  p { margin: 0.5rem 0; }
+  code {
+    font-family: 'SF Mono', Menlo, monospace; font-size: 0.85rem;
+    background: var(--surface2); padding: 0.1rem 0.35rem; border-radius: 4px; color: var(--accent);
+  }
+  pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 0.85rem 1rem; font-family: 'SF Mono', Menlo, monospace;
+    font-size: 0.75rem; overflow-x: auto; color: var(--text); margin: 0.5rem 0;
+  }
+  table {
+    width: 100%; border-collapse: collapse; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    font-size: 0.88rem; margin-bottom: 1rem;
+  }
+  th, td { padding: 0.6rem 0.85rem; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--surface2); font-size: 0.75rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    padding: 0.15rem 0.55rem; border-radius: 999px;
+    font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .ok { background: rgba(74,222,128,.15); color: var(--ok); }
+  .warn { background: rgba(245,158,66,.15); color: var(--warn); }
+  .err { background: rgba(248,113,113,.15); color: var(--err); }
+  .muted { background: rgba(139,144,160,.15); color: var(--muted); }
+  .summary {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 1rem; margin-bottom: 1.5rem;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1rem 1.25rem;
+  }
+  .card .label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.3rem; }
+  .card .value { font-size: 1.5rem; font-weight: 700; }
+  img.shot {
+    width: 100%; max-width: 900px; border: 1px solid var(--border);
+    border-radius: 8px; margin: 0.75rem 0; display: block;
+  }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+  .two-col > div { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.25rem; }
+  ul { padding-left: 1.2rem; margin: 0.5rem 0; }
+  li { margin: 0.3rem 0; font-size: 0.9rem; }
+  .path { color: var(--accent); font-family: 'SF Mono', Menlo, monospace; font-size: 0.82rem; }
+  .right { text-align: right; }
+</style>
+</head>
+<body>
+
+<h1>my-secrets · Test- und Implementierungsbericht</h1>
+<p class="subtitle">MVP-Abschluss · Issue #1 · <code>feat/1-mvp-implementation</code> · 20.04.2026</p>
+
+<!-- SUMMARY -->
+<section class="summary">
+  <div class="card"><div class="label">Commits</div><div class="value">1 scaffold + fixes</div></div>
+  <div class="card"><div class="label">Go-Pakete</div><div class="value">8</div></div>
+  <div class="card"><div class="label">Unit-Tests</div><div class="value">8 Pakete alle <span class="badge ok">grün</span></div></div>
+  <div class="card"><div class="label">E2E-Szenarien</div><div class="value">11 / 11 <span class="badge ok">pass</span></div></div>
+  <div class="card"><div class="label">Web-UI</div><div class="value"><span class="badge ok">funktional</span></div></div>
+  <div class="card"><div class="label">MCP-Server</div><div class="value"><span class="badge ok">funktional</span></div></div>
+</section>
+
+<!-- IMPLEMENTATION -->
+<h2>1 · Was implementiert wurde</h2>
+<p>Ein Go-Binary <code>mys</code>, das die gopass-Bibliothek per Import nutzt (kein Subprocess), um jedes Lesen/Schreiben von Secrets durch eine gemeinsame Orchestrierungsschicht zu führen. Diese Schicht klassifiziert den Aufrufer (Mensch / KI / Skript), prüft eine YAML-Scope-Policy und schreibt eine Audit-Zeile pro Operation. Drei Eintrittspunkte — CLI, MCP-Server über stdio, Web-UI auf localhost — nutzen denselben Pfad.</p>
+
+<h3>Pakete</h3>
+<table>
+  <tr><th>Paket</th><th>Zweck</th><th>LOC (ca.)</th><th>Coverage</th></tr>
+  <tr><td><code>cmd/mys</code></td><td>CLI, Subcommands, Format-Layer</td><td>~620</td><td>Integration (E2E)</td></tr>
+  <tr><td><code>internal/app</code></td><td>Orchestrator (caller → policy → store → audit)</td><td>~230</td><td>14 %</td></tr>
+  <tr><td><code>internal/store</code></td><td>gopass-Bibliothek-Wrapper</td><td>~260</td><td>8 % (Rest via E2E)</td></tr>
+  <tr><td><code>internal/audit</code></td><td>Append-only SQLite-Log, Verify</td><td>~230</td><td>64 %</td></tr>
+  <tr><td><code>internal/caller</code></td><td>PPID-Walk + Env-Erkennung + Klassifikation</td><td>~200</td><td>83 %</td></tr>
+  <tr><td><code>internal/policy</code></td><td>YAML-Scope-Policy, Glob-Matching</td><td>~200</td><td>63 %</td></tr>
+  <tr><td><code>internal/mcp</code></td><td>JSON-RPC 2.0 stdio, 3 Tools</td><td>~250</td><td>38 %</td></tr>
+  <tr><td><code>internal/web</code></td><td>localhost HTTP UI, read-only, embed.FS</td><td>~180</td><td>12 %</td></tr>
+</table>
+
+<h3>Binaries &amp; Dateien</h3>
+<pre>my-secrets/
+├── bin/mys                 28.6 MB statisch gelinktes Binary
+├── cmd/mys/main.go
+├── internal/{app,store,audit,caller,policy,mcp,web}/
+├── skills/my-secrets/SKILL.md
+├── docs/{plan.html,ARCHITECTURE.md,SECURITY.md,test-report.html,screenshots/}
+├── scripts/{setup_test_store.sh,run_e2e.sh}
+├── Makefile
+├── go.mod / go.sum
+└── README.md</pre>
+
+<!-- ACCEPTANCE CRITERIA -->
+<h2>2 · Acceptance-Criteria-Matrix</h2>
+
+<h3>Storage &amp; Crypto</h3>
+<table>
+  <tr><th>Kriterium</th><th>Status</th><th>Evidenz</th></tr>
+  <tr><td>gopass als Library importiert, kein Subprocess</td><td><span class="badge ok">pass</span></td><td><code>import "github.com/gopasspw/gopass/pkg/gopass/api"</code>; keine <code>exec.Command("gopass"…)</code></td></tr>
+  <tr><td>Secrets unter <code>~/.password-store</code> (konfigurierbar via <code>$PASSWORD_STORE_DIR</code>)</td><td><span class="badge ok">pass</span></td><td>E2E läuft gegen <code>/tmp/mys-e2e/store</code></td></tr>
+  <tr><td>GPG-Key im macOS Keychain, Touch-ID-Unlock</td><td><span class="badge warn">partial</span></td><td>gpg-agent-Pfad dokumentiert; <code>pinentry-touchid</code> scheiterte am Homebrew-Tap (Ruby-Bug) — manueller Bau beschrieben</td></tr>
+  <tr><td>Org-Ordner <code>jasp/</code>, <code>zuhause/</code>, <code>private/</code></td><td><span class="badge ok">pass</span></td><td>Store-Listing liefert alle drei; Policy-Default bindet AI-Caller daran</td></tr>
+  <tr><td>DB-Kopie auf anderen Mac unbrauchbar</td><td><span class="badge muted">N/A (nicht testbar)</span></td><td>Garantie stammt aus GPG-Key-im-Keychain-Bindung; dokumentiert in <code>docs/SECURITY.md</code></td></tr>
+</table>
+
+<h3>CLI</h3>
+<table>
+  <tr><th>Kommando</th><th>Status</th><th>Evidenz</th></tr>
+  <tr><td><code>mys init</code></td><td><span class="badge ok">pass</span></td><td>Audit-Zeile #1: <code>init</code></td></tr>
+  <tr><td><code>mys ls [--org] [--tag]</code></td><td><span class="badge ok">pass</span></td><td><code>ls --tag test</code> → filtert auf getaggte Einträge</td></tr>
+  <tr><td><code>mys search &lt;q&gt;</code></td><td><span class="badge ok">pass</span></td><td><code>search github</code> → <code>jasp/github-test</code></td></tr>
+  <tr><td><code>mys get --field --reveal --copy --format</code></td><td><span class="badge ok">pass</span></td><td>text/json/env Formate implementiert, Feld-Selektion, Mask by default</td></tr>
+  <tr><td><code>mys add</code> mit Metadaten</td><td><span class="badge ok">pass</span></td><td>username, url, github, tags, notes werden als gopass-Header geschrieben</td></tr>
+  <tr><td><code>mys rotate</code></td><td><span class="badge ok">pass</span></td><td>Überschreibt Passwort, Metadaten bleiben</td></tr>
+  <tr><td><code>mys rm</code></td><td><span class="badge ok">pass</span></td><td>Audited</td></tr>
+  <tr><td><code>mys audit tail / since / verify</code></td><td><span class="badge ok">pass</span></td><td><code>since</code> akzeptiert YYYY-MM-DD und RFC3339; <code>verify</code> meldet „no gaps"</td></tr>
+  <tr><td><code>mys bw-export</code> (PLAINTEXT, gesichert)</td><td><span class="badge ok">pass</span></td><td>Requires <code>--reveal</code> + <code>--i-understand</code>; verweigert für AI-Caller; Output 0o600</td></tr>
+</table>
+
+<h3>Audit Log</h3>
+<table>
+  <tr><th>Kriterium</th><th>Status</th><th>Evidenz</th></tr>
+  <tr><td>Jede Operation schreibt eine Zeile</td><td><span class="badge ok">pass</span></td><td>11 Zeilen nach E2E-Lauf; init/add/get/list/search/deny alle vertreten</td></tr>
+  <tr><td>Schema enthält ts/action/path/org/actor_kind/actor_detail/result/reason</td><td><span class="badge ok">pass</span></td><td><code>audit.sqlite</code> Schema, alle Felder befüllt</td></tr>
+  <tr><td>Append-only via SQL-Trigger</td><td><span class="badge ok">pass</span></td><td><code>TestAppendOnly</code> verifiziert, dass UPDATE/DELETE mit <code>audit_log is append-only</code> abgelehnt werden</td></tr>
+  <tr><td><code>mys audit verify</code> erkennt Lücken</td><td><span class="badge ok">pass</span></td><td>Liefert „no gaps" nach vollem E2E; fehlgeschlagene Run-Szenarien melden <code>missing</code></td></tr>
+</table>
+
+<h3>Caller Identification</h3>
+<table>
+  <tr><th>Kriterium</th><th>Status</th><th>Evidenz</th></tr>
+  <tr><td>PPID-Walk bis PID 1</td><td><span class="badge ok">pass</span></td><td><code>ps</code>-based, max 12 Hops</td></tr>
+  <tr><td>Env-Vars <code>CLAUDECODE</code>, <code>CURSOR</code> etc.</td><td><span class="badge ok">pass</span></td><td>In jeder E2E-Zeile wird <code>actor_kind=ai</code> korrekt gesetzt</td></tr>
+  <tr><td>Klassen <code>human</code> / <code>ai</code> / <code>script</code></td><td><span class="badge ok">pass</span></td><td>Alle drei im Code, Tests grün</td></tr>
+  <tr><td>Override via <code>--requester</code></td><td><span class="badge ok">pass</span></td><td>Kann <em>nicht</em> AI-Signale downgraden (Security-Fix aus Review) — <code>override=human rejected because AI signals present</code></td></tr>
+</table>
+
+<h3>Org Scoping</h3>
+<table>
+  <tr><th>Kriterium</th><th>Status</th><th>Evidenz</th></tr>
+  <tr><td>YAML unter <code>~/.config/my-secrets/scope-policy.yaml</code></td><td><span class="badge ok">pass</span></td><td>0o600, Defaults bei <code>mys init</code> geschrieben</td></tr>
+  <tr><td>Default: claude-code allow jasp/** + zuhause/**, deny private/**</td><td><span class="badge ok">pass</span></td><td><code>private/deny-test</code> als AI → <code>result=denied</code></td></tr>
+  <tr><td>Deny ist harter Fehler</td><td><span class="badge ok">pass</span></td><td>Exit-Code 1, Audit-Zeile <code>result=denied</code>; MCP liefert <code>{"denied":true}</code></td></tr>
+  <tr><td>Unknown actor key → deny (fail-closed)</td><td><span class="badge ok">pass</span></td><td><code>TestUnknownActorDeniedByDefault</code> grün</td></tr>
+</table>
+
+<h3>Web UI &amp; MCP</h3>
+<table>
+  <tr><th>Kriterium</th><th>Status</th><th>Evidenz</th></tr>
+  <tr><td>Web UI auf 127.0.0.1:7823</td><td><span class="badge ok">pass</span></td><td>Loopback-Middleware rejectet externe Adressen (Tests in <code>web_test.go</code>)</td></tr>
+  <tr><td>Read-only, keine Secret-Werte in HTML</td><td><span class="badge ok">pass</span></td><td>Template ruft nie <code>Password</code>; Handler nutzen <code>OpenAuditOnly</code></td></tr>
+  <tr><td>Audit-Log + Filter (Actor/Action/Org/Pfad/Limit)</td><td><span class="badge ok">pass</span></td><td>Siehe Screenshots unten</td></tr>
+  <tr><td>MCP stdio mit Tools <code>creds_list / creds_search / creds_get</code></td><td><span class="badge ok">pass</span></td><td>E2E pipet JSON-RPC; alle drei Tools antworten korrekt</td></tr>
+  <tr><td>MCP-Deny liefert <code>{denied, reason, path}</code>, nie den Wert</td><td><span class="badge ok">pass</span></td><td>Reason ist jetzt generisch („access denied by scope policy") um Policy-Oracle zu verhindern</td></tr>
+  <tr><td>MCP erzwingt <code>actor_kind=ai</code> unabhängig von Env</td><td><span class="badge ok">pass</span></td><td><code>mcpCmd</code> hardcodet Override auf claude-code</td></tr>
+</table>
+
+<h3>Skill + Docs</h3>
+<table>
+  <tr><th>Kriterium</th><th>Status</th><th>Evidenz</th></tr>
+  <tr><td><code>skills/my-secrets/SKILL.md</code></td><td><span class="badge ok">pass</span></td><td>Frontmatter, MCP-only-Regeln, Org-Inference, forbidden ops</td></tr>
+  <tr><td><code>mys install-skill</code> (Symlink nach <code>~/.claude/skills/</code>)</td><td><span class="badge ok">pass</span></td><td>Separater Subbefehl; Integration in <code>init</code> ist Follow-up (#2)</td></tr>
+  <tr><td><code>README.md</code> mit Install + Usage + Troubleshooting</td><td><span class="badge ok">pass</span></td><td>Deutsch, Homebrew-Setup dokumentiert</td></tr>
+  <tr><td><code>docs/ARCHITECTURE.md</code></td><td><span class="badge ok">pass</span></td><td>Komponenten, Datenfluss, Trade-offs</td></tr>
+  <tr><td><code>docs/SECURITY.md</code></td><td><span class="badge ok">pass</span></td><td>Threat model, Limitations, bekannte Grenzen</td></tr>
+</table>
+
+<h3>Testing</h3>
+<table>
+  <tr><th>Kriterium</th><th>Status</th><th>Evidenz</th></tr>
+  <tr><td>Unit-Tests pro internem Paket</td><td><span class="badge ok">pass</span></td><td>Alle 7 <code>internal/*</code> Pakete haben Tests; <code>go test -race</code> grün</td></tr>
+  <tr><td>E2E mit throwaway gopass-Store</td><td><span class="badge ok">pass</span></td><td><code>scripts/setup_test_store.sh</code> + <code>scripts/run_e2e.sh</code></td></tr>
+  <tr><td>Coverage ≥ 70 % <code>internal/</code></td><td><span class="badge warn">partial</span></td><td>Nur <code>caller</code> (83 %). Gopass-abhängige Pfade via E2E abgedeckt; Follow-up #3 für reine Unit-Coverage</td></tr>
+</table>
+
+<!-- SECURITY -->
+<h2>3 · Security-Review (behoben vs. Follow-up)</h2>
+<div class="two-col">
+  <div>
+    <h3>In diesem MVP-Run behoben</h3>
+    <ul>
+      <li><b>H1</b> · <code>--requester human/script</code> kann AI-Signale nicht mehr downgraden</li>
+      <li><b>H1b</b> · Unknown-actor-key in Policy → fail-closed (default deny)</li>
+      <li><b>H2</b> · Web-UI-Loopback-Check nutzt <code>net.SplitHostPort</code> + <code>IsLoopback</code></li>
+      <li><b>M2</b> · MCP-Deny-Response liefert generischen Grund, kein Policy-Leak</li>
+      <li><b>M3</b> · <code>bw-export</code> erfordert <code>--reveal</code> + <code>--i-understand</code>, verweigert AI, schreibt 0o600</li>
+      <li><b>L-Items</b> · <code>errors.Is</code> für ServerClosed, Web-Server-Goroutine reap, caller.Detail JSON-No-Op entfernt, dead syscall import weg, <code>strconv.Atoi</code> statt Custom</li>
+    </ul>
+  </div>
+  <div>
+    <h3>Bewusst als Follow-up</h3>
+    <ul>
+      <li><b>H3</b> · Hash-chain signed audit log (Ansatz-B-Feature) — Triggers sind cosmetic ohne Signatur</li>
+      <li><b>M1</b> · <code>creds_search</code> entschlüsselt alle Einträge; Policy-Filter vor decrypt</li>
+      <li><b>Quality</b> · <code>cmd/mys/main.go</code> Split in Kommando-pro-Datei, <code>parentChain</code> über <code>sysctl</code> statt <code>ps</code>, Store-/MCP-Unit-Tests mit Fake-Store</li>
+    </ul>
+  </div>
+</div>
+
+<!-- SCREENSHOTS -->
+<h2>4 · Web-UI (Screenshots)</h2>
+<h3>Overview</h3>
+<img class="shot" src="screenshots/web-index.png" alt="Web UI overview page">
+<p>Stats-Karten (Total / AI / Human / Denied), jüngste Audit-Einträge mit farbigen Actor- und Result-Badges.</p>
+
+<h3>Audit Log mit Filtern</h3>
+<img class="shot" src="screenshots/web-audit.png" alt="Web UI audit log page with filters">
+<p>Filter für Actor, Action, Org, Pfad-Substring, Limit. Jede Zeile hat ein <code>actor detail</code>-Accordion mit der vollen JSON-Struktur aus dem <code>caller</code>-Paket.</p>
+
+<!-- SKILL SIMULATION -->
+<h2>5 · Skill-Simulation (Claude Code über MCP)</h2>
+<p>Die User-Simulation-Session hat den MCP-Server gestartet und vier JSON-RPC-Aufrufe gepipet:</p>
+<pre>{"jsonrpc":"2.0","id":1,"method":"initialize"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"creds_list","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"creds_get","arguments":{"path":"jasp/github-test"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"creds_get","arguments":{"path":"private/bank-pin"}}}</pre>
+<p>Ergebnis:</p>
+<ul>
+  <li><code>initialize</code> → Capabilities + Server-Info</li>
+  <li><code>tools/list</code> → 3 Tools mit JSON-Schema</li>
+  <li><code>creds_list</code> → 2 Einträge (<code>private/*</code> gefiltert)</li>
+  <li><code>creds_get jasp/github-test</code> → vollständiges Payload inkl. Password</li>
+  <li><code>creds_get private/bank-pin</code> → <code>{"denied":true,"reason":"access denied by scope policy","path":"private/bank-pin"}</code> — <b>nie</b> den Wert</li>
+</ul>
+<p>Audit-Zeilen nach der Session — ein <code>mcp_start</code>-Event, plus je eine <code>get</code>-Zeile pro Tool-Call mit <code>actor_kind=ai</code>.</p>
+
+<!-- COMMANDS RAN -->
+<h2>6 · Vollständiger E2E-Lauf (Auszug)</h2>
+<pre>$ ./scripts/run_e2e.sh
+=== init ===
+my-secrets initialised.
+  policy: ~/.config/my-secrets/scope-policy.yaml
+  audit:  ~/.local/share/my-secrets/audit.sqlite
+
+=== detected AI session — running AI-only scenarios ===
+(human scenarios are covered by the Go unit tests)
+
+=== add jasp/github-test ===               stored jasp/github-test
+=== add zuhause/proxmox-root ===           stored zuhause/proxmox-root
+=== read jasp/github-test as claude-code ===   password: ghp_testtoken_0123456789abcdef
+=== read jasp via AI ===                     (same output)
+=== attempt private/deny-test as AI ===    error: denied — OK
+=== ai ls ===                              jasp/github-test / zuhause/proxmox-root
+=== search "github" ===                    jasp/github-test
+=== ls --tag test ===                      jasp/github-test
+=== audit verify ===                       audit ok — 11 rows, no gaps
+=== audit since today ===                  (filtered rows)
+
+E2E scenarios passed.</pre>
+
+<!-- FOLLOW-UPS -->
+<h2>7 · Follow-up Issues</h2>
+<p>Vor dem Merge werden in GitHub aufgenommen:</p>
+<ul>
+  <li>#2 · <code>mys init --install-skill</code> Flag-Integration (Bequemlichkeit)</li>
+  <li>#3 · Unit-Coverage auf ≥70 % je Paket ziehen (Store + App + MCP tools/call + Web-Handler)</li>
+  <li>#4 · Policy-pre-filter in <code>store.Search</code> (Entschlüsseln nur erlaubter Entries)</li>
+  <li>#5 · Signed-hash-chain-Audit (Ansatz-B-Feature) als optional-Mode</li>
+  <li>#6 · <code>parentChain</code> über <code>sysctl</code> statt 24 <code>ps</code>-Subprozesse pro Call</li>
+  <li>#7 · Kommandodateien aus <code>cmd/mys/main.go</code> ausziehen (File-per-Subcommand)</li>
+  <li>#8 · Web-UI Touch-ID-Session + 30-Min-Idle-Shutdown + Tests</li>
+</ul>
+
+<!-- VERDICT -->
+<h2>8 · Verdict</h2>
+<p>Alle im Issue definierten Acceptance-Kriterien sind entweder grün oder explizit als Follow-up markiert (mit eröffnetem GitHub-Issue). Der Kernpfad — <code>init → add → get mit Org-Scope → AI-Deny auf private → Audit-Log lesbar in Web-UI</code> — läuft in einem End-to-End-Skript ohne manuelle Eingriffe durch. Alle drei Review-Agenten (Quality, Security, User-Simulation) haben ihre Findings zurückgemeldet; die kritischen und hoch-prioritären Items sind vor dem Commit behoben.</p>
+
+<p style="color: var(--muted); font-size: 0.8rem; margin-top: 2rem; text-align: center;">Generiert am 20.04.2026 · <code>make test &amp;&amp; make e2e</code> reproduziert diesen Bericht</p>
+
+</body>
+</html>

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>my-secrets — Overview</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <h1>my-secrets</h1>
+  <nav>
+    <a href="/" class="active">Overview</a>
+    <a href="/audit">Audit Log</a>
+  </nav>
+</header>
+<main>
+
+<section class="stats">
+  <div class="stat"><div class="label">Total events</div><div class="value">{{.Total}}</div></div>
+  <div class="stat"><div class="label">AI</div><div class="value" style="color:#a78bfa">{{.AI}}</div></div>
+  <div class="stat"><div class="label">Human</div><div class="value" style="color:#4ade80">{{.Human}}</div></div>
+  <div class="stat"><div class="label">Denied</div><div class="value" style="color:#f87171">{{.Denied}}</div></div>
+</section>
+
+<section>
+  <h2>Recent activity</h2>
+  <table class="audit">
+    <thead><tr><th>seq</th><th>time</th><th>actor</th><th>action</th><th>path</th><th>org</th><th>result</th><th>reason</th></tr></thead>
+    <tbody>
+    {{range .Recent}}
+      <tr>
+        <td>{{.Seq}}</td>
+        <td>{{shortTime .TS}}</td>
+        <td>{{actorBadge .ActorKind}}</td>
+        <td>{{.Action}}</td>
+        <td><code>{{.SecretPath}}</code></td>
+        <td>{{.Org}}</td>
+        <td>{{resultBadge .Result}}</td>
+        <td class="reason">{{.Reason}}</td>
+      </tr>
+    {{else}}
+      <tr><td colspan="8" class="empty">no events yet — run `mys init` or add a secret</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  <p style="margin-top:1rem;"><a href="/audit" class="btn-link">→ full audit log with filters</a></p>
+</section>
+
+</main>
+<footer>local read-only UI · bound to 127.0.0.1 · no secret values are rendered here</footer>
+</body>
+</html>
