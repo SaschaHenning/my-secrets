@@ -153,6 +153,30 @@ Summary: 2 PASS / 4 WARN / 3 FAIL / 1 SKIP
 Jeder `mys doctor`-Lauf schreibt eine einzelne Aggregat-Zeile
 (`action=doctor`, `reason=pass=… warn=… fail=… skip=…`) ins Audit-Log.
 
+## Key-Backup
+
+Der Private Key, der den ganzen Store entschlüsselt, ist die „Krone". Geht
+er verloren, sind **alle** Secrets weg — auf jedem Gerät, für immer.
+Deshalb gibt es `mys key backup`:
+
+```bash
+# Paperkey: kompakte Druckausgabe des Secret Keys.
+mys key backup --paper --out key.paper
+lp key.paper                                          # ausdrucken + wegschließen
+
+# ASCII-armored, symmetrisch verschlüsselt (AES256): sicher für USB-Sticks.
+mys key backup --armored --symmetric --out key.asc.gpg
+
+# Was ist schon gesichert?
+mys key backup --status
+```
+
+Diese Backups sind **persönlich**: sie rekonstruieren den Key, dem der
+ganze Store gehört. Niemals mit Kolleginnen teilen — für Team-Sharing
+gibt es `mys bw-export`. Metadaten jedes Backups landen in
+`~/.local/share/my-secrets/backups.json` (niemals Key-Material) und als
+`action=key_backup`-Zeile im Audit-Log.
+
 ## Web-UI
 
 ```bash
