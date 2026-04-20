@@ -59,6 +59,12 @@ type WizardOptions struct {
 	// DryRun: skip every subprocess call (gh/gopass). Tests use this
 	// together with a non-nil Runner that records the attempted calls.
 	DryRun bool
+	// KeyFingerprint is the GPG fingerprint of the user's current key.
+	// When set, the initial-sync reconcile step uses it to re-add the
+	// key as a recipient after adopting an existing remote store. If
+	// empty, no adopt happens for a pristine local mount paired with a
+	// non-empty remote and the user has to recover by hand.
+	KeyFingerprint string
 }
 
 // RunWizard executes the full setup flow. On success it returns the
@@ -145,13 +151,23 @@ func RunWizard(ctx context.Context, io WizardIO, opts WizardOptions) (*Config, e
 	}
 
 	// Initial sync — surfaces GPG prompt once, right after setup.
+	// Replaces an earlier `gopass sync` call that was blind to the
+	// state of the remote: if the remote repo had any prior history
+	// (another device, a pre-existing backup), pull failed with
+	// „refusing to merge unrelated histories" and the whole flow
+	// aborted. We now fetch, reconcile with whatever the remote has,
+	// and push explicitly — see ReconcileWithRemote for the full
+	// decision tree.
 	if !opts.DryRun {
-		for _, r := range cfg.Remotes {
-			fmt.Fprintf(io.Out, "Initialer Sync für Mount %q...\n", r.Mount)
-			if _, err := GopassSync(ctx, opts.Runner, r.Mount); err != nil {
-				return nil, fmt.Errorf("initial sync for %q: %w", r.Mount, err)
+		for _, rem := range cfg.Remotes {
+			fmt.Fprintf(io.Out, "Initialer Sync für Mount %q...\n", rem.Mount)
+			if err := ReconcileWithRemote(ctx, opts.Runner, rem.Mount, opts.KeyFingerprint); err != nil {
+				return nil, fmt.Errorf("initial sync for %q: %w", rem.Mount, err)
 			}
-			cfg.MarkSynced(r.Mount, time.Now())
+			if _, err := GopassGit(ctx, opts.Runner, rem.Mount, "push", "origin", "main"); err != nil {
+				return nil, fmt.Errorf("initial push for %q: %w", rem.Mount, err)
+			}
+			cfg.MarkSynced(rem.Mount, time.Now())
 		}
 	}
 

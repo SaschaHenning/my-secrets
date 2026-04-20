@@ -357,6 +357,36 @@ func GopassGitInit(ctx context.Context, r Runner, mount string) ([]byte, error) 
 	return r.Run(ctx, "gopass", args...)
 }
 
+// GopassGit forwards arbitrary arguments to `gopass git` for the given
+// mount. Needed by the reconcile flow, which issues fetch / rev-parse /
+// merge / reset / push against the mount's embedded git repo.
+func GopassGit(ctx context.Context, r Runner, mount string, gitArgs ...string) ([]byte, error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	args := []string{"git"}
+	if mount != "" && mount != DefaultStoreMount {
+		args = append(args, "--store", mount)
+	}
+	args = append(args, gitArgs...)
+	return r.Run(ctx, "gopass", args...)
+}
+
+// GopassRecipientsAdd runs `gopass recipients add --store <mount> <fpr>`.
+// Used by the reconcile flow to re-assert the current key as a reader
+// after adopting an existing remote store.
+func GopassRecipientsAdd(ctx context.Context, r Runner, mount, fingerprint string) ([]byte, error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	args := []string{"recipients", "add"}
+	if mount != "" && mount != DefaultStoreMount {
+		args = append(args, "--store", mount)
+	}
+	args = append(args, fingerprint)
+	return r.Run(ctx, "gopass", args...)
+}
+
 // GopassGitRemoteAdd runs `gopass git remote add <name> <url>` on the
 // given mount.
 //
@@ -375,6 +405,119 @@ func GopassGitRemoteAdd(ctx context.Context, r Runner, mount, url string) ([]byt
 	}
 	args = append(args, "remote", "add", "origin", url)
 	return r.Run(ctx, "gopass", args...)
+}
+
+// ReconcileWithRemote brings a freshly-initialised local mount into a
+// state where the subsequent `git push` will succeed, regardless of
+// whether the remote is empty, in sync, ahead, or has a divergent
+// history (the „unrelated histories" case).
+//
+// The four possible states and their treatment:
+//
+//	(a) Remote has no main branch yet               → nothing to do.
+//	(b) origin/main is an ancestor of HEAD          → nothing to do.
+//	(c) HEAD is an ancestor of origin/main          → fast-forward merge.
+//	(d) Divergent histories                         → see below.
+//
+// For divergent histories we distinguish two sub-cases based on whether
+// the local mount is „pristine" (nothing but the files a `gopass git
+// init` leaves behind):
+//
+//	(d1) pristine → adopt the remote: `reset --hard origin/main`, then
+//	     `gopass recipients add <fingerprint>` so that subsequent
+//	     `gopass insert` calls encrypt to the current key as well.
+//	(d2) non-pristine → merge with `--allow-unrelated-histories`. If
+//	     the merge conflicts, a clear error is returned and the caller
+//	     must resolve manually — we refuse to silently discard user
+//	     content.
+//
+// fingerprint is required in the adopt path (d1). The other paths
+// ignore it; pass "" if it is not available and no adopt will happen
+// because the local mount already has user content.
+func ReconcileWithRemote(ctx context.Context, r Runner, mount, fingerprint string) error {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	// `gopass git fetch origin` is a no-op if the remote has no refs.
+	if _, err := GopassGit(ctx, r, mount, "fetch", "origin"); err != nil {
+		return fmt.Errorf("git fetch origin: %w", err)
+	}
+	// Does origin/main exist?
+	if _, err := GopassGit(ctx, r, mount, "rev-parse", "--quiet", "--verify", "origin/main"); err != nil {
+		// (a) empty remote — nothing to reconcile.
+		return nil
+	}
+	// (b) origin/main is ancestor of HEAD → local already carries the
+	// remote content, push will fast-forward.
+	if _, err := GopassGit(ctx, r, mount, "merge-base", "--is-ancestor", "origin/main", "HEAD"); err == nil {
+		return nil
+	}
+	// (c) HEAD is ancestor of origin/main → remote is ahead, fast-forward.
+	if _, err := GopassGit(ctx, r, mount, "merge-base", "--is-ancestor", "HEAD", "origin/main"); err == nil {
+		if _, err := GopassGit(ctx, r, mount, "merge", "--ff-only", "origin/main"); err != nil {
+			return fmt.Errorf("fast-forward to origin/main: %w", err)
+		}
+		return nil
+	}
+	// (d) divergent. Pristine or not?
+	pristine, err := isMountPristine(ctx, r, mount)
+	if err != nil {
+		return fmt.Errorf("check pristine state: %w", err)
+	}
+	if pristine {
+		// (d1) adopt remote — we have nothing locally worth keeping.
+		if _, err := GopassGit(ctx, r, mount, "reset", "--hard", "origin/main"); err != nil {
+			return fmt.Errorf("reset to origin/main: %w", err)
+		}
+		if fingerprint != "" {
+			// Add this key as a reader on top of whatever recipients
+			// the remote store already had. gopass writes a commit
+			// for this, so the push below has fresh local content.
+			if _, err := GopassRecipientsAdd(ctx, r, mount, fingerprint); err != nil {
+				return fmt.Errorf("add recipient %s after adopt: %w", fingerprint, err)
+			}
+		}
+		return nil
+	}
+	// (d2) non-pristine divergence — try an unrelated-histories merge.
+	// Conflicts remain in the working tree; surface them so the user
+	// can resolve manually rather than losing data to a reset.
+	if _, err := GopassGit(ctx, r, mount, "merge", "--allow-unrelated-histories", "--no-edit",
+		"-m", "Merge remote store into local (mys reconcile)", "origin/main"); err != nil {
+		return fmt.Errorf("merge remote with local content: %w "+
+			"(resolve conflicts in the gopass store, then re-run `mys sync setup`)", err)
+	}
+	return nil
+}
+
+// isMountPristine reports whether the mount contains only the files a
+// fresh `gopass git init` produces: .gpg-id, .gitattributes, and
+// entries under .public-keys/. Any .gpg file or extra top-level
+// directory means the user has started adding real secrets and we
+// must NOT adopt the remote via reset --hard.
+func isMountPristine(ctx context.Context, r Runner, mount string) (bool, error) {
+	out, err := GopassGit(ctx, r, mount, "ls-files")
+	if err != nil {
+		return false, err
+	}
+	for _, f := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		if strings.HasSuffix(f, ".gpg") {
+			return false, nil
+		}
+		switch {
+		case f == ".gpg-id", f == ".gitattributes":
+			continue
+		case strings.HasPrefix(f, ".public-keys/"):
+			continue
+		default:
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // GopassMountAdd adds a new gopass mount at <path> under <name>.

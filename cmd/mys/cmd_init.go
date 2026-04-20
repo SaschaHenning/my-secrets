@@ -722,6 +722,7 @@ func stepSync(ctx context.Context, opts *initOptions, state *initState) error {
 	cfg, err := syncpkg.RunWizard(ctx, syncpkg.WizardIO{In: opts.In, Out: opts.Out},
 		syncpkg.WizardOptions{
 			NonInteractive: opts.Yes,
+			KeyFingerprint: state.KeyFingerprint,
 		})
 	if err != nil {
 		return err
