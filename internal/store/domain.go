@@ -67,13 +67,38 @@ func NormalizeDomain(s string) string {
 		host = host[i+1:]
 	}
 	out := stripHost(host)
-	// Reject any residual obvious-junk token that slipped through (missing
-	// dot = definitely not a hostname we want to index; single-colon = port
-	// separator without a numeric port).
-	if strings.ContainsAny(out, " \t") {
+	// Reject anything that does not look like a plausible hostname. We
+	// require at least one alphanumeric rune and forbid whitespace or
+	// obvious syntax leftovers (lone ":", empty-after-strip, etc.). This
+	// is the safety net that catches inputs like "://bad" which slip past
+	// the scheme-prefix check because their scheme part is empty.
+	if !looksLikeHostname(out) {
 		return ""
 	}
 	return out
+}
+
+// looksLikeHostname is a last-resort heuristic: a hostname must have at
+// least one letter or digit, and must not contain whitespace, slashes,
+// or leading/trailing punctuation that would never be in a real host.
+func looksLikeHostname(s string) bool {
+	if s == "" {
+		return false
+	}
+	// IPv6 literal — already bracket-checked in stripHost.
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		return len(s) > 2
+	}
+	hasAlnum := false
+	for _, c := range s {
+		switch {
+		case c == ' ' || c == '\t' || c == '/' || c == '?' || c == '#':
+			return false
+		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
+			hasAlnum = true
+		}
+	}
+	return hasAlnum
 }
 
 // hasSchemePrefix returns true if s starts with a URL scheme followed by
@@ -96,26 +121,73 @@ func hasSchemePrefix(s string) bool {
 
 // stripHost removes port, trailing dot, and lowercases; it also strips a
 // leading "www." which is almost always noise for our matching.
+//
+// IPv6 literals (bracketed per RFC 3986, e.g. "[2001:db8::1]:8080") are
+// handled specially: the port is stripped correctly, and the bracketed
+// literal is kept intact so callers can still compare it bit-for-bit.
+// IPv6 literals never enter fuzzy matching (they have no dot-segments
+// the Levenshtein code understands), which is the correct behaviour —
+// we want exact equality on IP literals, not „close enough".
 func stripHost(h string) string {
 	h = strings.ToLower(h)
-	// Port.
-	if i := strings.LastIndex(h, ":"); i >= 0 {
-		// Only treat as port if the suffix is numeric — otherwise it might
-		// be part of an IPv6 literal, which we leave alone.
-		allDigits := i < len(h)-1
-		for _, c := range h[i+1:] {
-			if c < '0' || c > '9' {
-				allDigits = false
-				break
+	// IPv6 literal: "[addr]" optionally followed by ":port". Strip only
+	// the trailing ":port" and keep the brackets + address intact.
+	if strings.HasPrefix(h, "[") {
+		if end := strings.Index(h, "]"); end >= 0 {
+			rest := h[end+1:]
+			if strings.HasPrefix(rest, ":") {
+				if isAllDigits(rest[1:]) {
+					h = h[:end+1]
+				}
+			} else if rest == "" {
+				// No port — nothing to strip beyond the bracketed literal.
+			} else {
+				// Path/garbage after "]" — drop it.
+				h = h[:end+1]
 			}
 		}
-		if allDigits {
+		// Do NOT strip "www." or trailing dots from IPv6 literals.
+		return h
+	}
+	// IPv4 / DNS-style host. Strip trailing ":port" if numeric.
+	if i := strings.LastIndex(h, ":"); i >= 0 {
+		if isAllDigits(h[i+1:]) && i < len(h)-1 {
 			h = h[:i]
 		}
 	}
 	h = strings.TrimPrefix(h, "www.")
 	h = strings.TrimSuffix(h, ".")
 	return h
+}
+
+// isAllDigits returns true when s is non-empty and every rune is 0–9.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikeIPv4 returns true when s has the shape „N.N.N.N" with N in 0..999
+// — good enough to rule out fuzzy matching on what is clearly an IP
+// literal. We do not validate the numeric range beyond that; semantic
+// correctness belongs to a different layer.
+func looksLikeIPv4(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if !isAllDigits(p) {
+			return false
+		}
+	}
+	return true
 }
 
 // DeriveDomain is an alias for NormalizeDomain used at the app layer when
@@ -188,6 +260,15 @@ func MatchDomain(query, stored string) (tier string, hint string, matched bool) 
 // semantically). Distance ≤ 2 per segment is the threshold the issue
 // body calls out.
 func levenshteinSegments(q, s string) (int, bool) {
+	// IP literals don't have meaningful dot-segments for fuzzy matching —
+	// "1.2.3.4" vs "1.2.3.5" should NOT be classified as a typo. Refuse
+	// both IPv6 (bracketed) and IPv4 (all-numeric per-segment) inputs here.
+	if strings.HasPrefix(q, "[") || strings.HasPrefix(s, "[") {
+		return 0, false
+	}
+	if looksLikeIPv4(q) || looksLikeIPv4(s) {
+		return 0, false
+	}
 	qp := strings.Split(q, ".")
 	sp := strings.Split(s, ".")
 	if len(qp) != len(sp) {

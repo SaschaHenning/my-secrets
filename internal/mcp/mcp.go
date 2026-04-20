@@ -193,9 +193,14 @@ func handleToolCall(ctx context.Context, a *app.App, req *rpcRequest) *rpcRespon
 		if err != nil {
 			return errorResp(req.ID, -32000, err.Error())
 		}
+		// Uniform schema: matches is always []{path, tier, hint}, similar is
+		// always present as an array (possibly empty). tier/hint are empty
+		// when the query was not a domain match — the consuming side gets a
+		// stable shape to parse regardless of whether --domain was used.
 		payload := map[string]any{
-			"matches": paths,
+			"matches": pathsAsMatches(paths),
 			"count":   len(paths),
+			"similar": []map[string]any{},
 		}
 		b, _ := json.MarshalIndent(payload, "", "  ")
 		return okResp(req.ID, textContent(string(b)))
@@ -220,20 +225,19 @@ func handleToolCall(ctx context.Context, a *app.App, req *rpcRequest) *rpcRespon
 		if args.IncludeSimilar != nil {
 			wantSimilar = *args.IncludeSimilar
 		}
-		payload := map[string]any{
-			"matches": paths,
-			"count":   len(paths),
-		}
+		// Uniform schema — same as creds_list above. `similar` is always
+		// present; it is populated from the domain fuzzy-matcher only when
+		// wantSimilar is true, otherwise it stays an empty array.
+		similar := []map[string]any{}
 		if wantSimilar {
-			// Use the query as a domain hint. We do not require that the
-			// query IS a domain — if it cannot be normalised or nothing
-			// matches, similar is simply an empty array.
-			_, sim, derr := a.SearchByDomain(ctx, args.Query, true)
-			if derr == nil {
-				payload["similar"] = renderSimilar(sim)
-			} else {
-				payload["similar"] = []any{}
+			if _, sim, derr := a.SearchByDomain(ctx, args.Query, true); derr == nil {
+				similar = renderSimilar(sim)
 			}
+		}
+		payload := map[string]any{
+			"matches": pathsAsMatches(paths),
+			"count":   len(paths),
+			"similar": similar,
 		}
 		b, _ := json.MarshalIndent(payload, "", "  ")
 		return okResp(req.ID, textContent(string(b)))
@@ -300,15 +304,35 @@ func handleDomainQuery(ctx context.Context, a *app.App, id json.RawMessage, quer
 	if err != nil {
 		return errorResp(id, -32000, err.Error())
 	}
+	// Same uniform {matches, count, similar} shape used by creds_list and
+	// creds_search. similar is always present; empty when caller explicitly
+	// asked for exact-only via include_similar=false.
+	similar := []map[string]any{}
+	if wantSimilar {
+		similar = renderSimilar(sim)
+	}
 	payload := map[string]any{
 		"matches": renderMatches(matches),
 		"count":   len(matches),
-	}
-	if wantSimilar {
-		payload["similar"] = renderSimilar(sim)
+		"similar": similar,
 	}
 	b, _ := json.MarshalIndent(payload, "", "  ")
 	return okResp(id, textContent(string(b)))
+}
+
+// pathsAsMatches turns a plain []string of paths into the uniform
+// matches shape. tier/hint stay empty — the consumer sees the same
+// structure whether or not the query was a domain match.
+func pathsAsMatches(paths []string) []map[string]any {
+	out := make([]map[string]any, 0, len(paths))
+	for _, p := range paths {
+		out = append(out, map[string]any{
+			"path": p,
+			"tier": "",
+			"hint": "",
+		})
+	}
+	return out
 }
 
 // renderMatches turns DomainMatch hits into a minimal, password-free
