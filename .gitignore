@@ -1,0 +1,40 @@
+# Binaries
+/mys
+/bin/
+*.exe
+*.test
+*.out
+
+# Go
+vendor/
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Local config and state
+.env
+.env.local
+/data/
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-journal
+
+# Claude / tooling caches
+.playwright-cli/
+.claude/settings.local.json
+
+# Build
+dist/
+build/
+
+# Logs
+*.log

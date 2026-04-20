@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lokaler Credential-Manager — Planungsübersicht</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #232733;
+    --border: #2e3344;
+    --text: #e1e4ed;
+    --text-muted: #8b90a0;
+    --accent-blue: #5b9cf6;
+    --accent-green: #4ade80;
+    --accent-orange: #f59e42;
+    --accent-purple: #a78bfa;
+    --accent-red: #f87171;
+    --accent-cyan: #22d3ee;
+    --accent-pink: #f472b6;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 1.9rem; font-weight: 700; margin-bottom: 0.25rem; }
+  h2 { font-size: 1.3rem; font-weight: 600; margin-bottom: 1rem; margin-top: 2.5rem; }
+  h3 { font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem; margin-top: 1rem; color: var(--text); }
+  .subtitle { color: var(--text-muted); font-size: 0.95rem; margin-bottom: 2rem; }
+
+  /* Requirements checklist */
+  .checklist {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 2rem;
+  }
+  .checklist-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.5rem 0;
+    cursor: pointer;
+    user-select: none;
+  }
+  .checklist-item input[type="checkbox"] {
+    margin-top: 0.3rem;
+    width: 16px; height: 16px;
+    accent-color: var(--accent-green);
+    cursor: pointer;
+  }
+  .checklist-item label {
+    flex: 1;
+    cursor: pointer;
+    font-size: 0.92rem;
+  }
+  .checklist-item .hint {
+    display: block;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    margin-top: 0.2rem;
+  }
+
+  /* Comparison table */
+  table.compare {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 1rem;
+    font-size: 0.88rem;
+  }
+  .compare th, .compare td {
+    padding: 0.75rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .compare th {
+    background: var(--surface2);
+    font-weight: 600;
+    color: var(--text);
+    font-size: 0.85rem;
+  }
+  .compare tr:last-child td { border-bottom: none; }
+  .compare .col-a { color: var(--accent-blue); font-weight: 600; }
+  .compare .col-b { color: var(--accent-purple); font-weight: 600; }
+  .compare .col-c { color: var(--accent-green); font-weight: 600; }
+  .compare .row-label { font-weight: 600; color: var(--text); background: rgba(255,255,255,0.02); }
+
+  /* Approach cards */
+  .approach {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1.25rem;
+  }
+  .approach.a { border-left: 4px solid var(--accent-blue); }
+  .approach.b { border-left: 4px solid var(--accent-purple); }
+  .approach.c { border-left: 4px solid var(--accent-green); }
+
+  .approach-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    user-select: none;
+    margin-bottom: 0.25rem;
+  }
+  .approach-header h2 { margin: 0; font-size: 1.15rem; }
+  .chevron { color: var(--text-muted); font-size: 0.9rem; transition: transform 0.2s; }
+  .approach.open .chevron { transform: rotate(90deg); }
+
+  .approach-tag {
+    font-size: 0.7rem;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-left: 0.5rem;
+  }
+  .tag-a { background: rgba(91,156,246,0.15); color: var(--accent-blue); }
+  .tag-b { background: rgba(167,139,250,0.15); color: var(--accent-purple); }
+  .tag-c { background: rgba(74,222,128,0.15); color: var(--accent-green); }
+
+  .approach-tagline {
+    color: var(--text-muted);
+    font-size: 0.88rem;
+    margin-bottom: 1rem;
+  }
+
+  .approach-body { display: none; }
+  .approach.open .approach-body { display: block; margin-top: 1rem; }
+
+  /* Diagram */
+  pre.diagram {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 0.72rem;
+    line-height: 1.35;
+    overflow-x: auto;
+    color: var(--text);
+    margin: 0.5rem 0 1rem 0;
+  }
+
+  /* Meta grid inside approach */
+  .meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+  }
+  .meta {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    font-size: 0.85rem;
+  }
+  .meta .meta-label {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.25rem;
+  }
+
+  /* Pro/Contra */
+  .pro-con { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
+  .pro, .con {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    font-size: 0.85rem;
+  }
+  .pro { border-left: 3px solid var(--accent-green); }
+  .con { border-left: 3px solid var(--accent-red); }
+  .pro h4, .con h4 { font-size: 0.85rem; margin-bottom: 0.4rem; }
+  .pro h4 { color: var(--accent-green); }
+  .con h4 { color: var(--accent-red); }
+  .pro ul, .con ul { padding-left: 1.1rem; }
+  .pro li, .con li { margin: 0.2rem 0; }
+
+  ul { padding-left: 1.2rem; }
+  li { margin: 0.25rem 0; font-size: 0.9rem; }
+  p { margin: 0.5rem 0; font-size: 0.92rem; }
+
+  code {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 0.82rem;
+    background: var(--surface2);
+    padding: 0.1rem 0.35rem;
+    border-radius: 4px;
+    color: var(--accent-cyan);
+  }
+
+  /* Recommendation */
+  .recommendation {
+    background: linear-gradient(135deg, rgba(74,222,128,0.08), rgba(91,156,246,0.05));
+    border: 1px solid var(--accent-green);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 2rem;
+  }
+  .recommendation h2 { margin-top: 0; color: var(--accent-green); }
+
+  /* Next steps as actionable checklist */
+  .next-steps {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+  }
+  .next-steps .checklist-item label { font-weight: 500; }
+
+  .footer-note {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    margin-top: 2rem;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>Lokaler Credential-Manager</h1>
+<p class="subtitle">Planungsübersicht · 3 Architekturansätze · 20.04.2026</p>
+
+<!-- REQUIREMENTS -->
+<h2>Anforderungen</h2>
+<p style="color: var(--text-muted); font-size: 0.9rem;">Abhaken, was dabei sein muss. Felder sind anklickbar.</p>
+<div class="checklist">
+  <div class="checklist-item"><input type="checkbox" id="r1" checked><label for="r1">Lokale, verschlüsselte Speicherung auf dem Mac<span class="hint">SQLite + AES-256 oder gleichwertig; eine Datei oder Datei-pro-Secret.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r2" checked><label for="r2">Maschinengebundene Verschlüsselung (DB-Kopie auf Fremdgerät wertlos)<span class="hint">Secure Enclave / Keychain mit <code>ThisDeviceOnly</code>; explizite Export-Funktion mit Passphrase.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r3" checked><label for="r3">CLI zum Suchen, Lesen, Schreiben, Rotieren<span class="hint">Befehle wie <code>creds get</code>, <code>creds ls</code>, <code>creds add</code>, <code>creds rotate</code>.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r4" checked><label for="r4">Claude-Code-Skill für einfachen KI-Zugriff<span class="hint">Skill-Datei unter <code>~/.claude/skills/</code>, die das CLI oder MCP aufruft.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r5" checked><label for="r5">Vollständige Audit-Protokollierung jedes Zugriffs<span class="hint">Wer (Mensch/KI/Agent), wann, welcher Eintrag, welche Org, Ergebnis. Append-only.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r6" checked><label for="r6">KI-Erkennung: System weiß, ob Claude Code oder ein Agent zugreift<span class="hint">Signale: <code>CLAUDECODE=1</code>, Parent-Process-Chain, expliziter Skill-Header.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r7" checked><label for="r7">Web-Oberfläche zum Anschauen der Einträge und Audit-Logs<span class="hint">Läuft nur auf localhost, mit Touch-ID-Gate.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r8" checked><label for="r8">Metadaten: URL, Username, GitHub-Projekt, Tags<span class="hint">Pro Eintrag frei erweiterbar.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r9" checked><label for="r9">Org-Scoping: Credentials pro Organisation, Cross-Org-Zugriff blockiert<span class="hint">Durchsetzung über CWD-Match, Git-Origin, signierter Org-Token.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r10"><label for="r10">Bitwarden-Sync (optional, einseitiger Push als Backup)<span class="hint">Explizit per Befehl, niemals automatisch.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r11"><label for="r11">YubiKey als zweiter Faktor<span class="hint">Challenge-Response wrappt den Master-Key — ohne Stick kein Unlock.</span></label></div>
+  <div class="checklist-item"><input type="checkbox" id="r12"><label for="r12">Rotation-Tracking mit Versionshistorie<span class="hint"><code>entry_versions</code>-Tabelle, Rollback möglich.</span></label></div>
+</div>
+
+<!-- COMPARISON TABLE -->
+<h2>Die drei Ansätze im Vergleich</h2>
+<table class="compare">
+  <thead>
+    <tr>
+      <th style="width: 20%"></th>
+      <th style="width: 26.6%"><span class="col-a">A · macOS-nativ</span><br><span style="color: var(--text-muted); font-weight: 400; font-size: 0.8rem;">Swift-Daemon + Secure Enclave</span></th>
+      <th style="width: 26.6%"><span class="col-b">B · Open-Source-Stack</span><br><span style="color: var(--text-muted); font-weight: 400; font-size: 0.8rem;">Rust-Daemon + Go-CLI + SvelteKit</span></th>
+      <th style="width: 26.6%"><span class="col-c">C · Best-of-Breed</span><br><span style="color: var(--text-muted); font-weight: 400; font-size: 0.8rem;">gopass + dünner Go-Wrapper + Datasette</span></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td class="row-label">Eigenbau-Anteil</td><td>hoch</td><td>sehr hoch</td><td>niedrig</td></tr>
+    <tr><td class="row-label">Aufwand (mit KI)</td><td><b>~13 PT</b></td><td>~24 PT</td><td><b>~6,5 PT</b></td></tr>
+    <tr><td class="row-label">Maschinenbindung</td><td>Secure Enclave nativ (SEP-Key, ECIES-Wrap)</td><td>Keychain <code>ThisDeviceOnly</code> + optional YubiKey + Machine-Binding-Token</td><td>GPG-Key im macOS-Keychain, Touch-ID via <code>pinentry-touchid</code></td></tr>
+    <tr><td class="row-label">Audit-Garantie</td><td>hoch (Socket-only Daemon)</td><td>sehr hoch (signierte Hash-Chain)</td><td>mittel (Wrapper ist umgehbar, MCP-Only-Pfad hilft)</td></tr>
+    <tr><td class="row-label">KI-Erkennung</td><td>Prozess-Tree + Env + Code-Signing-Check</td><td>Peer-Creds + Env + signierter Session-Token</td><td>PPID-Walk + Skill-Header</td></tr>
+    <tr><td class="row-label">Org-Scoping</td><td>CWD + Git-Origin + expliziter Scope</td><td>Signierter Org-Token + Git + CWD</td><td>gopass-Ordner = Org, Policy-YAML im Wrapper</td></tr>
+    <tr><td class="row-label">Web-UI</td><td>Eigenbau (SvelteKit embedded)</td><td>Eigenbau (SvelteKit embedded)</td><td>Datasette von der Stange</td></tr>
+    <tr><td class="row-label">Sprachen</td><td>Swift, Rust, Svelte</td><td>Rust, Go, Svelte</td><td>Go, YAML</td></tr>
+    <tr><td class="row-label">Portabilität</td><td>nur macOS</td><td>portabel (auch Linux)</td><td>nur macOS (Touch-ID)</td></tr>
+    <tr><td class="row-label">Schwachstelle</td><td>Swift-Know-how, Reinstall löscht SE-Keys</td><td>Angriffsfläche durch 3 Sprachen</td><td>Wer <code>gopass</code> direkt ruft, umgeht Audit</td></tr>
+  </tbody>
+</table>
+
+<!-- RECOMMENDATION -->
+<h2>Empfehlung</h2>
+<div class="recommendation">
+  <h2 style="margin-top:0;">Ansatz C als Start · Ansatz A als mittelfristiges Upgrade</h2>
+  <p><b>Warum C zuerst?</b> Bei ~6,5 Personentagen ist das Ding in einer Woche lauffähig. Die harten Teile (Krypto, Touch-ID, File-Storage, GPG-Agent) übernehmen erprobte Tools. Du baust nur den Audit-Wrapper, die Org-Policy und den Claude-Skill — das sind genau die Teile, die dein Projekt wirklich einzigartig machen.</p>
+  <p><b>Wichtigster Punkt:</b> Mach den <b>MCP-Server-Pfad</b> (nicht das CLI) zur einzigen Schnittstelle, über die Claude Code Secrets holen kann. Dann gibt es für die KI keinen Umgehungsweg — Claude hat ja keine Shell, die es ohne dein MCP-Tool aufrufen könnte. Der CLI-Wrapper ist dann nur für dich persönlich.</p>
+  <p><b>Wann Ansatz A?</b> Wenn sich zeigt, dass du <i>kryptographisch erzwungenes</i> Audit willst (auch für lokale Shell-Scripts und andere CLIs), ist A die saubere Lösung. Der Umstieg kostet dich nichts, weil C eine klare API-Grenze hat — dein Claude-Skill bleibt identisch.</p>
+  <p><b>Ansatz B</b> ist technisch der brillanteste (signierte Hash-Chain, Rust-Daemon, portabel), aber der Aufwand ist für einen Einzelplatz-Homelab-Use-Case disproportional. Aufheben, falls du später Team-Sharing oder Linux-Hosts brauchst.</p>
+</div>
+
+<!-- APPROACH A -->
+<h2>Die Ansätze im Detail</h2>
+
+<div class="approach a open" onclick="this.classList.toggle('open')">
+  <div class="approach-header">
+    <div>
+      <h2 style="display:inline;">Ansatz A<span class="approach-tag tag-a">macOS-nativ</span></h2>
+    </div>
+    <span class="chevron">▶</span>
+  </div>
+  <p class="approach-tagline">Swift-Daemon, Secure Enclave, SQLCipher, Unix-Socket-IPC.</p>
+  <div class="approach-body" onclick="event.stopPropagation()">
+
+    <div class="meta-grid">
+      <div class="meta"><div class="meta-label">Daemon</div>Swift (LaunchAgent)</div>
+      <div class="meta"><div class="meta-label">Storage</div>SQLCipher, AES-256-CBC + HMAC-SHA512</div>
+      <div class="meta"><div class="meta-label">Master-Key</div>SE-Keypair + KEK im Keychain</div>
+      <div class="meta"><div class="meta-label">CLI</div>Rust + clap + JSON-RPC über UDS</div>
+      <div class="meta"><div class="meta-label">Web-UI</div>SvelteKit (static, embedded)</div>
+      <div class="meta"><div class="meta-label">Aufwand mit KI</div><b>~13 PT</b> (2,5–3 Wochen)</div>
+    </div>
+
+    <h3>Architektur</h3>
+<pre class="diagram">┌─────────────────────────────────────────────────────────────────┐
+│ Clients                                                         │
+│  creds CLI          Claude Skill          Browser (localhost)   │
+└──────┬────────────────────┬──────────────────────┬──────────────┘
+       │ Unix-Socket        │ Unix-Socket          │ HTTP+Token
+       ▼                    ▼                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ credsd  (Swift LaunchAgent, läuft pro User-Session)             │
+│   ┌──────────┐   ┌─────────────┐   ┌──────────────────────┐     │
+│   │ IPC API  │──▶│ Audit-Proxy │──▶│ Core (Unlock/Crypto) │     │
+│   └──────────┘   │ (Caller-ID) │   └───────┬──────────┬───┘     │
+│                  └─────────────┘           │          │         │
+└────────────────────────────────────────────┼──────────┼─────────┘
+                                             ▼          ▼
+                                 ┌───────────────┐  ┌──────────┐
+                                 │ macOS Keychain│  │vault.db  │
+                                 │ + Secure Encl.│  │(SQLCipher)│
+                                 └───────────────┘  └──────────┘
+                                                       │
+                                                       ▼
+                                                ┌──────────────┐
+                                                │ audit.db     │
+                                                │ (append-only,│
+                                                │ hash-chain)  │
+                                                └──────────────┘</pre>
+
+    <h3>Maschinenbindung</h3>
+    <p>Der Master-Key ist ein ECC-P256-Keypair mit <code>kSecAttrTokenIDSecureEnclave</code>. Der private Teil verlässt die SEP <b>nie</b>. Der DB-Key für SQLCipher wird mit diesem SE-Key ECIES-gewrappt, im Keychain mit <code>ThisDeviceOnly</code> + <code>biometryCurrentSet</code> abgelegt. Kopiert man die <code>vault.db</code> auf einen anderen Mac, scheitert jeder Entschlüsselungsversuch an <code>errSecDecode</code>, weil der SEP-Key physisch an den T2/Apple-Silicon-Chip gebunden ist.</p>
+
+    <h3>KI-Erkennung</h3>
+    <p>Drei Signalquellen werden kombiniert: (1) <code>SO_PEERCRED</code> am Unix-Socket liefert Caller-PID, (2) <code>libproc</code>-Walk ermittelt die komplette Prozess-Ahnenreihe bis PID 1, (3) <code>sysctl KERN_PROCARGS2</code> liest die Env-Variablen des Callers direkt aus dem Kernel, sucht nach <code>CLAUDECODE=1</code>. Der Skill reicht zusätzlich einen Hint-Header mit — Widerspruch zwischen Header und beobachteter Env → Warnung im Audit-Log.</p>
+
+    <div class="pro-con">
+      <div class="pro">
+        <h4>Pro</h4>
+        <ul>
+          <li>Hardware-fundierte Maschinenbindung (Secure Enclave, nicht nur Dateisystem)</li>
+          <li>Audit ist zentral — niemand umgeht den Daemon</li>
+          <li>Native Touch-ID-UX</li>
+          <li>Kein Cloud-Bedarf</li>
+        </ul>
+      </div>
+      <div class="con">
+        <h4>Contra</h4>
+        <ul>
+          <li>Swift-Know-how nötig</li>
+          <li>Apple Developer Account für Notarisierung</li>
+          <li>SE-Keys nach macOS-Neuinstallation weg → Backup-Passphrase Pflicht</li>
+          <li>Nur macOS, nicht portabel</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- APPROACH B -->
+<div class="approach b" onclick="this.classList.toggle('open')">
+  <div class="approach-header">
+    <div>
+      <h2 style="display:inline;">Ansatz B<span class="approach-tag tag-b">Open-Source-Stack</span></h2>
+    </div>
+    <span class="chevron">▶</span>
+  </div>
+  <p class="approach-tagline">Rust-Daemon, signierte Hash-Chain, Go-CLI, portabel auf Linux erweiterbar.</p>
+  <div class="approach-body" onclick="event.stopPropagation()">
+
+    <div class="meta-grid">
+      <div class="meta"><div class="meta-label">Daemon</div>Rust + ring + rusqlite</div>
+      <div class="meta"><div class="meta-label">Storage</div>SQLCipher + per-secret DEKs</div>
+      <div class="meta"><div class="meta-label">Master-Key</div>Keychain + optional YubiKey</div>
+      <div class="meta"><div class="meta-label">CLI</div>Go (cobra)</div>
+      <div class="meta"><div class="meta-label">Web-UI</div>SvelteKit (static)</div>
+      <div class="meta"><div class="meta-label">Aufwand mit KI</div>~24 PT</div>
+    </div>
+
+    <h3>Architektur</h3>
+<pre class="diagram">┌─────────────────────────────────────────────────────────────┐
+│ Clients                                                     │
+│  zcred (Go CLI)    Web-UI (SvelteKit)    Claude Skill       │
+└────────┬──────────────────┬────────────────────┬────────────┘
+         │ HTTP+mTLS / UDS  │                    │
+         └──────────────────┼────────────────────┘
+                            ▼
+              ┌──────────────────────────────┐
+              │ zcredd (Rust Daemon)         │
+              │  REST/gRPC · Auth · Audit    │
+              │  Caller-Fingerprint · Sync   │
+              └───┬────────────┬─────────┬───┘
+                  ▼            ▼         ▼
+          ┌───────────┐ ┌─────────┐ ┌──────────────┐
+          │ vault.db  │ │audit.db │ │  Keychain    │
+          │(SQLCipher)│ │(hash-   │ │ + optional   │
+          │           │ │ chain,  │ │  YubiKey     │
+          │           │ │ signed) │ │              │
+          └───────────┘ └─────────┘ └──────────────┘
+                                         │
+                                         ▼ optional
+                                   Bitwarden (bw push)</pre>
+
+    <h3>Besonderheit: signierte Hash-Chain</h3>
+    <p>Jeder Audit-Eintrag enthält <code>prev_hash</code>, <code>entry_hash</code> (SHA-256) und eine Ed25519-Signatur. Signier-Key liegt im Keychain, nicht exportierbar. Manipulation bricht die Kette sofort detektierbar auf. <code>zcred audit verify</code> prüft das in einem Rutsch.</p>
+
+    <div class="pro-con">
+      <div class="pro">
+        <h4>Pro</h4>
+        <ul>
+          <li>Portabel (läuft später auch auf Linux-Homelab-Node)</li>
+          <li>Kryptographisch nachweisbares Audit-Log</li>
+          <li>Open-Source-Crypto, keine Blackbox</li>
+          <li>Per-Secret-DEKs als Defense-in-Depth</li>
+        </ul>
+      </div>
+      <div class="con">
+        <h4>Contra</h4>
+        <ul>
+          <li>Drei Sprachen (Rust, Go, Svelte) — größere Angriffsfläche</li>
+          <li>Keychain-Integration aus Rust umständlicher als aus Swift</li>
+          <li>Update-Mechanismus selbst bauen</li>
+          <li>Für Einzelplatz überdimensioniert</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- APPROACH C -->
+<div class="approach c open" onclick="this.classList.toggle('open')">
+  <div class="approach-header">
+    <div>
+      <h2 style="display:inline;">Ansatz C<span class="approach-tag tag-c">Best-of-Breed · empfohlen</span></h2>
+    </div>
+    <span class="chevron">▶</span>
+  </div>
+  <p class="approach-tagline">gopass als Storage + macOS Keychain + dünner Go-Wrapper + Datasette-UI + MCP-Server.</p>
+  <div class="approach-body" onclick="event.stopPropagation()">
+
+    <div class="meta-grid">
+      <div class="meta"><div class="meta-label">Storage</div>gopass (GPG, File-pro-Secret, Git-native)</div>
+      <div class="meta"><div class="meta-label">Master-Key</div>GPG-Key im Keychain, <code>pinentry-touchid</code></div>
+      <div class="meta"><div class="meta-label">CLI</div>Go-Wrapper <code>zhpass</code> (~400 LOC)</div>
+      <div class="meta"><div class="meta-label">Web-UI</div>Datasette (fertig, YAML-konfiguriert)</div>
+      <div class="meta"><div class="meta-label">KI-Pfad</div>MCP-Server als einzige Eintrittstür</div>
+      <div class="meta"><div class="meta-label">Aufwand mit KI</div><b>~6,5 PT</b></div>
+    </div>
+
+    <h3>Architektur</h3>
+<pre class="diagram">┌────────────────────────────────────────────────────────────┐
+│ Clients                                                    │
+│  Mensch-CLI      Claude Skill (MCP)     Scripts / n8n      │
+└───────┬──────────────────┬─────────────────────┬───────────┘
+        └──────────────────┼─────────────────────┘
+                           ▼
+                ┌──────────────────────┐
+                │ zhpass (Wrapper-CLI) │  ← einziger Eintritt
+                │ + MCP-Server         │
+                │  • PPID-Detektion    │
+                │  • Scope-Policy      │
+                │  • Audit-Write       │
+                └───┬──────────────┬───┘
+         gopass show│              │append
+                    ▼              ▼
+          ┌────────────────┐  ┌──────────────┐
+          │ gopass store   │  │ audit.sqlite │
+          │ (GPG, Git)     │  └──────┬───────┘
+          └────────┬───────┘         │
+                   │                 ▼
+          gpg-agent│         ┌──────────────┐
+                   ▼         │  Datasette   │
+          ┌────────────────┐ │  Web-UI      │
+          │ macOS Keychain │ │  :8081       │
+          │ + Touch-ID     │ └──────────────┘
+          │ (pinentry)     │
+          └────────────────┘
+                   ▲
+                   │ einseitig, explizit
+          ┌────────┴───────┐
+          │ bw export →    │
+          │ gopass insert  │
+          └────────────────┘</pre>
+
+    <h3>Der Trick: MCP-Server als KI-einzige Schnittstelle</h3>
+    <p>Claude Code hat keine Shell, die sich umgehen ließe — nur die MCP-Tools, die du ihm gibst. Wenn <code>zhpass</code> als MCP-Server läuft und Claude nur dieses Tool kennt, dann gibt es für die KI <b>keinen Weg, Secrets außerhalb des Audit-Pfads zu lesen</b>. Der CLI-Wrapper ist dann nur für dich als Menschen — wer dort direkt <code>gopass</code> tippt, umgeht Audit, aber das ist organisatorische Disziplin, kein KI-Risiko.</p>
+
+    <h3>Org-Scoping via gopass-Ordner</h3>
+<pre class="diagram">store/
+  jasp/…         recipients: gpg-key-mac, gpg-key-yubi
+  zuhause/…      recipients: gpg-key-mac
+  private/…      recipients: gpg-key-mac  (deny für claude-code)</pre>
+    <p>gopass erzwingt Recipients pro Ordner über <code>.gpg-id</code>-Dateien. Der Wrapper liest zusätzlich <code>scope-policy.yaml</code> und blockiert Zugriffe außerhalb des Scopes.</p>
+
+    <div class="pro-con">
+      <div class="pro">
+        <h4>Pro</h4>
+        <ul>
+          <li>~30 % des Aufwands gegenüber Eigenbau</li>
+          <li>Krypto, Storage, Git-Sync, GPG-Agent komplett erprobt</li>
+          <li>Git-History der <code>store/</code>-Dateien ist bereits ein Schreibaudit</li>
+          <li>Web-UI via Datasette = 20 Zeilen YAML</li>
+          <li>Backend austauschbar — später Ansatz A drunter schieben ohne Skill-Änderung</li>
+        </ul>
+      </div>
+      <div class="con">
+        <h4>Contra</h4>
+        <ul>
+          <li>Wer <code>gopass</code> direkt aufruft, umgeht das Audit (für menschliche CLI-Nutzung akzeptabel, für KI gelöst via MCP-Only-Pfad)</li>
+          <li>Scope-Check ist advisory, nicht kryptographisch erzwungen</li>
+          <li>Metadaten-Suche schwächer als Bitwarden/1Password</li>
+          <li>Keine Multi-User-Delegation — bleibt Single-Mac-Setup</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- NEXT STEPS -->
+<h2>Nächste Schritte (wenn du C wählst)</h2>
+<div class="next-steps">
+  <div class="checklist-item"><input type="checkbox" id="n1"><label for="n1">GitHub-Issue „Credential-Manager MVP" anlegen mit Acceptance-Kriterien aus der Anforderungsliste oben</label></div>
+  <div class="checklist-item"><input type="checkbox" id="n2"><label for="n2">Homebrew-Setup verifizieren: <code>gnupg</code>, <code>gopass</code>, <code>pinentry-touchid</code>, <code>datasette</code></label></div>
+  <div class="checklist-item"><input type="checkbox" id="n3"><label for="n3">gopass-Store initialisieren mit Ordnern <code>jasp/</code>, <code>zuhause/</code>, <code>private/</code></label></div>
+  <div class="checklist-item"><input type="checkbox" id="n4"><label for="n4">Go-Wrapper <code>zhpass</code> schreiben (CLI-Modus): get/list/search/add/rotate, PPID-Detection, Audit-Writer</label></div>
+  <div class="checklist-item"><input type="checkbox" id="n5"><label for="n5">Scope-Policy-YAML-Schema definieren und Enforcement einbauen</label></div>
+  <div class="checklist-item"><input type="checkbox" id="n6"><label for="n6">MCP-Server-Modus für <code>zhpass</code> (Stdio-Transport), Tool-Schemas <code>creds.get</code> / <code>creds.list</code> / <code>creds.search</code></label></div>
+  <div class="checklist-item"><input type="checkbox" id="n7"><label for="n7">Datasette-Konfiguration für Audit-DB mit Views nach Actor, Org, Zeitraum</label></div>
+  <div class="checklist-item"><input type="checkbox" id="n8"><label for="n8">Claude-Code-Skill <code>~/.claude/skills/zhpass/SKILL.md</code> schreiben</label></div>
+  <div class="checklist-item"><input type="checkbox" id="n9"><label for="n9">Bitwarden-Export-Importer als separates Kommando (einseitig)</label></div>
+  <div class="checklist-item"><input type="checkbox" id="n10"><label for="n10">Dokumentation: wie neue Org anlegen, wie Secret rotieren, wie Audit prüfen</label></div>
+</div>
+
+<p class="footer-note">Generiert am 20.04.2026 · 3 parallele Research-Agenten · Vollberichte im Conversation-Transcript</p>
+
+<script>
+  // Persist checklist state in localStorage
+  document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    const key = 'credplan-' + cb.id;
+    const saved = localStorage.getItem(key);
+    if (saved !== null) cb.checked = saved === 'true';
+    cb.addEventListener('change', () => localStorage.setItem(key, cb.checked));
+  });
+</script>
+</body>
+</html>
