@@ -1,13 +1,28 @@
 package main
 
 import (
+	"embed"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
+
+// skillAssets holds the skill files that ship with the binary. Embedding
+// them means `mys install-skill` works from any working directory and
+// does not need the repo checkout to be present — which is the whole
+// point of an installed CLI.
+//
+//go:embed skills_embed/my-secrets/*
+var skillAssets embed.FS
+
+// skillEmbedRoot is the on-disk path inside the embed.FS that mirrors
+// the repo's skills/my-secrets/ directory. Kept as a const so tests can
+// agree on the layout without poking at embed internals.
+const skillEmbedRoot = "skills_embed/my-secrets"
 
 // Scope values for the skill install. "global" lives under ~/.claude,
 // "local" under <cwd>/.claude so the skill only applies inside that
@@ -35,7 +50,7 @@ func installSkillCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "linked %s → %s\n", dst, src)
+			fmt.Fprintf(cmd.OutOrStdout(), "installed %s (from %s)\n", dst, src)
 			return nil
 		},
 	}
@@ -65,17 +80,14 @@ func installSkill(cmd *cobra.Command) (dst, src string, err error) {
 	return installSkillAt(cmd, skillScopeGlobal, "")
 }
 
-// installSkillAt performs the skill-install side-effect for the given
-// scope. It does not print anything — callers format their own output.
+// installSkillAt writes the embedded skill files into the scope-specific
+// destination. It replaces any previous install (symlink or directory)
+// so repeated calls are idempotent.
 //
-// scope is one of skillScopeGlobal / skillScopeLocal. cwdOverride is
-// intended for tests; production callers pass "" and the function
-// uses os.Getwd().
+// The `src` return value is a short description of where the skill
+// content came from — useful for logging. Embedded content reports
+// "embedded assets".
 func installSkillAt(cmd *cobra.Command, scope, cwdOverride string) (dst, src string, err error) {
-	src, err = findSkillSource()
-	if err != nil {
-		return "", "", err
-	}
 	dst, err = skillInstallPath(scope, cwdOverride)
 	if err != nil {
 		return "", "", err
@@ -83,13 +95,41 @@ func installSkillAt(cmd *cobra.Command, scope, cwdOverride string) (dst, src str
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", "", err
 	}
-	// Remove any existing entry (symlink OR directory) so repeated
-	// installs always end at a fresh link pointing at the current repo.
+	// Remove any previous install (may be a symlink from an older mys
+	// version or a directory from a partial write).
 	_ = os.RemoveAll(dst)
-	if err := os.Symlink(src, dst); err != nil {
-		return "", "", fmt.Errorf("symlink skill: %w", err)
+
+	if err := writeEmbeddedSkill(dst); err != nil {
+		return "", "", fmt.Errorf("write skill: %w", err)
 	}
-	return dst, src, nil
+	return dst, "embedded assets", nil
+}
+
+// writeEmbeddedSkill copies every file under skillEmbedRoot out of the
+// embed.FS into dst, preserving relative paths. Files are created with
+// 0644 and intermediate directories with 0755.
+func writeEmbeddedSkill(dst string) error {
+	return fs.WalkDir(skillAssets, skillEmbedRoot, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(skillEmbedRoot, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := skillAssets.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
 }
 
 // skillInstallPath returns the target path for the given scope.
@@ -113,20 +153,4 @@ func skillInstallPath(scope, cwdOverride string) (string, error) {
 		return filepath.Join(cwd, ".claude", "skills", "my-secrets"), nil
 	}
 	return "", fmt.Errorf("unknown skill scope %q", scope)
-}
-
-func findSkillSource() (string, error) {
-	// Expected layout: <repo>/skills/my-secrets/SKILL.md and binary in <repo>
-	// or <repo>/cmd/mys. Search upward from CWD.
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	for dir := cwd; dir != "/" && dir != ""; dir = filepath.Dir(dir) {
-		candidate := filepath.Join(dir, "skills", "my-secrets")
-		if fi, err := os.Stat(candidate); err == nil && fi.IsDir() {
-			return candidate, nil
-		}
-	}
-	return "", fmt.Errorf("could not locate skills/my-secrets directory upward from %s", cwd)
 }
