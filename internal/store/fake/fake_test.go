@@ -321,3 +321,84 @@ func TestCloneEntry_Nil(t *testing.T) {
 		t.Errorf("cloneEntry(nil) = %v, want nil", got)
 	}
 }
+
+// TestTOTPEntry_RoundTrip ensures every TOTP field survives a Set/Get
+// cycle in the fake store. The store layer is the one source of truth
+// for which fields persist, so any regression here will catch a missing
+// clone or a dropped metadata key.
+func TestTOTPEntry_RoundTrip(t *testing.T) {
+	s := New()
+	orig := &store.Entry{
+		Path:          "jasp/github-2fa",
+		Kind:          store.KindTOTP,
+		Password:      "JBSWY3DPEHPK3PXP",
+		TOTPIssuer:    "GitHub",
+		TOTPLabel:     "sascha@example.com",
+		TOTPAlgorithm: "SHA256",
+		TOTPDigits:    8,
+		TOTPPeriod:    60,
+	}
+	if err := s.Set(ctx(), orig); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx(), orig.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != store.KindTOTP {
+		t.Errorf("kind = %q, want totp", got.Kind)
+	}
+	if got.Password != orig.Password {
+		t.Errorf("seed lost: %q", got.Password)
+	}
+	if got.TOTPIssuer != "GitHub" {
+		t.Errorf("issuer = %q", got.TOTPIssuer)
+	}
+	if got.TOTPLabel != "sascha@example.com" {
+		t.Errorf("label = %q", got.TOTPLabel)
+	}
+	if got.TOTPAlgorithm != "SHA256" {
+		t.Errorf("algorithm = %q", got.TOTPAlgorithm)
+	}
+	if got.TOTPDigits != 8 {
+		t.Errorf("digits = %d", got.TOTPDigits)
+	}
+	if got.TOTPPeriod != 60 {
+		t.Errorf("period = %d", got.TOTPPeriod)
+	}
+}
+
+// TestSearch_MatchesTOTPIssuerAndLabel ensures a search for "github"
+// surfaces TOTP entries whose issuer field is "GitHub:sascha" style and
+// a search for the label substring matches as well. This covers the
+// „indexed metadata" contract the data model calls out.
+func TestSearch_MatchesTOTPIssuerAndLabel(t *testing.T) {
+	s := NewWithEntries(
+		&store.Entry{
+			Path: "jasp/2fa", Kind: store.KindTOTP, Password: "ABCDEF",
+			TOTPIssuer: "GitHub", TOTPLabel: "sascha@example.com",
+		},
+		&store.Entry{
+			Path: "jasp/aws-2fa", Kind: store.KindTOTP, Password: "ABCDEF",
+			TOTPIssuer: "AWS", TOTPLabel: "ops",
+		},
+	)
+	// Issuer match.
+	got, _, err := s.Search(ctx(), "gith", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{"jasp/2fa"}) {
+		t.Errorf("issuer search = %v, want [jasp/2fa]", got)
+	}
+	// Label match.
+	got, _, _ = s.Search(ctx(), "ops", nil)
+	if !reflect.DeepEqual(got, []string{"jasp/aws-2fa"}) {
+		t.Errorf("label search = %v, want [jasp/aws-2fa]", got)
+	}
+	// Password value (the base32 seed) must NOT match even for TOTP entries.
+	got, _, _ = s.Search(ctx(), "abcdef", nil)
+	if len(got) != 0 {
+		t.Errorf("TOTP seed must not be searchable, got %v", got)
+	}
+}

@@ -59,6 +59,7 @@ func rootCmd() *cobra.Command {
 		recipientCmd(&requester),
 		installSkillCmd(),
 		doctorCmd(&requester),
+		totpCmd(&requester),
 	)
 	return root
 }

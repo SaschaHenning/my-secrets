@@ -99,6 +99,42 @@ mys audit tail --actor ai
 mys audit verify                          # prüft Hash-Lücken
 ```
 
+## TOTP / 2FA
+
+TOTP-Seeds (die Basis jeder „Authenticator-App") sind die zweitgrößte
+Credential-Klasse nach Passwörtern — und die schmerzhafteste, wenn das
+Telefon verloren geht. `my-secrets` speichert Seeds verschlüsselt im
+gopass-Store und generiert den aktuellen Code deterministisch aus der
+lokalen Uhr.
+
+```bash
+# Direkt aus dem QR-Code-URI hinzufügen (wie Google Authenticator ihn liest)
+mys totp add jasp/github \
+  "otpauth://totp/GitHub:sascha?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&algorithm=SHA1&digits=6&period=30"
+
+# Oder nur ein Base32-Seed, Metadaten via Flags
+mys totp add jasp/aws JBSWY3DPEHPK3PXP --issuer AWS --label ops
+
+# Aktuellen Code holen
+mys totp jasp/github
+#
+# jasp/github (GitHub:sascha)
+# 487 291     (19s left)
+
+# Watch-Modus: aktualisiert sekündlich, Abbruch mit Ctrl-C
+mys totp jasp/github --watch
+```
+
+`mys get jasp/github` zeigt die TOTP-Metadaten (Issuer, Label,
+Algorithmus, Digits, Period) und maskiert den Seed. Nur `--reveal`
+druckt ihn im Klartext.
+
+Jede `mys totp <path>`-Code-Generierung erzeugt eine Audit-Zeile mit
+`action=totp_generate` und `reason=window=<index>` (RFC-6238-Zeitfenster),
+so dass wiederholte Aufrufe im selben 30-s-Fenster erkennbar bleiben.
+Die Scope-Policy greift identisch zu `mys get`: AI-Aufrufer kommen nicht
+an `private/**`.
+
 ## Checking your setup: `mys doctor`
 
 Ein einzelner Befehl, der elf Checks durchläuft und beantwortet: „Ist
