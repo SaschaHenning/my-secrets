@@ -210,12 +210,12 @@ func TestGenerateKey_Integration(t *testing.T) {
 	_ = exec.Command("gpgconf", "--kill", "gpg-agent").Run()
 }
 
-// TestEnsurePinentryTouchID_NonMac makes sure the function is a pure
+// TestEnsurePinentryMac_NonMac makes sure the function is a pure
 // no-op off darwin (no filesystem writes, no subprocess calls).
-func TestEnsurePinentryTouchID_NonMac(t *testing.T) {
+func TestEnsurePinentryMac_NonMac(t *testing.T) {
 	home := t.TempDir()
 	ctx := context.Background()
-	configured, err := ensurePinentryTouchIDIn(ctx, home, "linux")
+	configured, err := ensurePinentryMacIn(ctx, home, "linux")
 	if err != nil {
 		t.Fatalf("err on linux: %v", err)
 	}
@@ -223,41 +223,41 @@ func TestEnsurePinentryTouchID_NonMac(t *testing.T) {
 		t.Fatalf("should not configure on linux")
 	}
 	if _, err := os.Stat(filepath.Join(home, ".gnupg", "gpg-agent.conf")); err == nil {
-		t.Fatalf("ensurePinentryTouchIDIn created gpg-agent.conf on linux")
+		t.Fatalf("ensurePinentryMacIn created gpg-agent.conf on linux")
 	}
 }
 
-// TestEnsurePinentryTouchID_NotOnPath must not touch the config when
-// pinentry-touchid is missing from PATH — callers print the install
+// TestEnsurePinentryMac_NotOnPath must not touch the config when
+// pinentry-mac is missing from PATH — callers print the install
 // hint themselves.
-func TestEnsurePinentryTouchID_NotOnPath(t *testing.T) {
+func TestEnsurePinentryMac_NotOnPath(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS-specific path")
 	}
-	// Stub PATH so LookPath fails for pinentry-touchid.
+	// Stub PATH so LookPath fails for pinentry-mac.
 	t.Setenv("PATH", t.TempDir())
 	home := t.TempDir()
-	configured, err := ensurePinentryTouchIDIn(context.Background(), home, "darwin")
+	configured, err := ensurePinentryMacIn(context.Background(), home, "darwin")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if configured {
-		t.Fatalf("configured=true with pinentry-touchid missing from PATH")
+		t.Fatalf("configured=true with pinentry-mac missing from PATH")
 	}
 	if _, err := os.Stat(filepath.Join(home, ".gnupg", "gpg-agent.conf")); err == nil {
 		t.Fatalf("gpg-agent.conf should not have been created")
 	}
 }
 
-// TestEnsurePinentryTouchID_Idempotent makes sure a second call with an
+// TestEnsurePinentryMac_Idempotent makes sure a second call with an
 // already-configured file is a no-op.
-func TestEnsurePinentryTouchID_Idempotent(t *testing.T) {
+func TestEnsurePinentryMac_Idempotent(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS-specific path")
 	}
-	// Lay down a fake pinentry-touchid so LookPath succeeds.
+	// Lay down a fake pinentry-mac so LookPath succeeds.
 	pathDir := t.TempDir()
-	fake := filepath.Join(pathDir, "pinentry-touchid")
+	fake := filepath.Join(pathDir, "pinentry-mac")
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write fake pinentry: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestEnsurePinentryTouchID_Idempotent(t *testing.T) {
 	ctx := context.Background()
 
 	// First call writes the file.
-	configured, err := ensurePinentryTouchIDIn(ctx, home, "darwin")
+	configured, err := ensurePinentryMacIn(ctx, home, "darwin")
 	if err != nil {
 		t.Fatalf("first call: %v", err)
 	}
@@ -279,12 +279,12 @@ func TestEnsurePinentryTouchID_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read first: %v", err)
 	}
-	if !strings.Contains(string(first), "pinentry-touchid") {
-		t.Fatalf("file missing pinentry-touchid line: %q", first)
+	if !strings.Contains(string(first), "pinentry-mac") {
+		t.Fatalf("file missing pinentry-mac line: %q", first)
 	}
 
 	// Second call must be idempotent.
-	configured2, err := ensurePinentryTouchIDIn(ctx, home, "darwin")
+	configured2, err := ensurePinentryMacIn(ctx, home, "darwin")
 	if err != nil {
 		t.Fatalf("second call: %v", err)
 	}
@@ -300,25 +300,25 @@ func TestEnsurePinentryTouchID_Idempotent(t *testing.T) {
 	}
 }
 
-// TestHasPinentryTouchIDLine checks the matcher against common config
+// TestHasPinentryMacLine checks the matcher against common config
 // shapes so the idempotency promise does not regress.
-func TestHasPinentryTouchIDLine(t *testing.T) {
+func TestHasPinentryMacLine(t *testing.T) {
 	cases := []struct {
 		name  string
 		input string
 		want  bool
 	}{
 		{"empty", "", false},
-		{"comment only", "# pinentry-program /opt/homebrew/bin/pinentry-touchid\n", false},
-		{"other pinentry", "pinentry-program /usr/local/bin/pinentry-mac\n", false},
-		{"homebrew", "pinentry-program /opt/homebrew/bin/pinentry-touchid\n", true},
-		{"intel homebrew", "pinentry-program /usr/local/bin/pinentry-touchid\n", true},
-		{"leading whitespace", "   pinentry-program /opt/homebrew/bin/pinentry-touchid  \n", true},
+		{"comment only", "# pinentry-program /opt/homebrew/bin/pinentry-mac\n", false},
+		{"other pinentry", "pinentry-program /usr/local/bin/pinentry-curses\n", false},
+		{"homebrew", "pinentry-program /opt/homebrew/bin/pinentry-mac\n", true},
+		{"intel homebrew", "pinentry-program /usr/local/bin/pinentry-mac\n", true},
+		{"leading whitespace", "   pinentry-program /opt/homebrew/bin/pinentry-mac  \n", true},
 		{"no path", "pinentry-program\n", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hasPinentryTouchIDLine([]byte(tc.input)); got != tc.want {
+			if got := hasPinentryMacLine([]byte(tc.input)); got != tc.want {
 				t.Fatalf("input %q → %v, want %v", tc.input, got, tc.want)
 			}
 		})

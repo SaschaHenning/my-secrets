@@ -11,8 +11,8 @@
 //   - HasKeys: enumerate existing secret keys via `--with-colons`.
 //   - GenerateKey: batch-generate an Ed25519 key and return the new
 //     fingerprint (parsed from the [GNUPG:] KEY_CREATED status line).
-//   - EnsurePinentryTouchID: append a `pinentry-program` line to
-//     ~/.gnupg/gpg-agent.conf if pinentry-touchid is on PATH; idempotent.
+//   - EnsurePinentryMac: append a `pinentry-program` line to
+//     ~/.gnupg/gpg-agent.conf if pinentry-mac is on PATH; idempotent.
 package gpgsetup
 
 import (
@@ -147,7 +147,7 @@ type GenerateOpts struct {
 	// Email is the email address that ends up in the UID. Required.
 	Email string
 	// Passphrase protects the private key. Empty means „no passphrase"
-	// (recommended when pinentry-touchid is taking over auth).
+	// (recommended when pinentry-mac is taking over auth).
 	Passphrase string
 }
 
@@ -318,15 +318,15 @@ func parseKeyCreatedLine(b []byte) string {
 	return any
 }
 
-// EnsurePinentryTouchID is a macOS-only helper that wires
-// pinentry-touchid into the user's gpg-agent configuration.
+// EnsurePinentryMac is a macOS-only helper that wires
+// pinentry-mac into the user's gpg-agent configuration.
 //
 // Behaviour:
 //   - On non-macOS: no-op, returns (false, nil).
-//   - If `pinentry-touchid` is not on PATH: prints nothing and returns
+//   - If `pinentry-mac` is not on PATH: prints nothing and returns
 //     (false, nil) — the `mys init` step surfaces the install hint.
 //   - If the user's ~/.gnupg/gpg-agent.conf already contains a
-//     `pinentry-program` line pointing at a `pinentry-touchid` binary,
+//     `pinentry-program` line pointing at a `pinentry-mac` binary,
 //     the function is a no-op and returns (false, nil).
 //   - Otherwise the function appends `pinentry-program <path>` to
 //     gpg-agent.conf (creating the file if necessary with 0600) and
@@ -336,17 +336,17 @@ func parseKeyCreatedLine(b []byte) string {
 // Any error from the filesystem or from gpgconf is returned so the
 // init step can decide whether to treat it as fatal; today the init
 // step treats this as a warning, not a hard failure.
-func EnsurePinentryTouchID(ctx context.Context) (configured bool, err error) {
-	return ensurePinentryTouchIDIn(ctx, "", runtime.GOOS)
+func EnsurePinentryMac(ctx context.Context) (configured bool, err error) {
+	return ensurePinentryMacIn(ctx, "", runtime.GOOS)
 }
 
-// ensurePinentryTouchIDIn is the testable core. homeOverride, when
+// ensurePinentryMacIn is the testable core. homeOverride, when
 // non-empty, replaces os.UserHomeDir(). goos lets tests simulate non-mac.
-func ensurePinentryTouchIDIn(ctx context.Context, homeOverride, goos string) (bool, error) {
+func ensurePinentryMacIn(ctx context.Context, homeOverride, goos string) (bool, error) {
 	if goos != "darwin" {
 		return false, nil
 	}
-	path, err := exec.LookPath("pinentry-touchid")
+	path, err := exec.LookPath("pinentry-mac")
 	if err != nil {
 		// Caller prints the install hint.
 		return false, nil
@@ -368,7 +368,7 @@ func ensurePinentryTouchIDIn(ctx context.Context, homeOverride, goos string) (bo
 	if rerr != nil && !os.IsNotExist(rerr) {
 		return false, fmt.Errorf("read gpg-agent.conf: %w", rerr)
 	}
-	if hasPinentryTouchIDLine(existing) {
+	if hasPinentryMacLine(existing) {
 		return false, nil
 	}
 	// Append — creating with 0600 if missing.
@@ -453,11 +453,11 @@ func hasAllowLoopbackLine(conf []byte) bool {
 	return false
 }
 
-// hasPinentryTouchIDLine reports whether the config blob already
+// hasPinentryMacLine reports whether the config blob already
 // contains a non-comment `pinentry-program` line whose value ends in
-// `pinentry-touchid` (the suffix catches both /opt/homebrew/bin/… and
+// `pinentry-mac` (the suffix catches both /opt/homebrew/bin/… and
 // /usr/local/bin/… installs).
-func hasPinentryTouchIDLine(conf []byte) bool {
+func hasPinentryMacLine(conf []byte) bool {
 	sc := bufio.NewScanner(strings.NewReader(string(conf)))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -472,7 +472,7 @@ func hasPinentryTouchIDLine(conf []byte) bool {
 			continue
 		}
 		bin := filepath.Base(parts[1])
-		if bin == "pinentry-touchid" {
+		if bin == "pinentry-mac" {
 			return true
 		}
 	}

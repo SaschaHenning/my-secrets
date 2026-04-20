@@ -71,7 +71,7 @@ On a machine with neither a GPG key nor a gopass store, mys init will:
 
   1. generate an Ed25519 GPG key (or pick an existing one)
   2. initialise the gopass store against that key
-  3. configure pinentry-touchid (macOS only, best-effort)
+  3. configure pinentry-mac (macOS only, best-effort)
   4. write the default scope policy and create the audit DB
   5. optionally install the Claude Code skill
   6. optionally set up git sync
@@ -103,7 +103,7 @@ Re-running is idempotent: no duplicate keys, no config churn.`,
 	c.Flags().StringVar(&opts.Name, "name", "", "real name for a new GPG key (defaults to git config user.name)")
 	c.Flags().StringVar(&opts.Email, "email", "", "email for a new GPG key (defaults to git config user.email)")
 	c.Flags().BoolVar(&opts.NoPassphrase, "no-passphrase", false,
-		"generate the new GPG key without a passphrase (useful with pinentry-touchid)")
+		"generate the new GPG key without a passphrase (useful with pinentry-mac)")
 	// --install-skill takes an optional value so both `--install-skill`
 	// (implies global) and `--install-skill=local` work.
 	c.Flags().BoolVar(&opts.InstallSkill, "install-skill", false,
@@ -149,7 +149,7 @@ func runInit(ctx context.Context, opts *initOptions) error {
 	steps := []initStep{
 		{name: "detect or generate GPG key", run: stepGPG},
 		{name: "initialise gopass store", run: stepGopass},
-		{name: "configure pinentry-touchid", run: stepPinentry},
+		{name: "configure pinentry-mac", run: stepPinentry},
 		{name: "write policy + audit", run: stepState},
 		{name: "install Claude skill", run: stepSkill},
 		{name: "set up git sync", run: stepSync},
@@ -224,7 +224,7 @@ func stepGPG(ctx context.Context, opts *initOptions, state *initState) error {
 		// see that the key is generated without passphrase protection. The
 		// security implication (losing the key file = losing every secret)
 		// is too important to leave implicit.
-		fmt.Fprintf(opts.Out, "[!] Generating key WITHOUT passphrase — rely on pinentry-touchid or file-system permissions for protection.\n")
+		fmt.Fprintf(opts.Out, "[!] Generating key WITHOUT passphrase — rely on pinentry-mac or file-system permissions for protection.\n")
 	}
 	fmt.Fprintf(opts.Out, "[+] Generating ed25519 GPG key for %s <%s>...\n", name, email)
 	fpr, err := gpgsetup.GenerateKey(ctx, gpgsetup.GenerateOpts{
@@ -426,7 +426,7 @@ func stepGopass(ctx context.Context, opts *initOptions, state *initState) error 
 	return nil
 }
 
-// ----- Step 3: pinentry-touchid -----
+// ----- Step 3: pinentry-mac -----
 
 func stepPinentry(ctx context.Context, opts *initOptions, _ *initState) error {
 	if runtime.GOOS != "darwin" {
@@ -434,63 +434,63 @@ func stepPinentry(ctx context.Context, opts *initOptions, _ *initState) error {
 		// not applicable.
 		return nil
 	}
-	if _, err := exec.LookPath("pinentry-touchid"); err != nil {
+	if _, err := exec.LookPath("pinentry-mac"); err != nil {
 		// Missing binary. In interactive mode explain what it is and
 		// offer to install it via brew. In --yes mode just skip with a
 		// short line so the log stays quiet.
 		if opts.Yes {
-			fmt.Fprintln(opts.Out, "[!] pinentry-touchid not installed (skipped in --yes mode)")
+			fmt.Fprintln(opts.Out, "[!] pinentry-mac not installed (skipped in --yes mode)")
 			return nil
 		}
-		install, err := promptInstallPinentryTouchID(opts)
+		install, err := promptInstallPinentryMac(opts)
 		if err != nil {
 			return err
 		}
 		if !install {
-			fmt.Fprintln(opts.Out, "[!] pinentry-touchid übersprungen — Passphrase-Prompts bleiben textbasiert.")
+			fmt.Fprintln(opts.Out, "[!] pinentry-mac übersprungen — Passphrase-Prompts bleiben textbasiert.")
 			return nil
 		}
-		if err := installPinentryTouchIDViaBrew(ctx, opts); err != nil {
-			fmt.Fprintf(opts.Out, "[!] pinentry-touchid Installation fehlgeschlagen: %s\n", err.Error())
-			fmt.Fprintln(opts.Out, "    Manuell: `brew install pinentry-touchid` + Re-run von `mys init`.")
+		if err := installPinentryMacViaBrew(ctx, opts); err != nil {
+			fmt.Fprintf(opts.Out, "[!] pinentry-mac Installation fehlgeschlagen: %s\n", err.Error())
+			fmt.Fprintln(opts.Out, "    Manuell: `brew install pinentry-mac` + Re-run von `mys init`.")
 			return nil
 		}
 		// LookPath again after install.
-		if _, err := exec.LookPath("pinentry-touchid"); err != nil {
-			fmt.Fprintln(opts.Out, "[!] pinentry-touchid nach Installation nicht auf PATH — neue Shell öffnen und `mys init` nochmal laufen lassen.")
+		if _, err := exec.LookPath("pinentry-mac"); err != nil {
+			fmt.Fprintln(opts.Out, "[!] pinentry-mac nach Installation nicht auf PATH — neue Shell öffnen und `mys init` nochmal laufen lassen.")
 			return nil
 		}
 	}
-	configured, err := gpgsetup.EnsurePinentryTouchID(ctx)
+	configured, err := gpgsetup.EnsurePinentryMac(ctx)
 	if err != nil {
-		fmt.Fprintf(opts.Out, "[!] pinentry-touchid: %s\n", err.Error())
+		fmt.Fprintf(opts.Out, "[!] pinentry-mac: %s\n", err.Error())
 		return nil
 	}
 	home, _ := os.UserHomeDir()
 	confPath := filepath.Join(home, ".gnupg", "gpg-agent.conf")
 	if configured {
-		fmt.Fprintf(opts.Out, "[v] pinentry-touchid configured in %s\n", prettyPath(confPath))
+		fmt.Fprintf(opts.Out, "[v] pinentry-mac configured in %s\n", prettyPath(confPath))
 	} else {
-		fmt.Fprintf(opts.Out, "[v] pinentry-touchid already configured in %s\n", prettyPath(confPath))
+		fmt.Fprintf(opts.Out, "[v] pinentry-mac already configured in %s\n", prettyPath(confPath))
 	}
 	return nil
 }
 
-// promptInstallPinentryTouchID explains what Touch-ID integration buys
-// and asks whether to run `brew install pinentry-touchid` right now.
-func promptInstallPinentryTouchID(opts *initOptions) (bool, error) {
+// promptInstallPinentryMac explains what Touch-ID integration buys
+// and asks whether to run `brew install pinentry-mac` right now.
+func promptInstallPinentryMac(opts *initOptions) (bool, error) {
 	fmt.Fprintln(opts.Out, "")
 	fmt.Fprintln(opts.Out, "Touch-ID für GPG einrichten?")
 	fmt.Fprintln(opts.Out, "")
-	fmt.Fprintln(opts.Out, "`pinentry-touchid` leitet GPG-Passphrase-Abfragen auf den")
+	fmt.Fprintln(opts.Out, "`pinentry-mac` leitet GPG-Passphrase-Abfragen auf den")
 	fmt.Fprintln(opts.Out, "Touch-ID-Sensor deines Mac um. Statt „Passphrase tippen")
 	fmt.Fprintln(opts.Out, "im Terminal\" tippst du jede `mys get`/`mys totp`/Git-Sync-Entsperrung")
 	fmt.Fprintln(opts.Out, "mit dem Finger weg — spürbar schneller, und die Passphrase")
 	fmt.Fprintln(opts.Out, "liegt in der macOS-Keychain statt im Shell-Verlauf.")
 	fmt.Fprintln(opts.Out, "")
-	fmt.Fprintln(opts.Out, "Ohne pinentry-touchid funktioniert my-secrets genauso,")
+	fmt.Fprintln(opts.Out, "Ohne pinentry-mac funktioniert my-secrets genauso,")
 	fmt.Fprintln(opts.Out, "nur eben mit Text-Passphrase-Prompt. Später nachrüstbar")
-	fmt.Fprintln(opts.Out, "mit `brew install pinentry-touchid` + Re-run von `mys init`.")
+	fmt.Fprintln(opts.Out, "mit `brew install pinentry-mac` + Re-run von `mys init`.")
 	fmt.Fprintln(opts.Out, "")
 	if _, err := exec.LookPath("brew"); err != nil {
 		fmt.Fprintln(opts.Out, "`brew` ist nicht auf PATH — Installation wird hier übersprungen.")
@@ -499,7 +499,7 @@ func promptInstallPinentryTouchID(opts *initOptions) (bool, error) {
 	}
 	br := bufio.NewReader(opts.In)
 	for {
-		fmt.Fprint(opts.Out, "Jetzt `brew install pinentry-touchid`? [j/N]: ")
+		fmt.Fprint(opts.Out, "Jetzt `brew install pinentry-mac`? [j/N]: ")
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
 			return false, err
@@ -515,13 +515,13 @@ func promptInstallPinentryTouchID(opts *initOptions) (bool, error) {
 	}
 }
 
-// installPinentryTouchIDViaBrew runs `brew install pinentry-touchid`
+// installPinentryMacViaBrew runs `brew install pinentry-mac`
 // with stdout/stderr piped through opts.Out so the user sees the progress.
 // Returns any non-zero exit as an error; the caller decides how to
 // surface it.
-func installPinentryTouchIDViaBrew(ctx context.Context, opts *initOptions) error {
-	fmt.Fprintln(opts.Out, "[+] Installing pinentry-touchid via brew...")
-	cmd := exec.CommandContext(ctx, "brew", "install", "pinentry-touchid")
+func installPinentryMacViaBrew(ctx context.Context, opts *initOptions) error {
+	fmt.Fprintln(opts.Out, "[+] Installing pinentry-mac via brew...")
+	cmd := exec.CommandContext(ctx, "brew", "install", "pinentry-mac")
 	cmd.Stdout = opts.Out
 	cmd.Stderr = opts.Out
 	return cmd.Run()

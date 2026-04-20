@@ -7,7 +7,7 @@ Schritt-für-Schritt-Anleitung für ein frisches macOS-Setup.
 Komplett von Null (kein GPG-Key, kein gopass-Store, kein my-secrets):
 
 ```bash
-brew install gopass pinentry-touchid
+brew install gopass pinentry-mac
 git clone https://github.com/SaschaHenning/my-secrets ~/Code/my-secrets
 cd ~/Code/my-secrets
 make build && sudo cp bin/mys /usr/local/bin/
@@ -15,7 +15,7 @@ mys init --install-skill
 ```
 
 Das reicht. `mys init` generiert den GPG-Key, initialisiert den
-gopass-Store, setzt `pinentry-touchid` in Gang, legt Policy + Audit-DB
+gopass-Store, setzt `pinentry-mac` in Gang, legt Policy + Audit-DB
 an und verlinkt den Claude-Skill.
 
 Oder komplett automatisiert via Installer:
@@ -62,22 +62,22 @@ Für biometrische Freigabe beim GPG-Entsperren:
 
 ```bash
 # Versuch 1 — Homebrew-Tap
-brew install jorgelbg/tap/pinentry-touchid
+brew install jorgelbg/tap/pinentry-mac
 
 # Wenn das wegen eines Homebrew-Ruby-Bugs („undefined method 'type_member'")
 # scheitert, Binary direkt bauen:
-git clone https://github.com/jorgelbg/pinentry-touchid /tmp/ptid
+git clone https://github.com/jorgelbg/pinentry-mac /tmp/ptid
 cd /tmp/ptid
-go build -o "$(brew --prefix)/bin/pinentry-touchid" .
+go build -o "$(brew --prefix)/bin/pinentry-mac" .
 ```
 
 Anschließend in `~/.gnupg/gpg-agent.conf`:
 
 ```
-pinentry-program /opt/homebrew/bin/pinentry-touchid
+pinentry-program /opt/homebrew/bin/pinentry-mac
 ```
 
-Ohne `pinentry-touchid` funktioniert alles — du bekommst dann den
+Ohne `pinentry-mac` funktioniert alles — du bekommst dann den
 Standard-`pinentry`-Prompt (Passphrase im Keychain gespeichert).
 
 ## Schritt 2 · Repo klonen und bauen
@@ -121,7 +121,7 @@ arbeitsfähigen Zustand:
    nachfragen).
 2. **gopass-Store** — `gopass init` gegen den gerade ermittelten
    Fingerprint, wenn `~/.password-store/.gpg-id` noch fehlt.
-3. **pinentry-touchid** — falls das Binary auf PATH liegt, wird der
+3. **pinentry-mac** — falls das Binary auf PATH liegt, wird der
    Eintrag in `~/.gnupg/gpg-agent.conf` gesetzt und `gpg-agent`
    neugestartet. Sonst: kurzer Hinweis, kein Abbruch.
 4. **Policy + Audit-DB** — schreibt
@@ -144,7 +144,7 @@ Flags:
 ```bash
 # Non-interactive (CI, fresh Mac):
 mys init --yes                          # fehlt user.name/email in git config → Fehler
-mys init --yes --no-passphrase          # Key ohne Passphrase (via pinentry-touchid)
+mys init --yes --no-passphrase          # Key ohne Passphrase (via pinentry-mac)
 
 # Explizite Angaben:
 mys init --name "Sascha" --email garry@jasp.eu
@@ -256,7 +256,7 @@ werden.
 `brew install pinentry-mac` + in `~/.gnupg/gpg-agent.conf`
 `pinentry-program /opt/homebrew/bin/pinentry-mac` eintragen.
 
-**`brew install jorgelbg/tap/pinentry-touchid` scheitert mit „type_member"**
+**`brew install jorgelbg/tap/pinentry-mac` scheitert mit „type_member"**
 → Homebrew-Ruby-Bug. Siehe „Optional: Touch-ID-Unlock" oben für den manuellen Bau.
 
 **Audit-DB sagt `database is locked`**
