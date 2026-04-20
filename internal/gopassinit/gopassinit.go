@@ -17,11 +17,26 @@ import (
 	"strings"
 )
 
-// DefaultStoreDir returns the path of the default gopass store:
-// $PASSWORD_STORE_DIR if set, otherwise ~/.password-store.
+// DefaultStoreDir returns the path of the default gopass store in the
+// order gopass itself uses:
+//
+//  1. $PASSWORD_STORE_DIR if set.
+//  2. The path reported by `gopass config mounts.path` — gopass
+//     v1.16+ persists its active store path here, which may differ
+//     from the conventional ~/.password-store.
+//  3. ~/.password-store as the final fallback.
+//
+// This is what "where does gopass actually keep my secrets" resolves to.
 func DefaultStoreDir() (string, error) {
 	if p := os.Getenv("PASSWORD_STORE_DIR"); p != "" {
 		return p, nil
+	}
+	if _, err := exec.LookPath("gopass"); err == nil {
+		if out, err := exec.Command("gopass", "config", "mounts.path").Output(); err == nil {
+			if path := strings.TrimSpace(string(out)); path != "" {
+				return path, nil
+			}
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {

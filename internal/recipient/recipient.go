@@ -208,18 +208,74 @@ func parseGopassRecipients(b []byte) []string {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Walk the line collecting runs of hex chars of length 40.
+		// Walk the line collecting hex tokens. gopass 1.16+ prints only
+		// 16-char short key IDs ("0xABCD1234..."), older releases printed
+		// full 40-char fingerprints. Accept both shapes and — if we see a
+		// short ID — resolve it to the full fingerprint via gpg so the
+		// rest of the flow can treat everything uniformly.
 		for _, tok := range tokenize(line) {
-			if isFingerprint(tok) {
-				up := strings.ToUpper(tok)
-				if _, ok := seen[up]; !ok {
-					seen[up] = struct{}{}
-					fprs = append(fprs, up)
+			tok = strings.TrimPrefix(tok, "0x")
+			tok = strings.TrimPrefix(tok, "0X")
+			if !isHexID(tok) {
+				continue
+			}
+			up := strings.ToUpper(tok)
+			if len(up) == 16 {
+				if full := resolveShortID(up); full != "" {
+					up = full
 				}
+			}
+			if _, ok := seen[up]; !ok {
+				seen[up] = struct{}{}
+				fprs = append(fprs, up)
 			}
 		}
 	}
-	return fprs
+	// Second pass: drop a 16-char short ID when we already have its
+	// matching 40-char fingerprint (the short ID is the fingerprint's
+	// last 16 characters). This handles the case where both formats
+	// appear in the same gopass output (older tree-style listings put
+	// both the short header line and the full fingerprint line below
+	// each other).
+	fulls := map[string]struct{}{}
+	for _, f := range fprs {
+		if len(f) == 40 {
+			fulls[f[len(f)-16:]] = struct{}{}
+		}
+	}
+	out := fprs[:0]
+	for _, f := range fprs {
+		if len(f) == 16 {
+			if _, isShadow := fulls[f]; isShadow {
+				continue
+			}
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// resolveShortID calls `gpg --with-colons --list-keys <short>` to expand
+// a 16-char key id into its 40-char fingerprint. Returns an empty string
+// if gpg is missing or the lookup fails — caller keeps the short form
+// in that case so the user at least sees something.
+func resolveShortID(short string) string {
+	if _, err := exec.LookPath("gpg"); err != nil {
+		return ""
+	}
+	out, err := exec.Command("gpg", "--with-colons", "--list-keys", short).Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "fpr:") {
+			parts := strings.Split(line, ":")
+			if len(parts) >= 10 && len(parts[9]) == 40 {
+				return strings.ToUpper(parts[9])
+			}
+		}
+	}
+	return ""
 }
 
 // tokenize returns whitespace / tree-char separated tokens from a line.
@@ -236,6 +292,17 @@ func tokenize(line string) []string {
 
 func isFingerprint(s string) bool {
 	if len(s) != 40 {
+		return false
+	}
+	return isHexID(s)
+}
+
+// isHexID returns true for 16- or 40-character all-hex tokens. gopass
+// 1.16+ emits short key IDs (16 chars); older versions and gpg itself
+// emit full fingerprints (40 chars). Both are accepted so the recipient
+// parser works across versions.
+func isHexID(s string) bool {
+	if len(s) != 16 && len(s) != 40 {
 		return false
 	}
 	for _, r := range s {

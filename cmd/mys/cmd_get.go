@@ -126,9 +126,6 @@ func printEntry(w io.Writer, e *store.Entry, field string, reveal bool, format s
 	if e.Notes != "" {
 		fmt.Fprintf(w, "notes:    %s\n", e.Notes)
 	}
-	if e.Domain != "" {
-		fmt.Fprintf(w, "domain:   %s\n", e.Domain)
-	}
 	if len(e.Fields) > 0 {
 		// Sorted for stable output across rewrites.
 		keys := make([]string, 0, len(e.Fields))

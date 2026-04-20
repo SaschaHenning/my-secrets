@@ -52,7 +52,9 @@ func ParseDuration(s string) (time.Duration, error) {
 	}
 	n, err := strconv.Atoi(numPart)
 	if err != nil {
-		return 0, fmt.Errorf("rotation: %q has no integer prefix: %w", s, err)
+		// Hide the internal strconv error from the user — they typed a
+		// duration, they should see a duration-shaped error.
+		return 0, fmt.Errorf("rotation: %q is not a valid duration — expected Nd / Nw / Nm / Ny (e.g. 30d, 2w, 3m, 1y)", s)
 	}
 	if n <= 0 {
 		return 0, fmt.Errorf("rotation: %q must be positive", s)
