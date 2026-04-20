@@ -105,9 +105,10 @@ func auditCmd() *cobra.Command {
 	since.Flags().IntVar(&sinceLimit, "limit", 200, "max rows")
 	since.Flags().StringVar(&sinceFormat, "format", "text", "output format: text | json")
 
+	var checkSignatures bool
 	verify := &cobra.Command{
 		Use:   "verify",
-		Short: "Check that the audit log has no gaps",
+		Short: "Check that the audit log has no gaps (add --signatures for hash-chain check)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -118,6 +119,17 @@ func auditCmd() *cobra.Command {
 				return err
 			}
 			defer a.Close(ctx)
+			if checkSignatures {
+				ok, bad, checked, err := a.Audit.VerifySignatures(ctx)
+				if err != nil {
+					return err
+				}
+				if ok {
+					fmt.Fprintf(cmd.OutOrStdout(), "audit ok — %d signed rows verified\n", checked)
+					return nil
+				}
+				return fmt.Errorf("audit tampered: seqs %v failed signature check (checked %d signed rows)", bad, checked)
+			}
 			ok, missing, err := a.Audit.Verify(ctx)
 			if err != nil {
 				return err
@@ -130,6 +142,8 @@ func auditCmd() *cobra.Command {
 			return fmt.Errorf("audit gaps: %v", missing)
 		},
 	}
+	verify.Flags().BoolVar(&checkSignatures, "signatures", false,
+		"verify Ed25519 hash-chain signatures (requires MYS_AUDIT_SIGN-written rows)")
 
 	root.AddCommand(tail, since, verify)
 	return root

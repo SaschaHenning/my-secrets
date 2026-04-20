@@ -84,6 +84,59 @@ For higher assurance we would need the signed hash-chain design from
 Ansatz B of the planning doc — deliberately deferred for the MVP because
 the single-user threat model does not require crypto-grade audit.
 
+### Signed-Chain-Mode (opt-in)
+
+To detect DB-level tampering beyond what the triggers catch, set
+
+```
+export MYS_AUDIT_SIGN=1
+```
+
+in any shell that invokes `mys`. Every row written under that env gains
+three additional columns:
+
+| Column      | Contents                                                               |
+| ----------- | ---------------------------------------------------------------------- |
+| `prev_hash` | `row_hash` of the previous signed row (32 zero bytes for the first).   |
+| `row_hash`  | `SHA-256(canonical_bytes(entry) ‖ prev_hash)`.                         |
+| `signature` | Ed25519 signature over `row_hash`.                                     |
+
+The private signing key is generated on first use and stored in the
+macOS Keychain under service `com.jasp.my-secrets.audit-signing`,
+account `default`. The matching public key is written to
+`~/.local/share/my-secrets/audit-pub.key` (base64, 0644) so anyone with
+read access to the audit DB can verify offline.
+
+To verify:
+
+```
+mys audit verify --signatures
+```
+
+The verifier re-computes `canonical_bytes` per row, walks the chain,
+and checks every Ed25519 signature against the public-key file. Output:
+
+- `audit ok — N signed rows verified` on success
+- `audit tampered: seqs [..] failed signature check` on any mismatch
+
+**Threat model coverage — why the triggers alone are insufficient.**
+The `BEFORE UPDATE` / `BEFORE DELETE` triggers run inside the same
+SQLite DB that an attacker with write access can modify. `DROP TRIGGER
+audit_no_update; UPDATE audit_log SET reason='...';` is a two-statement
+bypass. Sign-mode defeats this: an attacker without the Keychain-held
+private key cannot produce a valid signature for their forged row, and
+the chain linkage means any silent edit upstream of a later row breaks
+that later row's `prev_hash` check too. The tamper event becomes
+*detectable*, not *preventable*.
+
+**Cross-platform note.** The keychain backend is
+[`zalando/go-keyring`](https://github.com/zalando/go-keyring). On macOS
+it uses the system Keychain directly; on Linux it requires a running
+Secret Service (e.g. GNOME Keyring). If the platform lacks a keyring
+daemon, `mys` with `MYS_AUDIT_SIGN=1` will refuse to start — by design.
+Unset the env to fall back to trigger-only mode, or provide a working
+keychain.
+
 ## File permissions
 
 | File                                               | Mode           |

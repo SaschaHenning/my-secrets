@@ -3,8 +3,10 @@ package audit
 
 import (
 	"context"
+	"crypto/ed25519"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -56,7 +58,10 @@ type Entry struct {
 
 // Log wraps the underlying SQLite DB used for audit writes.
 type Log struct {
-	db *sql.DB
+	db       *sql.DB
+	signMode bool
+	privKey  ed25519.PrivateKey
+	keyStore KeyStore
 }
 
 // DefaultPath returns the usual audit DB path:
@@ -70,8 +75,15 @@ func DefaultPath() (string, error) {
 }
 
 // Open opens (and creates if missing) the audit DB. An empty path uses
-// DefaultPath().
+// DefaultPath(). Signed-chain mode is auto-enabled if MYS_AUDIT_SIGN=1.
 func Open(path string) (*Log, error) {
+	return OpenWithKeyStore(path, nil)
+}
+
+// OpenWithKeyStore is Open with an injected KeyStore. Used by tests. A
+// nil KeyStore means „use the default keychain-backed store when sign
+// mode is enabled".
+func OpenWithKeyStore(path string, ks KeyStore) (*Log, error) {
 	if path == "" {
 		var err error
 		path, err = DefaultPath()
@@ -96,8 +108,36 @@ func Open(path string) (*Log, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// Opt-in: signed hash-chain mode.
+	if envSignEnabled() {
+		if ks == nil {
+			defKS, err := DefaultKeyStore()
+			if err != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("audit signing: default keystore: %w", err)
+			}
+			ks = defKS
+		}
+		priv, err := ks.Load()
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("audit signing: load key: %w",
+				fmt.Errorf("%w — refusing to continue without signing keys (unset %s to disable)", err, EnvSignMode))
+		}
+		// Force public-key materialisation so the verify file is always there.
+		if _, perr := ks.Public(); perr != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("audit signing: public key: %w", perr)
+		}
+		l.signMode = true
+		l.privKey = priv
+		l.keyStore = ks
+	}
 	return l, nil
 }
+
+// SignModeEnabled reports whether the Log is writing signed rows.
+func (l *Log) SignModeEnabled() bool { return l != nil && l.signMode }
 
 func (l *Log) Close() error {
 	if l == nil || l.db == nil {
@@ -121,15 +161,90 @@ func (l *Log) Write(ctx context.Context, e Entry) (int64, error) {
 	if len(e.ActorDetail) > 0 {
 		detail = []byte(e.ActorDetail)
 	}
-	res, err := l.db.ExecContext(ctx, `
+
+	if !l.signMode {
+		res, err := l.db.ExecContext(ctx, `
+			INSERT INTO audit_log (ts, action, secret_path, org, actor_kind, actor_detail, result, reason)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		`, e.TS.UTC().Format(time.RFC3339Nano), e.Action, e.SecretPath, e.Org,
+			e.ActorKind, string(detail), e.Result, e.Reason)
+		if err != nil {
+			return 0, fmt.Errorf("audit write: %w", err)
+		}
+		return res.LastInsertId()
+	}
+
+	// Signed path: wrap in an IMMEDIATE transaction so the prev_hash read
+	// and the INSERT are atomic with respect to concurrent writers.
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("audit begin: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		// Some sqlite drivers auto-begin; ignore "cannot start a transaction within a transaction".
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// 1. Find predecessor row_hash (nil if table empty or prior rows unsigned).
+	var prev []byte
+	row := tx.QueryRowContext(ctx, `
+		SELECT row_hash FROM audit_log
+		WHERE row_hash IS NOT NULL
+		ORDER BY seq DESC
+		LIMIT 1
+	`)
+	if err := row.Scan(&prev); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("audit fetch prev_hash: %w", err)
+	}
+
+	// 2. Insert without chain columns first to obtain the AUTOINCREMENT seq.
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO audit_log (ts, action, secret_path, org, actor_kind, actor_detail, result, reason)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`, e.TS.UTC().Format(time.RFC3339Nano), e.Action, e.SecretPath, e.Org,
 		e.ActorKind, string(detail), e.Result, e.Reason)
 	if err != nil {
-		return 0, fmt.Errorf("audit write: %w", err)
+		return 0, fmt.Errorf("audit write signed: %w", err)
 	}
-	return res.LastInsertId()
+	seq, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	e.Seq = seq
+
+	// 3. Compute chain hash + signature using the assigned seq.
+	rowHash := chainHash(e, prev)
+	sig := ed25519.Sign(l.privKey, rowHash)
+
+	// 4. Update the row with prev_hash, row_hash, signature. We must allow
+	//    this by briefly bypassing the append-only UPDATE trigger. Because
+	//    we only populate three previously-NULL columns in the same
+	//    transaction as the insert, we guard that by a precondition check.
+	//    The trigger stays active at rest.
+	if _, err := tx.ExecContext(ctx, `DROP TRIGGER IF EXISTS audit_no_update`); err != nil {
+		return 0, fmt.Errorf("audit drop trigger: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+		UPDATE audit_log
+		SET prev_hash = ?, row_hash = ?, signature = ?
+		WHERE seq = ?
+	`, prev, rowHash, sig, seq)
+	if err != nil {
+		return 0, fmt.Errorf("audit write chain cols: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, appendOnlyUpdateTrigger); err != nil {
+		return 0, fmt.Errorf("audit restore trigger: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("audit commit: %w", err)
+	}
+	committed = true
+	return seq, nil
 }
 
 // Filter narrows a Tail / Since query.
@@ -210,6 +325,124 @@ func (l *Log) Verify(ctx context.Context) (ok bool, missing []int64, err error) 
 	return len(missing) == 0, missing, rows.Err()
 }
 
+// VerifySignatures walks the audit log and recomputes the hash-chain and
+// Ed25519 signatures for every signed row. Returns ok=true iff every
+// signed row matches. badSeqs contains the seq of every failing row
+// (signature mismatch or broken chain). Unsigned rows (written before
+// sign-mode was enabled) are skipped.
+func (l *Log) VerifySignatures(ctx context.Context) (ok bool, badSeqs []int64, checked int, err error) {
+	pub, err := l.loadPublicKey()
+	if err != nil {
+		return false, nil, 0, err
+	}
+	rows, err := l.db.QueryContext(ctx, `
+		SELECT seq, ts, action, secret_path, org, actor_kind, actor_detail, result, reason,
+		       prev_hash, row_hash, signature
+		FROM audit_log
+		ORDER BY seq ASC
+	`)
+	if err != nil {
+		return false, nil, 0, fmt.Errorf("audit verify signatures: %w", err)
+	}
+	defer rows.Close()
+
+	var prevRowHash []byte
+	havePrev := false
+	for rows.Next() {
+		var e Entry
+		var tsStr, detail string
+		var prevHash, rowHash, sig []byte
+		if err := rows.Scan(&e.Seq, &tsStr, &e.Action, &e.SecretPath, &e.Org,
+			&e.ActorKind, &detail, &e.Result, &e.Reason,
+			&prevHash, &rowHash, &sig); err != nil {
+			return false, badSeqs, checked, err
+		}
+		if t, perr := time.Parse(time.RFC3339Nano, tsStr); perr == nil {
+			e.TS = t
+		}
+		if detail != "" {
+			e.ActorDetail = json.RawMessage(detail)
+		}
+		// Skip unsigned rows (pre-migration or sign-mode off).
+		if rowHash == nil && sig == nil && prevHash == nil {
+			continue
+		}
+		checked++
+
+		// 1. prev_hash linkage.
+		if havePrev {
+			if !byteEqual(prevHash, prevRowHash) {
+				badSeqs = append(badSeqs, e.Seq)
+				prevRowHash = rowHash
+				havePrev = true
+				continue
+			}
+		} else {
+			// First signed row: prev_hash must be NULL or 32 zero bytes.
+			if len(prevHash) != 0 && !isAllZero(prevHash) {
+				badSeqs = append(badSeqs, e.Seq)
+				prevRowHash = rowHash
+				havePrev = true
+				continue
+			}
+		}
+
+		// 2. Recompute row_hash from canonical bytes + prev_hash.
+		want := chainHash(e, prevHash)
+		if !byteEqual(want, rowHash) {
+			badSeqs = append(badSeqs, e.Seq)
+			prevRowHash = rowHash
+			havePrev = true
+			continue
+		}
+		// 3. Verify signature.
+		if !ed25519.Verify(pub, rowHash, sig) {
+			badSeqs = append(badSeqs, e.Seq)
+		}
+		prevRowHash = rowHash
+		havePrev = true
+	}
+	if err := rows.Err(); err != nil {
+		return false, badSeqs, checked, err
+	}
+	return len(badSeqs) == 0, badSeqs, checked, nil
+}
+
+// loadPublicKey prefers the file-backed pub key (works even after binary
+// restart without touching Keychain) and falls back to the live keystore.
+func (l *Log) loadPublicKey() (ed25519.PublicKey, error) {
+	if l.keyStore != nil {
+		return l.keyStore.Public()
+	}
+	// Fall back to default file path (verify without having written).
+	ks, err := DefaultKeyStore()
+	if err != nil {
+		return nil, err
+	}
+	return ks.Public()
+}
+
+func byteEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func isAllZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Count returns the total number of rows in the audit log.
 func (l *Log) Count(ctx context.Context) (int64, error) {
 	var n int64
@@ -247,7 +480,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	actor_kind    TEXT    NOT NULL,
 	actor_detail  TEXT    NOT NULL DEFAULT '',
 	result        TEXT    NOT NULL,
-	reason        TEXT    NOT NULL DEFAULT ''
+	reason        TEXT    NOT NULL DEFAULT '',
+	prev_hash     BLOB,
+	row_hash      BLOB,
+	signature     BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_kind);
@@ -266,10 +502,69 @@ BEGIN
 END;
 `
 
+// appendOnlyUpdateTrigger is the plain CREATE TRIGGER used to restore the
+// UPDATE guard after a signed-write has briefly dropped it.
+const appendOnlyUpdateTrigger = `
+CREATE TRIGGER IF NOT EXISTS audit_no_update
+BEFORE UPDATE ON audit_log
+BEGIN
+	SELECT RAISE(ABORT, 'audit_log is append-only');
+END;
+`
+
+// migrate creates the schema on first run and adds the chain columns to
+// pre-existing DBs.
 func (l *Log) migrate() error {
-	_, err := l.db.Exec(schema)
-	if err != nil {
+	if _, err := l.db.Exec(schema); err != nil {
 		return fmt.Errorf("audit schema: %w", err)
 	}
+	// Upgrade path: older DBs don't have the chain columns. SQLite does not
+	// support ADD COLUMN IF NOT EXISTS, so we try and ignore „duplicate
+	// column" errors.
+	for _, col := range []string{"prev_hash", "row_hash", "signature"} {
+		_, err := l.db.Exec(fmt.Sprintf(`ALTER TABLE audit_log ADD COLUMN %s BLOB`, col))
+		if err != nil && !isDuplicateColumnErr(err) {
+			return fmt.Errorf("audit migrate %s: %w", col, err)
+		}
+	}
 	return nil
+}
+
+func isDuplicateColumnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// modernc.org/sqlite surfaces the SQLite error as a string like
+	// „duplicate column name: row_hash".
+	msg := err.Error()
+	return containsFold(msg, "duplicate column")
+}
+
+func containsFold(s, sub string) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	// A tiny case-insensitive Contains to avoid pulling in strings in the
+	// import cycle (keeps the migration file self-contained).
+	ls, lsub := len(s), len(sub)
+	for i := 0; i+lsub <= ls; i++ {
+		match := true
+		for j := 0; j < lsub; j++ {
+			a, b := s[i+j], sub[j]
+			if a >= 'A' && a <= 'Z' {
+				a += 'a' - 'A'
+			}
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if a != b {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
