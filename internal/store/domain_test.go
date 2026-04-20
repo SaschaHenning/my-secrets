@@ -33,6 +33,19 @@ func TestNormalizeDomain(t *testing.T) {
 		{"", ""},
 		{"   ", ""},
 		{"localhost:8080", "localhost"},
+
+		// Review finding I4: scheme-prefixed garbage must not produce a
+		// half-parsed „https:"-style host — return empty instead.
+		{"https://[[[", ""},
+		{"http://example.com:not-port", ""},
+		{"://bad", ""},
+
+		// Review finding I5: IPv6 literals are preserved with brackets
+		// and have their port stripped correctly; "www." and trailing
+		// dot logic must not touch them.
+		{"[2001:db8::1]:8080", "[2001:db8::1]"},
+		{"[2001:db8::1]", "[2001:db8::1]"},
+		{"https://[2001:db8::1]:443/path", "[2001:db8::1]"},
 	}
 	for _, tc := range cases {
 		got := NormalizeDomain(tc.in)
@@ -139,6 +152,31 @@ func TestLevenshteinSegments(t *testing.T) {
 		if ok && d != tc.wantD {
 			t.Errorf("levenshteinSegments(%q, %q) = %d, want %d", tc.a, tc.b, d, tc.wantD)
 		}
+	}
+}
+
+// Review finding I5: IP literals must never be fuzzy-matched. "1.2.3.4"
+// vs "1.2.3.5" is a different machine, not a typo; "[2001:db8::1]" vs
+// "[2001:db8::2]" likewise. Both cases must come out as no-match.
+func TestMatchDomain_IPLiteralsRejectedByFuzzy(t *testing.T) {
+	cases := []struct {
+		query, stored string
+	}{
+		{"1.2.3.4", "1.2.3.5"},
+		{"[2001:db8::1]", "[2001:db8::2]"},
+		{"192.168.1.1", "192.168.1.2"},
+	}
+	for _, tc := range cases {
+		tier, _, ok := MatchDomain(tc.query, tc.stored)
+		if ok && tier == TierFuzzy {
+			t.Errorf("MatchDomain(%q, %q) = fuzzy; IP literals must not fuzzy-match",
+				tc.query, tc.stored)
+		}
+	}
+	// But IPs that are identical should still classify as exact.
+	tier, _, ok := MatchDomain("1.2.3.4", "1.2.3.4")
+	if !ok || tier != TierExact {
+		t.Errorf("identical IPv4 must be exact, got tier=%q ok=%v", tier, ok)
 	}
 }
 

@@ -439,13 +439,91 @@ func TestToolsCall_CredsSearch_NoSimilarWhenMatchesPresent(t *testing.T) {
 		&store.Entry{Path: "jasp/github", Domain: "github.com", Username: "alice", Password: "p"},
 	)
 	// include_similar defaults to false because matches are non-empty —
-	// the payload should then have matches but no similar array.
+	// but the uniform schema still exposes similar as an empty array so
+	// clients never have to handle two shapes.
 	lines := sendAndReceive(t, a, []string{
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"creds_search","arguments":{"query":"alice"}}}`,
 	})
 	payload := unmarshalContentJSON(t, lines[0])
-	if _, ok := payload["similar"]; ok {
-		t.Errorf("similar must be absent on non-empty matches, got %v", payload["similar"])
+	similar, ok := payload["similar"].([]any)
+	if !ok {
+		t.Fatalf("similar must be present (uniform schema): %v", payload["similar"])
+	}
+	if len(similar) != 0 {
+		t.Errorf("similar should be empty when matches are non-empty and include_similar unset, got %v", similar)
+	}
+}
+
+// Review finding C2: every response from creds_list and creds_search must
+// use the same shape — matches=[]{path,tier,hint}, count=<int>, similar=[].
+// AI clients that parse the payload should never need to distinguish
+// between "domain query" and "plain query" response shapes.
+func TestToolsCall_UniformSchema(t *testing.T) {
+	a, _ := newFakeApp(t,
+		&store.Entry{Path: "jasp/github", Password: "p"},
+		&store.Entry{Path: "jasp/site", Domain: "jasp.eu", Password: "p"},
+	)
+
+	// Plain creds_list without --domain.
+	lines := sendAndReceive(t, a, []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"creds_list","arguments":{}}}`,
+	})
+	payload := unmarshalContentJSON(t, lines[0])
+	assertUniformShape(t, "creds_list (no domain)", payload)
+
+	// creds_list with --domain.
+	lines = sendAndReceive(t, a, []string{
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"creds_list","arguments":{"domain":"jasp.eu"}}}`,
+	})
+	payload = unmarshalContentJSON(t, lines[0])
+	assertUniformShape(t, "creds_list (domain)", payload)
+
+	// creds_search on a matching query.
+	lines = sendAndReceive(t, a, []string{
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"creds_search","arguments":{"query":"github"}}}`,
+	})
+	payload = unmarshalContentJSON(t, lines[0])
+	assertUniformShape(t, "creds_search (hit)", payload)
+
+	// creds_search on a miss — should still produce the same shape.
+	lines = sendAndReceive(t, a, []string{
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"creds_search","arguments":{"query":"no-such-thing-xyz"}}}`,
+	})
+	payload = unmarshalContentJSON(t, lines[0])
+	assertUniformShape(t, "creds_search (miss)", payload)
+}
+
+// assertUniformShape verifies that a tools/call payload has exactly
+// matches=[]object, count=number, similar=[]object with the expected
+// keys inside each object entry. It does NOT assert lengths — the
+// shape contract is separate from the content contract.
+func assertUniformShape(t *testing.T, label string, payload map[string]any) {
+	t.Helper()
+	matches, ok := payload["matches"].([]any)
+	if !ok {
+		t.Errorf("%s: matches missing or not an array: %v", label, payload["matches"])
+		return
+	}
+	for i, item := range matches {
+		m, ok := item.(map[string]any)
+		if !ok {
+			t.Errorf("%s: matches[%d] not an object: %v", label, i, item)
+			continue
+		}
+		for _, k := range []string{"path", "tier", "hint"} {
+			if _, has := m[k]; !has {
+				t.Errorf("%s: matches[%d] missing key %q: %+v", label, i, k, m)
+			}
+		}
+		if _, has := m["password"]; has {
+			t.Errorf("%s: matches[%d] must not carry a password", label, i)
+		}
+	}
+	if _, ok := payload["count"].(float64); !ok {
+		t.Errorf("%s: count missing or not numeric: %v", label, payload["count"])
+	}
+	if _, ok := payload["similar"].([]any); !ok {
+		t.Errorf("%s: similar missing or not an array: %v", label, payload["similar"])
 	}
 }
 
