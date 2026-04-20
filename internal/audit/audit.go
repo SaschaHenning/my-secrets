@@ -15,15 +15,15 @@ import (
 
 // Action types recorded in the log.
 const (
-	ActionInit   = "init"
-	ActionGet    = "get"
-	ActionList   = "list"
-	ActionSearch = "search"
-	ActionAdd    = "add"
-	ActionRotate = "rotate"
-	ActionRemove = "remove"
-	ActionExport = "export"
-	ActionWebOpen = "web_open"
+	ActionInit     = "init"
+	ActionGet      = "get"
+	ActionList     = "list"
+	ActionSearch   = "search"
+	ActionAdd      = "add"
+	ActionRotate   = "rotate"
+	ActionRemove   = "remove"
+	ActionExport   = "export"
+	ActionWebOpen  = "web_open"
 	ActionMCPStart = "mcp_start"
 )
 

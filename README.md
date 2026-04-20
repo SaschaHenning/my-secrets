@@ -52,8 +52,9 @@ cd ~/Code/my-secrets
 
 Das Skript installiert alle Homebrew-Pakete, baut das Binary, legt es
 nach `/usr/local/bin`, initialisiert gopass (falls nötig), führt
-`mys init` und `mys install-skill` aus und trägt den MCP-Server in
-`~/.claude/settings.json` ein.
+`mys init --install-skill` aus und trägt den MCP-Server in
+`~/.claude/settings.json` ein. `mys install-skill` existiert weiterhin
+als eigenständiger Befehl für manuelles Nachinstallieren.
 
 Für den **manuellen Weg**, alle Voraussetzungen, Update-/Deinstall-Schritte
 und Troubleshooting siehe [`INSTALL.md`](INSTALL.md).

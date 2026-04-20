@@ -26,7 +26,7 @@ var templates *template.Template
 
 func init() {
 	funcs := template.FuncMap{
-		"actorBadge": actorBadge,
+		"actorBadge":  actorBadge,
 		"resultBadge": resultBadge,
 		"shortTime": func(t time.Time) string {
 			return t.Local().Format("2006-01-02 15:04:05")
@@ -111,12 +111,12 @@ func handleIndex(a *app.App) http.HandlerFunc {
 		deniedCount := countResult(a, ctx, audit.ResultDenied)
 
 		data := map[string]any{
-			"Total":   total,
-			"AI":      aiCount,
-			"Human":   humanCount,
-			"Denied":  deniedCount,
-			"Recent":  last,
-			"Page":    "index",
+			"Total":  total,
+			"AI":     aiCount,
+			"Human":  humanCount,
+			"Denied": deniedCount,
+			"Recent": last,
+			"Page":   "index",
 		}
 		if err := templates.ExecuteTemplate(w, "index.html", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
