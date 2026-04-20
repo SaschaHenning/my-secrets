@@ -91,9 +91,15 @@ func RunWizard(ctx context.Context, io WizardIO, opts WizardOptions) (*Config, e
 		owner = got
 	}
 
+	// Default remote style: whatever the user's gh CLI is already
+	// using. If `gh auth status` reports https, we stick with https —
+	// otherwise ssh. This avoids silently picking ssh on machines
+	// where the user has never set up an SSH key, or where port 22 to
+	// GitHub is firewalled.
 	style := opts.RemoteStyle
 	if style == "" {
-		style = RemoteSSH
+		style = DetectRemoteStyle(ctx, opts.Runner)
+		fmt.Fprintf(io.Out, "Git-Protokoll laut `gh auth status`: %s\n", style)
 	}
 
 	cfg := &Config{Version: 1, Layout: layout, Owner: owner}
@@ -254,6 +260,15 @@ func configureRepo(ctx context.Context, out io.Writer, opts WizardOptions, cfg *
 	if _, err := GopassGitRemoteAdd(ctx, opts.Runner, mount, url); err != nil {
 		if !strings.Contains(err.Error(), "already") {
 			return err
+		}
+	}
+	// If we picked HTTPS, make sure `gh` is registered as git's
+	// credential helper so the first push succeeds without manual
+	// setup. Quiet failure — the user can still run `gh auth setup-git`
+	// by hand if this step is unavailable for some reason.
+	if style == RemoteHTTPS {
+		if _, err := opts.Runner.Run(ctx, "gh", "auth", "setup-git"); err == nil {
+			fmt.Fprintln(out, "Git-Credential-Helper via `gh auth setup-git` gesetzt (HTTPS-Pushes gehen jetzt mit dem gh-Token).")
 		}
 	}
 	cfg.UpdateRemote(mount, url)

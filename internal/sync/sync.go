@@ -140,6 +140,31 @@ const (
 	RemoteHTTPS RemoteStyle = "https"
 )
 
+// DetectRemoteStyle asks `gh auth status` which protocol the user's
+// GitHub login is configured for and returns a matching RemoteStyle.
+// Falls back to HTTPS (the safer default) when gh is missing or the
+// output does not contain a protocol line — most corporate setups
+// block outbound port 22, so HTTPS is the less surprising default.
+func DetectRemoteStyle(ctx context.Context, r Runner) RemoteStyle {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	out, err := r.Run(ctx, "gh", "auth", "status")
+	if err != nil && len(out) == 0 {
+		return RemoteHTTPS
+	}
+	// gh prints "  - Git operations protocol: https" (or ssh). Scan
+	// case-insensitively so formatting changes do not bite us.
+	lower := strings.ToLower(string(out))
+	if strings.Contains(lower, "git operations protocol: ssh") {
+		return RemoteSSH
+	}
+	if strings.Contains(lower, "git operations protocol: https") {
+		return RemoteHTTPS
+	}
+	return RemoteHTTPS
+}
+
 // BuildRemoteURL assembles a GitHub repo URL in the requested style.
 // Owner and name are normalised (trimmed, no trailing .git).
 func BuildRemoteURL(style RemoteStyle, owner, name string) (string, error) {
