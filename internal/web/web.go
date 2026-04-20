@@ -24,6 +24,19 @@ var assets embed.FS
 
 var templates *template.Template
 
+// sessionCookieName is the cookie that carries a successful Touch-ID
+// session ID between requests.
+const sessionCookieName = "mys_session"
+
+// defaultSessionTTL is how long a session stays valid without activity.
+// After this window of silence the idle watcher tears the server down.
+const defaultSessionTTL = 30 * time.Minute
+
+// idleTickInterval is how often the idle watcher polls sessionStore.
+// Kept short enough to respond promptly once ttl is exceeded but long
+// enough not to waste cycles.
+const idleTickInterval = 30 * time.Second
+
 func init() {
 	funcs := template.FuncMap{
 		"actorBadge":  actorBadge,
@@ -36,18 +49,38 @@ func init() {
 }
 
 // Serve starts the HTTP server on 127.0.0.1:port and blocks until the
-// context is cancelled. The audit-open app passed in must have its Audit
-// field set.
+// context is cancelled, the process receives an idle-timeout signal, or
+// the server itself fails. The audit-open app passed in must have its
+// Audit field set.
 func Serve(ctx context.Context, a *app.App, port int, stdout io.Writer) error {
-	a.AuditWebOpen(ctx, fmt.Sprintf("127.0.0.1:%d", port))
+	return serveWith(ctx, a, port, stdout, defaultSessionTTL, idleTickInterval)
+}
+
+// serveWith is the testable core of Serve. ttl and tick are parameterised
+// so tests can run the full HTTP stack with sub-second timings.
+func serveWith(ctx context.Context, a *app.App, port int, stdout io.Writer, ttl, tick time.Duration) error {
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	a.AuditWebOpen(cancelCtx, fmt.Sprintf("127.0.0.1:%d", port))
+
+	store := newSessionStore(ttl)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", handleIndex(a))
-	mux.HandleFunc("/audit", handleAudit(a))
+	// Public routes. /login deliberately lives outside the auth gate
+	// so the user can reach it; /healthz stays open so systemd-style
+	// supervisors can probe without a session.
+	mux.HandleFunc("/login", handleLogin(store, ttl))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Static assets stay public too — they carry no data.
 	mux.Handle("/static/", http.FileServerFS(assets))
+
+	// Gated routes. Every handler here goes through authGate, which
+	// redirects to /login on a missing / stale cookie.
+	mux.Handle("/", authGate(store, handleIndex(a)))
+	mux.Handle("/audit", authGate(store, handleAudit(a)))
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf("127.0.0.1:%d", port),
@@ -59,22 +92,40 @@ func Serve(ctx context.Context, a *app.App, port int, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "my-secrets web UI → http://127.0.0.1:%d\n", port)
 	fmt.Fprintln(stdout, "press Ctrl-C to stop")
 
+	// Idle watcher: closes store.idleCh after ttl of silence, which
+	// then triggers a graceful shutdown below.
+	watcherStop := make(chan struct{})
+	go store.runWatcher(watcherStop, tick)
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
+
 	select {
 	case err := <-errCh:
+		close(watcherStop)
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
-	case <-ctx.Done():
-		shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		err := srv.Shutdown(shutdown)
-		// Reap the server goroutine.
-		<-errCh
-		return err
+	case <-cancelCtx.Done():
+		close(watcherStop)
+		return gracefulShutdown(srv, errCh)
+	case <-store.IdleC():
+		fmt.Fprintln(stdout, "idle shutdown after 30 min inactivity")
+		close(watcherStop)
+		cancel()
+		return gracefulShutdown(srv, errCh)
 	}
+}
+
+// gracefulShutdown stops the server with a short grace period and reaps
+// the serve goroutine.
+func gracefulShutdown(srv *http.Server, errCh <-chan error) error {
+	shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := srv.Shutdown(shutdown)
+	<-errCh
+	return err
 }
 
 // localhostOnly rejects any request whose RemoteAddr is not loopback.
@@ -92,6 +143,101 @@ func localhostOnly(h http.Handler) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// authGate wraps a handler so it only fires for callers with a valid
+// session cookie. Missing/stale cookies get a 303 See Other back to
+// /login.
+func authGate(store *sessionStore, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(sessionCookieName)
+		if err != nil || !store.Validate(c.Value) {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- login handler ---------------------------------------------------------
+
+// handleLogin renders the login page on GET and runs the Touch-ID
+// challenge on POST. Successful POSTs set the session cookie and
+// redirect to /.
+func handleLogin(store *sessionStore, ttl time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			renderLogin(w, "")
+		case http.MethodPost:
+			if err := requireTouchID(r.Context()); err != nil {
+				w.WriteHeader(http.StatusUnauthorized)
+				renderLogin(w, err.Error())
+				return
+			}
+			id := store.Issue()
+			if id == "" {
+				http.Error(w, "failed to issue session", http.StatusInternalServerError)
+				return
+			}
+			http.SetCookie(w, &http.Cookie{
+				Name:     sessionCookieName,
+				Value:    id,
+				Path:     "/",
+				HttpOnly: true,
+				// Localhost HTTP, so Secure is off. SameSite=Lax is
+				// enough to block cross-site POSTs from leaking the
+				// cookie; the login form itself is same-origin.
+				Secure:   false,
+				SameSite: http.SameSiteLaxMode,
+				MaxAge:   int(ttl.Seconds()),
+			})
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+		default:
+			w.Header().Set("Allow", "GET, POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+// renderLogin writes the tiny inline login page. We do not route this
+// through html/template because the page is static aside from an
+// optional error message, which we escape manually.
+func renderLogin(w http.ResponseWriter, errMsg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	errBlock := ""
+	if errMsg != "" {
+		errBlock = fmt.Sprintf(`<p class="empty" style="color:#f87171">%s</p>`, template.HTMLEscapeString(errMsg))
+	}
+	_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<title>my-secrets — Anmelden</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header><h1>my-secrets</h1></header>
+<main>
+<section class="stats" style="grid-template-columns: 1fr; max-width: 420px; margin: 3rem auto;">
+  <div class="stat">
+    <div class="label">Anmeldung erforderlich</div>
+    <p style="margin-top:0.8rem;color:var(--muted);font-size:0.9rem;">
+      Bestätige per Touch&nbsp;ID, um die Weboberfläche zu öffnen.
+      Die Sitzung läuft nach 30&nbsp;Minuten Inaktivität automatisch ab.
+    </p>
+    <form method="post" action="/login" style="margin-top:1rem;">
+      <button type="submit" class="btn-link" style="background:var(--accent);color:white;padding:0.5rem 1rem;border:none;border-radius:4px;cursor:pointer;font-weight:600;">
+        Mit Touch ID anmelden
+      </button>
+    </form>
+    %s
+  </div>
+</section>
+</main>
+<footer>local read-only UI · bound to 127.0.0.1 · no secret values are rendered here</footer>
+</body>
+</html>`, errBlock)
 }
 
 // --- handlers --------------------------------------------------------------
