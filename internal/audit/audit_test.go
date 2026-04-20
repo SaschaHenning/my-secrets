@@ -104,6 +104,124 @@ func TestVerifyContiguous(t *testing.T) {
 	}
 }
 
+func TestCount(t *testing.T) {
+	l := newTestLog(t)
+	ctx := context.Background()
+	if n, err := l.Count(ctx); err != nil || n != 0 {
+		t.Errorf("Count empty = %d, err=%v", n, err)
+	}
+	for i := 0; i < 7; i++ {
+		_, _ = l.Write(ctx, Entry{Action: ActionGet, ActorKind: ActorAI, Result: ResultOK})
+	}
+	n, err := l.Count(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 7 {
+		t.Errorf("Count = %d, want 7", n)
+	}
+}
+
+func TestFiltersExtra(t *testing.T) {
+	l := newTestLog(t)
+	ctx := context.Background()
+	_, _ = l.Write(ctx, Entry{Action: ActionGet, SecretPath: "jasp/tok", Org: "jasp", ActorKind: ActorAI, Result: ResultOK})
+	_, _ = l.Write(ctx, Entry{Action: ActionAdd, SecretPath: "jasp/new", Org: "jasp", ActorKind: ActorHuman, Result: ResultOK})
+	_, _ = l.Write(ctx, Entry{Action: ActionSearch, SecretPath: "", Org: "", ActorKind: ActorScript, Result: ResultOK, Reason: "q=abc"})
+
+	// Action filter
+	get, _ := l.Tail(ctx, Filter{Action: ActionGet, Limit: 10})
+	if len(get) != 1 {
+		t.Errorf("action=get: want 1, got %d", len(get))
+	}
+
+	// Org filter
+	jasp, _ := l.Tail(ctx, Filter{Org: "jasp", Limit: 10})
+	if len(jasp) != 2 {
+		t.Errorf("org=jasp: want 2, got %d", len(jasp))
+	}
+
+	// Path (LIKE) filter
+	tok, _ := l.Tail(ctx, Filter{Path: "tok", Limit: 10})
+	if len(tok) != 1 || tok[0].SecretPath != "jasp/tok" {
+		t.Errorf("path LIKE tok: %+v", tok)
+	}
+
+	// Since filter: future date excludes everything.
+	future, _ := l.Tail(ctx, Filter{Since: time.Now().Add(24 * time.Hour), Limit: 10})
+	if len(future) != 0 {
+		t.Errorf("future since: want 0, got %d", len(future))
+	}
+
+	// Limit default (<=0 uses 50). Only cheap check: no error and returns rows.
+	all, err := l.Tail(ctx, Filter{Limit: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Errorf("default limit: want 3 rows, got %d", len(all))
+	}
+}
+
+func TestWriteDefaults(t *testing.T) {
+	l := newTestLog(t)
+	ctx := context.Background()
+	// Write an entry with empty ActorKind / Result — defaults should kick in.
+	seq, err := l.Write(ctx, Entry{Action: ActionGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := l.Tail(ctx, Filter{Limit: 5})
+	if len(rows) == 0 || rows[0].Seq != seq {
+		t.Fatalf("unexpected rows: %+v", rows)
+	}
+	if rows[0].ActorKind != ActorScript {
+		t.Errorf("actor_kind default = %q, want script", rows[0].ActorKind)
+	}
+	if rows[0].Result != ResultOK {
+		t.Errorf("result default = %q, want ok", rows[0].Result)
+	}
+	if rows[0].TS.IsZero() {
+		t.Error("TS default missing")
+	}
+}
+
+func TestCloseNil(t *testing.T) {
+	var l *Log
+	if err := l.Close(); err != nil {
+		t.Errorf("nil close: %v", err)
+	}
+	l2 := &Log{}
+	if err := l2.Close(); err != nil {
+		t.Errorf("zero close: %v", err)
+	}
+}
+
+func TestDefaultPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	p, err := DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(p) || filepath.Base(p) != "audit.sqlite" {
+		t.Errorf("unexpected default path: %q", p)
+	}
+}
+
+func TestOpenDefaultPath(t *testing.T) {
+	// Open("") uses DefaultPath. Redirect HOME to keep the real user state
+	// untouched.
+	t.Setenv("HOME", t.TempDir())
+	l, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if _, err := l.Count(context.Background()); err != nil {
+		t.Errorf("count on default-path log: %v", err)
+	}
+}
+
 func TestTimestampRoundTrip(t *testing.T) {
 	l := newTestLog(t)
 	ctx := context.Background()

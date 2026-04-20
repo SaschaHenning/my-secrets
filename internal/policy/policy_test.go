@@ -92,6 +92,113 @@ func TestLoadCustom(t *testing.T) {
 	}
 }
 
+func TestLoadInvalidYAML(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "broken.yaml")
+	if err := os.WriteFile(p, []byte("not: valid: yaml: [["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil {
+		t.Error("want error for invalid YAML")
+	}
+}
+
+func TestLoadEmptyActors(t *testing.T) {
+	// A YAML without any `actors` key produces an empty (non-nil) map.
+	dir := t.TempDir()
+	p := filepath.Join(dir, "empty.yaml")
+	if err := os.WriteFile(p, []byte("# no actors\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pol, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol.Actors == nil {
+		t.Fatal("actors must be non-nil after Load")
+	}
+	// With no actors defined, every decision is default-deny.
+	if d := pol.Evaluate("human", "", "anything"); d.Allowed {
+		t.Errorf("empty policy must deny, got %v", d)
+	}
+}
+
+func TestEvaluateNoAllowRules(t *testing.T) {
+	pol := &Policy{Actors: map[string]Rules{
+		"ai": {Deny: []string{"private/**"}},
+	}}
+	d := pol.Evaluate("ai", "", "jasp/github")
+	if d.Allowed {
+		t.Errorf("actor without any allow rules must be denied, got %v", d)
+	}
+	if d.MatchedRule != "no-allow" {
+		t.Errorf("MatchedRule = %q, want no-allow", d.MatchedRule)
+	}
+}
+
+func TestEvaluateAgentLabelWins(t *testing.T) {
+	pol := &Policy{Actors: map[string]Rules{
+		"ai":          {Allow: []string{"**"}},
+		"claude-code": {Allow: []string{"jasp/**"}},
+	}}
+	// agentLabel=claude-code must pick the narrower rule, not the generic
+	// ai fallback.
+	if d := pol.Evaluate("ai", "claude-code", "other/path"); d.Allowed {
+		t.Errorf("agent-label should override, got %v", d)
+	}
+}
+
+func TestEvaluateNilPolicy(t *testing.T) {
+	var pol *Policy
+	if d := pol.Evaluate("ai", "", "x"); d.Allowed {
+		t.Errorf("nil policy must deny, got %v", d)
+	}
+}
+
+func TestDefaultPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	p, err := DefaultPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(p) || filepath.Base(p) != "scope-policy.yaml" {
+		t.Errorf("unexpected default path: %q", p)
+	}
+}
+
+func TestWriteDefault(t *testing.T) {
+	// Redirect HOME so we don't touch the real config dir.
+	t.Setenv("HOME", t.TempDir())
+	p, err := WriteDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("policy file not created: %v", err)
+	}
+	// Calling it again should be a no-op (file exists).
+	p2, err := WriteDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p != p2 {
+		t.Errorf("paths differ: %q vs %q", p, p2)
+	}
+}
+
+func TestLoadDefaultPath(t *testing.T) {
+	// Load("") should use DefaultPath(). Redirect HOME to avoid depending
+	// on the real user's config file.
+	t.Setenv("HOME", t.TempDir())
+	pol, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol == nil || len(pol.Actors) == 0 {
+		t.Error("expected non-empty default policy")
+	}
+}
+
 func TestMatchGlobs(t *testing.T) {
 	cases := []struct {
 		pattern, path string

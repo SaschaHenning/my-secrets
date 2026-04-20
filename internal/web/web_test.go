@@ -1,12 +1,21 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/SaschaHenning/my-secrets/internal/app"
+	"github.com/SaschaHenning/my-secrets/internal/audit"
+	"github.com/SaschaHenning/my-secrets/internal/policy"
 )
 
 // Verify that the loopback middleware rejects non-loopback addresses.
@@ -25,6 +34,9 @@ func TestLocalhostOnly(t *testing.T) {
 		{"8.8.8.8:443", 403},
 		{"10.0.0.5:22", 403},
 		{"[2001:db8::1]:443", 403},
+		// SplitHostPort fails → fallback to RemoteAddr-as-host path.
+		{"not-a-host", 403},
+		{"127.0.0.1", 200},
 	}
 	for _, tc := range cases {
 		r := httptest.NewRequest("GET", "/", nil)
@@ -211,4 +223,198 @@ func TestLoginRejectsOtherMethods(t *testing.T) {
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405, got %d", w.Code)
 	}
+}
+
+// newAuditApp returns an app with a real (temp) audit log and a handful of
+// seeded rows. Store is nil — the web UI never touches it.
+func newAuditApp(t *testing.T) *app.App {
+	t.Helper()
+	l, err := audit.Open(filepath.Join(t.TempDir(), "audit.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	ctx := context.Background()
+	// A handful of representative rows covering every actor_kind and result.
+	rows := []audit.Entry{
+		{Action: audit.ActionGet, SecretPath: "jasp/github", Org: "jasp", ActorKind: audit.ActorAI, Result: audit.ResultOK, Reason: "allow"},
+		{Action: audit.ActionGet, SecretPath: "private/bank", Org: "private", ActorKind: audit.ActorAI, Result: audit.ResultDenied, Reason: "scope"},
+		{Action: audit.ActionAdd, SecretPath: "jasp/aws", Org: "jasp", ActorKind: audit.ActorHuman, Result: audit.ResultOK},
+		{Action: audit.ActionList, SecretPath: "", Org: "jasp", ActorKind: audit.ActorScript, Result: audit.ResultOK},
+	}
+	for _, r := range rows {
+		if _, err := l.Write(ctx, r); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	return &app.App{Audit: l, Policy: policy.Default(), Override: "human"}
+}
+
+func TestHandleIndex(t *testing.T) {
+	a := newAuditApp(t)
+	r := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handleIndex(a)(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	// Stats render — four seeded rows and the three actor-kind counts must
+	// all appear. The denied-count path is also exercised here.
+	for _, substr := range []string{"Total events", "my-secrets", "jasp/github", "Audit Log"} {
+		if !strings.Contains(body, substr) {
+			t.Errorf("index body missing %q: %s", substr, body[:minInt(len(body), 300)])
+		}
+	}
+}
+
+func TestHandleAudit(t *testing.T) {
+	a := newAuditApp(t)
+
+	cases := []struct {
+		name        string
+		query       string
+		wantStatus  int
+		wantMatches []string
+	}{
+		{"all", "", 200, []string{"jasp/github", "private/bank", "jasp/aws"}},
+		{"actor_filter_ai", "actor=ai", 200, []string{"jasp/github", "private/bank"}},
+		{"action_filter_get", "action=get", 200, []string{"jasp/github"}},
+		{"org_filter_jasp", "org=jasp", 200, []string{"jasp/github", "jasp/aws"}},
+		{"since_date", "since=2000-01-01", 200, []string{"jasp/github"}},
+		// Invalid since is silently ignored — the handler must still 200.
+		{"since_bad", "since=not-a-date", 200, []string{"jasp/github"}},
+		// Limit > 1000 or <= 0 is clamped to 100.
+		{"limit_clamp_high", "limit=99999", 200, []string{"jasp/github"}},
+		{"limit_clamp_zero", "limit=0", 200, []string{"jasp/github"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest("GET", "/audit?"+tc.query, nil)
+			w := httptest.NewRecorder()
+			handleAudit(a)(w, r)
+			if w.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d; body=%q", w.Code, tc.wantStatus, w.Body.String())
+				return
+			}
+			body := w.Body.String()
+			for _, m := range tc.wantMatches {
+				if !strings.Contains(body, m) {
+					t.Errorf("body missing %q", m)
+				}
+			}
+		})
+	}
+}
+
+func TestActorBadge(t *testing.T) {
+	cases := map[string]string{
+		audit.ActorAI:     "#a78bfa",
+		audit.ActorHuman:  "#4ade80",
+		audit.ActorScript: "#f59e42",
+		"unknown":         "#8b90a0",
+	}
+	for kind, expectedColor := range cases {
+		got := string(actorBadge(kind))
+		if !strings.Contains(got, expectedColor) {
+			t.Errorf("actorBadge(%q) should contain %q: %s", kind, expectedColor, got)
+		}
+		if !strings.Contains(got, kind) {
+			t.Errorf("actorBadge(%q) should include kind label", kind)
+		}
+	}
+}
+
+func TestResultBadge(t *testing.T) {
+	cases := map[string]string{
+		audit.ResultOK:     "#4ade80",
+		audit.ResultDenied: "#f87171",
+		audit.ResultError:  "#f59e42",
+		"weird":            "#8b90a0",
+	}
+	for result, expectedColor := range cases {
+		got := string(resultBadge(result))
+		if !strings.Contains(got, expectedColor) {
+			t.Errorf("resultBadge(%q) should contain %q: %s", result, expectedColor, got)
+		}
+	}
+}
+
+func TestCountHelpers(t *testing.T) {
+	a := newAuditApp(t)
+	ctx := context.Background()
+	// Sanity: we seeded 2 AI, 1 Human, 1 Script, 1 Denied.
+	if got := countActor(a, ctx, audit.ActorAI); got != 2 {
+		t.Errorf("countActor ai = %d, want 2", got)
+	}
+	if got := countActor(a, ctx, audit.ActorHuman); got != 1 {
+		t.Errorf("countActor human = %d, want 1", got)
+	}
+	if got := countResult(a, ctx, audit.ResultDenied); got != 1 {
+		t.Errorf("countResult denied = %d, want 1", got)
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// TestServe_StartStop starts the HTTP server on a random free port, issues
+// a /healthz probe, then cancels the context to exercise the shutdown path.
+func TestServe_StartStop(t *testing.T) {
+	a := newAuditApp(t)
+	port := freePort(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, a, port, &stdout) }()
+
+	// Poll /healthz until the server is listening (or time out).
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	deadline := time.Now().Add(3 * time.Second)
+	var resp *http.Response
+	var err error
+	for time.Now().Before(deadline) {
+		resp, err = client.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
+		if err == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("server never came up: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "ok" {
+		t.Errorf("/healthz = %q, want ok", string(body))
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Serve returned error: %v", err)
+	}
+
+	// A web_open audit row must have been written on startup.
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionWebOpen, Limit: 5})
+	if len(rows) == 0 {
+		t.Error("expected web_open audit entry")
+	}
+}
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port
 }
