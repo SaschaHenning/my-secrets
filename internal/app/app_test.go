@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/policy"
@@ -797,6 +798,90 @@ func TestApp_AutoSync_DeniedAddDoesNotSync(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Errorf("runner must not be invoked after denied write, got %d calls", len(rec.calls))
+	}
+}
+
+// --- Rotation timestamps --------------------------------------------------
+
+func TestAdd_SetsRotatedAt(t *testing.T) {
+	a, f := appWithFake(t, "human")
+	ctx := context.Background()
+	before := time.Now().UTC()
+	e := &store.Entry{Path: "jasp/new", Password: "p", RotateAfter: "90d"}
+	if err := a.Add(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now().UTC()
+	got, err := f.Get(ctx, "jasp/new")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.RotatedAt.IsZero() {
+		t.Fatal("rotated_at not set after Add")
+	}
+	// Accept a ±2s slack either side to survive slow CI.
+	lower := before.Add(-2 * time.Second)
+	upper := after.Add(2 * time.Second)
+	if got.RotatedAt.Before(lower) || got.RotatedAt.After(upper) {
+		t.Errorf("rotated_at = %v, want within [%v,%v]", got.RotatedAt, lower, upper)
+	}
+	// RotateAfter must round-trip unchanged.
+	if got.RotateAfter != "90d" {
+		t.Errorf("rotate_after = %q, want 90d", got.RotateAfter)
+	}
+}
+
+func TestAdd_OverwritesCallerProvidedRotatedAt(t *testing.T) {
+	// Defence-in-depth: the app layer owns the timestamp. Even if a
+	// caller pre-fills RotatedAt, Add must stamp "now" instead — the
+	// field is book-keeping, not user input.
+	a, f := appWithFake(t, "human")
+	ctx := context.Background()
+	e := &store.Entry{
+		Path:      "jasp/x",
+		Password:  "p",
+		RotatedAt: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	if err := a.Add(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := f.Get(ctx, "jasp/x")
+	if got.RotatedAt.Year() == 2000 {
+		t.Errorf("Add should have overwritten the pre-filled rotated_at, got %v", got.RotatedAt)
+	}
+	if time.Since(got.RotatedAt) > 10*time.Second {
+		t.Errorf("rotated_at = %v, want ~now", got.RotatedAt)
+	}
+}
+
+func TestRotate_UpdatesRotatedAt(t *testing.T) {
+	// Seed an entry with a stale rotated_at, rotate it, then assert
+	// that the stored rotated_at advanced.
+	past := time.Now().UTC().Add(-200 * 24 * time.Hour)
+	seed := &store.Entry{
+		Path:        "jasp/old",
+		Password:    "old",
+		RotateAfter: "90d",
+		RotatedAt:   past,
+	}
+	a, f := appWithFake(t, "human", seed)
+	ctx := context.Background()
+	if err := a.Rotate(ctx, "jasp/old", "new-pw"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.Get(ctx, "jasp/old")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.RotatedAt.After(past) {
+		t.Errorf("rotated_at did not advance: got %v, was %v", got.RotatedAt, past)
+	}
+	if got.Password != "new-pw" {
+		t.Errorf("password not updated: %q", got.Password)
+	}
+	// RotateAfter must be preserved through a rotate.
+	if got.RotateAfter != "90d" {
+		t.Errorf("rotate_after lost across rotate: got %q", got.RotateAfter)
 	}
 }
 

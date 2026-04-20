@@ -329,15 +329,15 @@ func TestRegistryOrderStable(t *testing.T) {
 	}
 }
 
-func TestRegistryHasAllTenChecks(t *testing.T) {
+func TestRegistryHasAllChecks(t *testing.T) {
 	reg := Registry()
-	if len(reg) != 10 {
-		t.Fatalf("expected 10 registered checks, got %d", len(reg))
-	}
 	wantIDs := []string{
 		"store", "gpg-key", "recipients", "git-remote", "sync-age",
 		"audit-writable", "audit-gaps", "signed-chain",
-		"paperkey-backup", "policy",
+		"paperkey-backup", "policy", "rotation-overdue",
+	}
+	if len(reg) != len(wantIDs) {
+		t.Fatalf("expected %d registered checks, got %d", len(wantIDs), len(reg))
 	}
 	for i, id := range wantIDs {
 		if reg[i].ID != id {

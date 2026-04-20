@@ -89,6 +89,7 @@ func Registry() []registeredCheck {
 		{ID: "signed-chain", Fn: CheckSignedChain},
 		{ID: "paperkey-backup", Fn: CheckPaperkeyBackup},
 		{ID: "policy", Fn: CheckPolicy},
+		{ID: "rotation-overdue", Fn: CheckRotationOverdue},
 	}
 }
 
