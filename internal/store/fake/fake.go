@@ -227,7 +227,7 @@ func cloneEntry(e *store.Entry) *store.Entry {
 	if e == nil {
 		return nil
 	}
-	c := *e
+	c := *e // copies RotateAfter (string) and RotatedAt (time.Time) by value.
 	if len(e.Tags) > 0 {
 		c.Tags = append([]string(nil), e.Tags...)
 	}

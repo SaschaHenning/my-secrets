@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
+	"github.com/SaschaHenning/my-secrets/internal/rotation"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -20,6 +21,7 @@ func addCmd(requester *string) *cobra.Command {
 		kind                             string
 		username, url, githubProj, notes string
 		tagsRaw                          string
+		rotateAfter                      string
 	)
 	c := &cobra.Command{
 		Use:   "add <path>",
@@ -29,6 +31,14 @@ func addCmd(requester *string) *cobra.Command {
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
+			}
+			// Validate the rotation policy string (if any) before we
+			// prompt for the password — refusing a typo early avoids
+			// asking the user to retype a long secret.
+			if rotateAfter != "" {
+				if _, perr := rotation.ParseDuration(rotateAfter); perr != nil {
+					return perr
+				}
 			}
 			pw, err := readPasswordStdin(cmd.ErrOrStderr())
 			if err != nil {
@@ -48,6 +58,7 @@ func addCmd(requester *string) *cobra.Command {
 				GitHubProject: githubProj,
 				Notes:         notes,
 				Password:      pw,
+				RotateAfter:   rotateAfter,
 			}
 			if tagsRaw != "" {
 				for _, t := range strings.Split(tagsRaw, ",") {
@@ -67,6 +78,8 @@ func addCmd(requester *string) *cobra.Command {
 	c.Flags().StringVar(&githubProj, "github", "", "related GitHub project (owner/name)")
 	c.Flags().StringVar(&notes, "notes", "", "free-form notes")
 	c.Flags().StringVar(&tagsRaw, "tags", "", "comma-separated tags")
+	c.Flags().StringVar(&rotateAfter, "rotate-after", "",
+		"rotation horizon (e.g. 90d, 6m, 1y) — leave empty to opt out of reminders")
 	return c
 }
 

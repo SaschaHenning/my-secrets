@@ -101,7 +101,7 @@ mys audit verify                          # prüft Hash-Lücken
 
 ## Checking your setup: `mys doctor`
 
-Ein einzelner Befehl, der zehn Checks durchläuft und beantwortet: „Ist
+Ein einzelner Befehl, der elf Checks durchläuft und beantwortet: „Ist
 meine Installation in Ordnung?"
 
 ```bash
@@ -110,22 +110,25 @@ mys doctor --json                  # maschinenlesbar (CI-tauglich)
 mys doctor --only policy,audit-gaps
 ```
 
-Exit-Code ist ≠ 0, sobald ein Check `[FAIL]` meldet.
+Exit-Code ist ≠ 0, sobald ein Check `[FAIL]` meldet. Der
+`rotation-overdue`-Check kann nur WARNen, nie FAILen — ein überfälliges
+Secret ist ein Stupser, kein Blocker.
 
 **Geprüft werden:**
 
-| # | ID                | Kriterium                                          |
-|---|-------------------|----------------------------------------------------|
-| 1 | `store`           | `~/.password-store` oder `$PASSWORD_STORE_DIR`     |
-| 2 | `gpg-key`         | mindestens ein GPG-Secret-Key                      |
-| 3 | `recipients`      | ≥ 2 gopass-Recipients (1 = WARN, „kein Backup")   |
-| 4 | `git-remote`      | `gopass git remote -v` liefert einen Remote        |
-| 5 | `sync-age`        | letzter Fetch ≤ 7 Tage = PASS, ≤ 30 = WARN         |
-| 6 | `audit-writable`  | Audit-DB lässt sich öffnen + beschreiben           |
-| 7 | `audit-gaps`      | `audit.Verify` findet keine Lücken                 |
-| 8 | `signed-chain`    | wenn `MYS_AUDIT_SIGN=1`: Hash-Kette stimmt         |
-| 9 | `paperkey-backup` | `~/.local/share/my-secrets/backups.json` ≥ 1 Eintrag |
-| 10 | `policy`          | `scope-policy.yaml` existiert & parst sauber       |
+| #  | ID                  | Kriterium                                          |
+|----|---------------------|----------------------------------------------------|
+| 1  | `store`             | `~/.password-store` oder `$PASSWORD_STORE_DIR`     |
+| 2  | `gpg-key`           | mindestens ein GPG-Secret-Key                      |
+| 3  | `recipients`        | ≥ 2 gopass-Recipients (1 = WARN, „kein Backup")   |
+| 4  | `git-remote`        | `gopass git remote -v` liefert einen Remote        |
+| 5  | `sync-age`          | letzter Fetch ≤ 7 Tage = PASS, ≤ 30 = WARN         |
+| 6  | `audit-writable`    | Audit-DB lässt sich öffnen + beschreiben           |
+| 7  | `audit-gaps`        | `audit.Verify` findet keine Lücken                 |
+| 8  | `signed-chain`      | wenn `MYS_AUDIT_SIGN=1`: Hash-Kette stimmt         |
+| 9  | `paperkey-backup`   | `~/.local/share/my-secrets/backups.json` ≥ 1 Eintrag |
+| 10 | `policy`            | `scope-policy.yaml` existiert & parst sauber       |
+| 11 | `rotation-overdue`  | keine Einträge jenseits ihres `rotate_after`-Horizonts |
 
 **Sample-Output** (leere HOME-Umgebung, demonstriert alle Status-Werte):
 
@@ -152,6 +155,52 @@ Summary: 2 PASS / 4 WARN / 3 FAIL / 1 SKIP
 
 Jeder `mys doctor`-Lauf schreibt eine einzelne Aggregat-Zeile
 (`action=doctor`, `reason=pass=… warn=… fail=… skip=…`) ins Audit-Log.
+
+## Rotation reminders
+
+Damit kein Passwort stillschweigend drei Jahre alt wird, kann jedes
+sensible Secret einen Rotations-Horizont tragen. Das Tooling hebt
+überfällige Einträge hervor — Rotation wird damit Gewohnheit statt
+Gedächtnisleistung.
+
+**Policy beim Anlegen setzen:**
+
+```bash
+echo "ghp_xxx" | mys add jasp/github-token --rotate-after 90d
+```
+
+Erlaubt sind `Nd` (Tage), `Nw` (Wochen), `Nm` (Monate = 30 Tage) und
+`Ny` (Jahre = 365 Tage). Eine leere Policy heißt „opt-out" — der
+Eintrag erscheint niemals in `--stale` oder `--rotating-in`.
+
+**Stale Einträge auflisten:**
+
+```bash
+mys ls --stale                     # alles überfällige
+mys ls --rotating-in 7d            # nächste Wochenrunde
+mys ls --stale --rotating-in 30d   # kombiniert (AND)
+```
+
+`--stale` erweitert die Ausgabe um Alter und Policy:
+
+```
+jasp/github-token  112d old  rotate_after=90d
+```
+
+**Beim Rotieren wird der Zeitstempel automatisch gesetzt:**
+
+```bash
+echo "new-pw" | mys rotate jasp/github-token
+# rotate_after bleibt erhalten, rotated_at wird auf jetzt gesetzt.
+```
+
+**In `mys doctor`:** Der `rotation-overdue`-Check zählt stale Einträge
+und meldet WARN (nie FAIL). Pfade werden bewusst nicht aufgelistet —
+die Ausgabe bleibt kompakt; `mys ls --stale` zeigt die Details.
+
+Einträge mit Policy aber ohne Rotations-Historie (z. B. nach einem
+Import) werden sanfter gemeldet: „rotation policy set but no rotation
+history". `mys rotate <path>` stempelt dann den ersten Zeitstempel.
 
 ## Key-Backup
 

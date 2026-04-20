@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gopasspw/gopass/pkg/gopass"
 	"github.com/gopasspw/gopass/pkg/gopass/api"
@@ -50,6 +51,12 @@ const (
 // Entry is the in-memory representation of a stored secret plus its metadata.
 // The password lives in Password; everything else is metadata and is safe to
 // log/display.
+//
+// RotateAfter and RotatedAt implement the rotation-reminder feature: an
+// entry with a non-empty RotateAfter ("90d", "6m", "1y") opts in to the
+// staleness checks that `mys ls --stale` and `mys doctor` perform.
+// RotatedAt is maintained automatically by App.Add and App.Rotate — it
+// is not a user-facing field.
 type Entry struct {
 	Path          string
 	Org           string
@@ -60,6 +67,8 @@ type Entry struct {
 	Tags          []string
 	Notes         string
 	Password      string
+	RotateAfter   string    // e.g. "90d", "6m", "1y" — empty = no policy.
+	RotatedAt     time.Time // last rotation timestamp (UTC); zero = never.
 }
 
 // Open opens the existing gopass store. Callers must have previously run
@@ -197,6 +206,11 @@ func (s *Store) Set(ctx context.Context, e *Entry) error {
 	setIfNotEmpty(sec, "kind", e.Kind)
 	setIfNotEmpty(sec, "github_project", e.GitHubProject)
 	setIfNotEmpty(sec, "notes", e.Notes)
+	setIfNotEmpty(sec, "rotate_after", e.RotateAfter)
+	if !e.RotatedAt.IsZero() {
+		// Always persist in RFC3339 UTC so parsing is unambiguous.
+		_ = sec.Set("rotated_at", e.RotatedAt.UTC().Format(time.RFC3339))
+	}
 	if len(e.Tags) > 0 {
 		// Store tags as a single comma-separated header; gopass Get returns
 		// the first value for a key anyway.
@@ -283,6 +297,17 @@ func entryFromSecret(path string, sec gopass.Secret) *Entry {
 			parts[i] = strings.TrimSpace(parts[i])
 		}
 		e.Tags = parts
+	}
+	if v, ok := sec.Get("rotate_after"); ok {
+		e.RotateAfter = v
+	}
+	if v, ok := sec.Get("rotated_at"); ok && v != "" {
+		// Silently ignore parse errors — an unparseable timestamp is
+		// treated as "no rotation history" rather than an operational
+		// error, so reminders degrade gracefully.
+		if t, perr := time.Parse(time.RFC3339, v); perr == nil {
+			e.RotatedAt = t.UTC()
+		}
 	}
 	return e
 }

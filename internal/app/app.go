@@ -198,7 +198,12 @@ func (a *App) searchWith(ctx context.Context, query string, ss storeSearcher) ([
 	return allowed, nil
 }
 
-// Add writes a new entry after policy check.
+// Add writes a new entry after policy check. Add is defined as a rotation
+// event for the purposes of the rotation-reminder feature: it always
+// stamps RotatedAt to the current UTC time. Callers that explicitly set
+// a non-zero RotatedAt before calling Add have that value overwritten —
+// the timestamp is a book-keeping field maintained by the app layer, not
+// user input.
 func (a *App) Add(ctx context.Context, e *store.Entry) error {
 	d := caller.Identify(a.Override)
 	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, e.Path)
@@ -206,6 +211,7 @@ func (a *App) Add(ctx context.Context, e *store.Entry) error {
 		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultDenied, decision.Reason)
 		return &ErrDenied{Path: e.Path, Reason: decision.Reason}
 	}
+	e.RotatedAt = time.Now().UTC()
 	if err := a.Store.Set(ctx, e); err != nil {
 		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultError, err.Error())
 		return err
@@ -215,7 +221,9 @@ func (a *App) Add(ctx context.Context, e *store.Entry) error {
 	return nil
 }
 
-// Rotate writes a new password for an existing entry.
+// Rotate writes a new password for an existing entry. It preserves all
+// metadata (including RotateAfter) and stamps RotatedAt to the current
+// UTC time so that --stale filters and doctor checks reset.
 func (a *App) Rotate(ctx context.Context, path, newPassword string) error {
 	d := caller.Identify(a.Override)
 	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
@@ -223,7 +231,18 @@ func (a *App) Rotate(ctx context.Context, path, newPassword string) error {
 		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultDenied, decision.Reason)
 		return &ErrDenied{Path: path, Reason: decision.Reason}
 	}
-	if err := a.Store.Rotate(ctx, path, newPassword); err != nil {
+	// Load the existing entry so the rotated_at stamp can be carried in
+	// the Set() call alongside the existing metadata. We bypass
+	// App.Get's audit row because the rotate audit row already captures
+	// this operation; emitting a separate get row would double-count.
+	existing, err := a.Store.Get(ctx, path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultError, err.Error())
+		return err
+	}
+	existing.Password = newPassword
+	existing.RotatedAt = time.Now().UTC()
+	if err := a.Store.Set(ctx, existing); err != nil {
 		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultError, err.Error())
 		return err
 	}
