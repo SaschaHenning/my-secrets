@@ -332,16 +332,23 @@ func GopassGitInit(ctx context.Context, r Runner, mount string) ([]byte, error) 
 	return r.Run(ctx, "gopass", args...)
 }
 
-// GopassGitRemoteAdd runs `gopass git remote add --remote origin --url <url> <mount>`.
+// GopassGitRemoteAdd runs `gopass git remote add <name> <url>` on the
+// given mount.
+//
+// Older gopass versions exposed `--remote` and `--url` flags; current
+// releases forward everything after `gopass git` straight to `git`,
+// which expects positional `<name> <url>`. Using the flag form against
+// a recent gopass fails with "unknown option `remote'" from git itself,
+// so we build the positional form here.
 func GopassGitRemoteAdd(ctx context.Context, r Runner, mount, url string) ([]byte, error) {
 	if r == nil {
 		r = ExecRunner{}
 	}
-	args := []string{"git", "remote", "add"}
+	args := []string{"git"}
 	if mount != "" && mount != DefaultStoreMount {
 		args = append(args, "--store", mount)
 	}
-	args = append(args, "--remote", "origin", "--url", url)
+	args = append(args, "remote", "add", "origin", url)
 	return r.Run(ctx, "gopass", args...)
 }
 
