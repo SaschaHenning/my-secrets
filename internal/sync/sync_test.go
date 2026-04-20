@@ -389,3 +389,176 @@ func TestMarkSynced(t *testing.T) {
 		t.Errorf("unknown mount mutated remotes: %+v", c.Remotes)
 	}
 }
+
+// Reconcile tests. The scriptedRunner covers each of the four paths
+// documented on ReconcileWithRemote. We drive the control flow by the
+// sequence of `gopass git ...` subcommands the function issues and
+// verify the final call list matches the expected recovery strategy.
+
+var errReconcileUnexpected = errors.New("unexpected runner call")
+
+func runnerFor(r map[string]scriptedResult) *scriptedRunner {
+	return &scriptedRunner{results: r, fallback: scriptedResult{err: errReconcileUnexpected}}
+}
+
+func keyStartsWith(calls [][]string, prefix ...string) bool {
+	for _, c := range calls {
+		if len(c) < len(prefix) {
+			continue
+		}
+		ok := true
+		for i := range prefix {
+			if c[i] != prefix[i] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func TestReconcile_EmptyRemote(t *testing.T) {
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git fetch origin": {},
+		// rev-parse fails → no origin/main. gopass propagates git's
+		// exit code; errUnexpected-identical error works for the
+		// "branch missing" signal.
+		"gopass git rev-parse --quiet --verify origin/main": {err: errors.New("no such ref")},
+	})
+	if err := ReconcileWithRemote(context.Background(), r, "root", "ABCD"); err != nil {
+		t.Fatalf("empty remote path failed: %v", err)
+	}
+	if keyStartsWith(r.calls, "gopass", "git", "reset") {
+		t.Errorf("must not reset on empty remote: %+v", r.calls)
+	}
+	if keyStartsWith(r.calls, "gopass", "git", "merge") {
+		t.Errorf("must not merge on empty remote: %+v", r.calls)
+	}
+}
+
+func TestReconcile_LocalAhead(t *testing.T) {
+	// origin/main is an ancestor of HEAD — push will FF, nothing to do.
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git fetch origin":                                      {},
+		"gopass git rev-parse --quiet --verify origin/main":            {},
+		"gopass git merge-base --is-ancestor origin/main HEAD":         {},
+	})
+	if err := ReconcileWithRemote(context.Background(), r, "root", "ABCD"); err != nil {
+		t.Fatalf("local-ahead path failed: %v", err)
+	}
+	if keyStartsWith(r.calls, "gopass", "git", "merge", "--ff-only") {
+		t.Errorf("unexpected merge call on local-ahead path: %+v", r.calls)
+	}
+}
+
+func TestReconcile_RemoteAhead_FastForward(t *testing.T) {
+	// HEAD is an ancestor of origin/main — FF merge brings local up.
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git fetch origin":                              {},
+		"gopass git rev-parse --quiet --verify origin/main":    {},
+		"gopass git merge-base --is-ancestor origin/main HEAD": {err: errors.New("not ancestor")},
+		"gopass git merge-base --is-ancestor HEAD origin/main": {},
+		"gopass git merge --ff-only origin/main":               {},
+	})
+	if err := ReconcileWithRemote(context.Background(), r, "root", "ABCD"); err != nil {
+		t.Fatalf("remote-ahead FF path failed: %v", err)
+	}
+	if !keyStartsWith(r.calls, "gopass", "git", "merge", "--ff-only") {
+		t.Errorf("expected --ff-only merge on remote-ahead path: %+v", r.calls)
+	}
+}
+
+func TestReconcile_Divergent_Pristine_Adopts(t *testing.T) {
+	// Divergent + ls-files returns only fresh-init files → adopt.
+	pristineFiles := []byte(".gitattributes\n.gpg-id\n.public-keys/foo.pub\n")
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git fetch origin":                              {},
+		"gopass git rev-parse --quiet --verify origin/main":    {},
+		"gopass git merge-base --is-ancestor origin/main HEAD": {err: errors.New("diverged")},
+		"gopass git merge-base --is-ancestor HEAD origin/main": {err: errors.New("diverged")},
+		"gopass git ls-files":                                  {out: pristineFiles},
+		"gopass git reset --hard origin/main":                  {},
+		"gopass recipients add ABCD":                           {},
+	})
+	if err := ReconcileWithRemote(context.Background(), r, "root", "ABCD"); err != nil {
+		t.Fatalf("pristine adopt path failed: %v", err)
+	}
+	if !keyStartsWith(r.calls, "gopass", "git", "reset", "--hard", "origin/main") {
+		t.Errorf("expected reset --hard on adopt path: %+v", r.calls)
+	}
+	if !keyStartsWith(r.calls, "gopass", "recipients", "add", "ABCD") {
+		t.Errorf("expected recipients add on adopt path: %+v", r.calls)
+	}
+}
+
+func TestReconcile_Divergent_WithContent_Merges(t *testing.T) {
+	// A real secret lives in the store — we must not reset.
+	contentFiles := []byte(".gitattributes\n.gpg-id\nzuhause/wifi.gpg\n")
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git fetch origin":                              {},
+		"gopass git rev-parse --quiet --verify origin/main":    {},
+		"gopass git merge-base --is-ancestor origin/main HEAD": {err: errors.New("diverged")},
+		"gopass git merge-base --is-ancestor HEAD origin/main": {err: errors.New("diverged")},
+		"gopass git ls-files":                                  {out: contentFiles},
+		"gopass git merge --allow-unrelated-histories --no-edit -m Merge remote store into local (mys reconcile) origin/main": {},
+	})
+	if err := ReconcileWithRemote(context.Background(), r, "root", "ABCD"); err != nil {
+		t.Fatalf("content merge path failed: %v", err)
+	}
+	if keyStartsWith(r.calls, "gopass", "git", "reset") {
+		t.Errorf("must not reset when content exists: %+v", r.calls)
+	}
+}
+
+func TestReconcile_PristineAdopt_NoFingerprint_SkipsRecipientsAdd(t *testing.T) {
+	// Empty fingerprint: adopt still happens, but no recipient is
+	// added — the caller is on its own (documented behaviour for the
+	// standalone `mys sync setup` path that does not yet know the fpr).
+	pristineFiles := []byte(".gitattributes\n.gpg-id\n")
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git fetch origin":                              {},
+		"gopass git rev-parse --quiet --verify origin/main":    {},
+		"gopass git merge-base --is-ancestor origin/main HEAD": {err: errors.New("diverged")},
+		"gopass git merge-base --is-ancestor HEAD origin/main": {err: errors.New("diverged")},
+		"gopass git ls-files":                                  {out: pristineFiles},
+		"gopass git reset --hard origin/main":                  {},
+	})
+	if err := ReconcileWithRemote(context.Background(), r, "root", ""); err != nil {
+		t.Fatalf("pristine adopt without fpr failed: %v", err)
+	}
+	if keyStartsWith(r.calls, "gopass", "recipients", "add") {
+		t.Errorf("must not call recipients add without fingerprint: %+v", r.calls)
+	}
+}
+
+func TestIsMountPristine(t *testing.T) {
+	cases := []struct {
+		name    string
+		output  string
+		want    bool
+	}{
+		{"empty", "", true},
+		{"fresh init", ".gitattributes\n.gpg-id\n.public-keys/abc.pub\n", true},
+		{"with a gpg file", ".gpg-id\nzuhause/wifi.gpg\n", false},
+		{"unknown top-level file", ".gpg-id\nREADME.md\n", false},
+		{"extra top-level dir", ".gpg-id\nmisc/\n", false},
+		{"whitespace only", "   \n\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runnerFor(map[string]scriptedResult{
+				"gopass git ls-files": {out: []byte(tc.output)},
+			})
+			got, err := isMountPristine(context.Background(), r, "root")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
