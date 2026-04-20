@@ -260,6 +260,32 @@ den gopass-Remote und führt einen ersten Sync aus. Der Zustand landet
 in `~/.config/my-secrets/sync.yaml`; jede Sync-Aktion schreibt eine
 Zeile ins Audit-Log (`action=sync_push|sync_pull|sync_setup`).
 
+### Auto-Sync nach Schreiboperationen
+
+Sobald `mys sync setup` einmal gelaufen ist, wird nach jedem
+erfolgreichen `mys add`, `mys rotate` und `mys rm` automatisch ein
+`gopass sync` ausgelöst — du musst dich nicht mehr an `mys sync push`
+erinnern, wenn dein mentales Modell „Änderung landet sofort auf GitHub"
+ist. Der Push läuft synchron mit 5 Sekunden Timeout; schlägt er fehl
+(offline, Netzwerkfehler), bleibt der lokale Commit erhalten, `mys`
+druckt eine Warnung auf stderr und schreibt eine Audit-Zeile mit
+`action=sync_push, result=error`. Der Exit-Code ist trotzdem `0`, weil
+die Schreiboperation selbst geglückt ist.
+
+Opt-out:
+
+```bash
+# Für diesen einen Aufruf:
+mys add --no-sync jasp/foo
+
+# Global (z. B. beim Rollout oder im Offline-Modus):
+export MYS_AUTO_SYNC=0
+```
+
+Gültige „aus"-Werte für `MYS_AUTO_SYNC`: `0`, `false`, `off`, `no`
+(case-insensitive). Alles andere (einschließlich „unset") bedeutet
+eingeschaltet.
+
 ## Projektstruktur
 
 ```

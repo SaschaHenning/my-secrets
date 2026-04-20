@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/SaschaHenning/my-secrets/internal/policy"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	"github.com/SaschaHenning/my-secrets/internal/store/fake"
+	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
 )
 
 // appWithAuditOnly returns an App suitable for testing the audit/policy
@@ -541,4 +543,276 @@ func TestWriteAudit_NilAuditIsNoop(t *testing.T) {
 	// Ensures the nil-audit guard path is covered (no panic expected).
 	a := &App{Policy: policy.Default(), Override: "human"}
 	a.AuditInit(context.Background(), "nope")
+}
+
+// --- Auto-sync hook -------------------------------------------------------
+
+// autoSyncRecorder is a sync.Runner that records every invocation and
+// returns a canned result. Used by the App-level tests to assert that
+// Add/Rotate/Remove reach (or do not reach) the auto-sync path.
+type autoSyncRecorder struct {
+	calls [][]string
+	err   error
+}
+
+func (r *autoSyncRecorder) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	call := append([]string{name}, args...)
+	r.calls = append(r.calls, call)
+	return nil, r.err
+}
+
+// withTempSyncConfig writes a sync.Config to a tempdir HOME and
+// installs a recording runner on the package-level autoSyncRunner. It
+// returns the recorder so the test can inspect calls, and restores the
+// runner via t.Cleanup.
+func withTempSyncConfig(t *testing.T, cfg *syncpkg.Config, runErr error) *autoSyncRecorder {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("MYS_AUTO_SYNC", "")
+	path := filepath.Join(dir, ".config", "my-secrets", "sync.yaml")
+	if err := syncpkg.Save(path, cfg); err != nil {
+		t.Fatalf("save sync config: %v", err)
+	}
+	rec := &autoSyncRecorder{err: runErr}
+	prev := autoSyncRunner
+	autoSyncRunner = rec
+	t.Cleanup(func() { autoSyncRunner = prev })
+	prevFlag := NoSyncFlag
+	NoSyncFlag = false
+	t.Cleanup(func() { NoSyncFlag = prevFlag })
+	return rec
+}
+
+// withNoSyncConfig points HOME at an empty tempdir so LoadConfig() sees
+// no remotes. Any AutoSync call should skip.
+func withNoSyncConfig(t *testing.T) *autoSyncRecorder {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MYS_AUTO_SYNC", "")
+	rec := &autoSyncRecorder{}
+	prev := autoSyncRunner
+	autoSyncRunner = rec
+	t.Cleanup(func() { autoSyncRunner = prev })
+	return rec
+}
+
+func singleRemoteConfig() *syncpkg.Config {
+	return &syncpkg.Config{
+		Version: 1,
+		Layout:  syncpkg.LayoutSingle,
+		Remotes: []syncpkg.StoreRemote{
+			{Mount: syncpkg.DefaultStoreMount, URL: "git@github.com:me/my-secrets-store.git"},
+		},
+	}
+}
+
+func TestApp_Add_AutoSync_Success(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
+	a, _ := appWithFake(t, "human")
+	var stderr bytes.Buffer
+	a.Stderr = &stderr
+	ctx := context.Background()
+	if err := a.Add(ctx, &store.Entry{Path: "jasp/new", Password: "p"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	// Two audit rows: add + sync_push(ok).
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Limit: 20})
+	var sawAdd, sawSync bool
+	for _, r := range rows {
+		switch r.Action {
+		case audit.ActionAdd:
+			if r.Result == audit.ResultOK {
+				sawAdd = true
+			}
+		case audit.ActionSyncPush:
+			if r.Result == audit.ResultOK {
+				sawSync = true
+				if !strings.Contains(r.Reason, "auto-sync after add jasp/new") {
+					t.Errorf("sync_push reason = %q, want to contain 'auto-sync after add jasp/new'", r.Reason)
+				}
+			}
+		}
+	}
+	if !sawAdd {
+		t.Errorf("expected add ok row, got rows=%+v", rows)
+	}
+	if !sawSync {
+		t.Errorf("expected sync_push ok row, got rows=%+v", rows)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr should be empty on success, got %q", stderr.String())
+	}
+	if len(rec.calls) == 0 {
+		t.Errorf("expected runner to be called at least once")
+	}
+}
+
+func TestApp_Add_AutoSync_Error(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), errors.New("network unreachable"))
+	a, _ := appWithFake(t, "human")
+	var stderr bytes.Buffer
+	a.Stderr = &stderr
+	ctx := context.Background()
+	// Add itself must still succeed — write was OK, sync is best-effort.
+	if err := a.Add(ctx, &store.Entry{Path: "jasp/new", Password: "p"}); err != nil {
+		t.Fatalf("add should return nil even when auto-sync fails, got %v", err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Limit: 20})
+	var sawAddOK, sawSyncErr bool
+	for _, r := range rows {
+		if r.Action == audit.ActionAdd && r.Result == audit.ResultOK {
+			sawAddOK = true
+		}
+		if r.Action == audit.ActionSyncPush && r.Result == audit.ResultError {
+			sawSyncErr = true
+			if !strings.Contains(r.Reason, "network unreachable") {
+				t.Errorf("sync_push error reason = %q, want to mention underlying error", r.Reason)
+			}
+		}
+	}
+	if !sawAddOK {
+		t.Errorf("expected add ok row, rows=%+v", rows)
+	}
+	if !sawSyncErr {
+		t.Errorf("expected sync_push error row, rows=%+v", rows)
+	}
+	if !strings.Contains(stderr.String(), "warning: auto-sync failed") {
+		t.Errorf("stderr must contain the warning, got %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "mys sync push") {
+		t.Errorf("stderr must point the user at 'mys sync push', got %q", stderr.String())
+	}
+	if len(rec.calls) == 0 {
+		t.Error("expected runner to be invoked")
+	}
+}
+
+func TestApp_Add_AutoSync_NoConfig(t *testing.T) {
+	rec := withNoSyncConfig(t)
+	a, _ := appWithFake(t, "human")
+	var stderr bytes.Buffer
+	a.Stderr = &stderr
+	ctx := context.Background()
+	if err := a.Add(ctx, &store.Entry{Path: "jasp/new", Password: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSyncPush, Limit: 5})
+	if len(rows) != 0 {
+		t.Errorf("expected no sync_push rows when sync is not configured, got %d", len(rows))
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("runner must not be called when no sync config exists, got %d calls", len(rec.calls))
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr must be empty on skipped path, got %q", stderr.String())
+	}
+}
+
+func TestApp_Add_AutoSync_EnvOff(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
+	t.Setenv("MYS_AUTO_SYNC", "0")
+	a, _ := appWithFake(t, "human")
+	ctx := context.Background()
+	if err := a.Add(ctx, &store.Entry{Path: "jasp/new", Password: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSyncPush, Limit: 5})
+	if len(rows) != 0 {
+		t.Errorf("expected no sync_push rows with MYS_AUTO_SYNC=0, got %d", len(rows))
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("runner must not be called with MYS_AUTO_SYNC=0, got %d calls", len(rec.calls))
+	}
+}
+
+func TestApp_Add_AutoSync_NoSyncFlag(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
+	NoSyncFlag = true
+	t.Cleanup(func() { NoSyncFlag = false })
+	a, _ := appWithFake(t, "human")
+	ctx := context.Background()
+	if err := a.Add(ctx, &store.Entry{Path: "jasp/new", Password: "p"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSyncPush, Limit: 5})
+	if len(rows) != 0 {
+		t.Errorf("expected no sync_push rows when --no-sync is set, got %d", len(rows))
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("runner must not be called with --no-sync, got %d calls", len(rec.calls))
+	}
+}
+
+func TestApp_Rotate_AutoSync(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
+	a, _ := appWithFake(t, "human", sampleEntries()...)
+	ctx := context.Background()
+	if err := a.Rotate(ctx, "jasp/github", "new-pw"); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSyncPush, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultOK {
+		t.Fatalf("expected one ok sync_push row after rotate, got %+v", rows)
+	}
+	if !strings.Contains(rows[0].Reason, "rotate jasp/github") {
+		t.Errorf("reason = %q, want to contain 'rotate jasp/github'", rows[0].Reason)
+	}
+	if len(rec.calls) == 0 {
+		t.Error("expected runner to be called")
+	}
+}
+
+func TestApp_Remove_AutoSync(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
+	a, _ := appWithFake(t, "human", sampleEntries()...)
+	ctx := context.Background()
+	if err := a.Remove(ctx, "jasp/github"); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSyncPush, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultOK {
+		t.Fatalf("expected one ok sync_push row after remove, got %+v", rows)
+	}
+	if !strings.Contains(rows[0].Reason, "remove jasp/github") {
+		t.Errorf("reason = %q, want to contain 'remove jasp/github'", rows[0].Reason)
+	}
+	if len(rec.calls) == 0 {
+		t.Error("expected runner to be called")
+	}
+}
+
+func TestApp_AutoSync_DeniedAddDoesNotSync(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
+	a, _ := appWithFake(t, "claude-code") // AI cannot write to private/**
+	ctx := context.Background()
+	err := a.Add(ctx, &store.Entry{Path: "private/foo", Password: "p"})
+	var denied *ErrDenied
+	if !errors.As(err, &denied) {
+		t.Fatalf("want ErrDenied, got %v", err)
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSyncPush, Limit: 5})
+	if len(rows) != 0 {
+		t.Errorf("expected no sync_push rows when write itself was denied, got %d", len(rows))
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("runner must not be invoked after denied write, got %d calls", len(rec.calls))
+	}
+}
+
+func TestApp_AutoSync_StoreErrorDoesNotSync(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
+	a, f := appWithFake(t, "human")
+	f.SetErr = errors.New("disk full")
+	ctx := context.Background()
+	if err := a.Add(ctx, &store.Entry{Path: "jasp/new", Password: "p"}); err == nil {
+		t.Fatal("want error")
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSyncPush, Limit: 5})
+	if len(rows) != 0 {
+		t.Errorf("expected no sync_push rows when write failed, got %d", len(rows))
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("runner must not be invoked after failed write, got %d calls", len(rec.calls))
+	}
 }

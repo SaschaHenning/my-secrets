@@ -9,13 +9,34 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
 	"github.com/SaschaHenning/my-secrets/internal/policy"
 	"github.com/SaschaHenning/my-secrets/internal/store"
+	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
 )
+
+// NoSyncFlag is set by the CLI when `--no-sync` is passed. It is a
+// package-level variable so that the cobra layer can flip it without
+// having to thread an option through every App.Open call site. The App
+// reads it once per AutoSync invocation.
+var NoSyncFlag bool
+
+// autoSyncTimeout is the hard budget for one auto-sync attempt. Chosen
+// so a write operation never blocks the user for more than a few
+// seconds even on a flaky network. Exposed as a package variable so
+// tests can tighten or extend it.
+var autoSyncTimeout = 5 * time.Second
+
+// autoSyncRunner is the sync.Runner used by (*App).AutoSync. Tests
+// override it to inject a fake runner; production code leaves it nil
+// which falls back to the exec runner.
+var autoSyncRunner syncpkg.Runner
 
 // App wires everything together.
 type App struct {
@@ -23,6 +44,10 @@ type App struct {
 	Audit    *audit.Log
 	Policy   *policy.Policy
 	Override string // explicit --requester value for this invocation
+	// Stderr is where user-visible warnings (auto-sync failure, etc.)
+	// are written. Nil falls back to os.Stderr. Tests inject a
+	// *bytes.Buffer here to assert on the output.
+	Stderr io.Writer
 }
 
 // Open opens the store + audit DB + policy in one call. Callers are
@@ -186,6 +211,7 @@ func (a *App) Add(ctx context.Context, e *store.Entry) error {
 		return err
 	}
 	a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultOK, decision.MatchedRule)
+	a.AutoSync(ctx, "add "+e.Path)
 	return nil
 }
 
@@ -202,6 +228,7 @@ func (a *App) Rotate(ctx context.Context, path, newPassword string) error {
 		return err
 	}
 	a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultOK, decision.MatchedRule)
+	a.AutoSync(ctx, "rotate "+path)
 	return nil
 }
 
@@ -218,7 +245,55 @@ func (a *App) Remove(ctx context.Context, path string) error {
 		return err
 	}
 	a.writeAudit(ctx, audit.ActionRemove, path, d, audit.ResultOK, decision.MatchedRule)
+	a.AutoSync(ctx, "remove "+path)
 	return nil
+}
+
+// AutoSync fires a `gopass sync` for every configured remote after a
+// successful write. It is best-effort: a failure does NOT propagate to
+// the caller — Add/Rotate/Remove return nil even if the push fails, on
+// the grounds that the local write already succeeded and the user
+// should not have to redo the write just because the network was down.
+//
+// Failure modes are surfaced in two ways:
+//   - A warning line is written to a.Stderr (defaults to os.Stderr).
+//   - An audit row with action=sync_push, result=error is appended so
+//     operators can correlate „CLI exited 0 but the remote is stale".
+//
+// The skip path (no sync config, no remotes, or MYS_AUTO_SYNC=0/--no-sync)
+// produces no audit row and no stderr output.
+//
+// A 5-second timeout is imposed on top of the caller's context so a
+// hanging `git push` cannot block the CLI indefinitely.
+func (a *App) AutoSync(ctx context.Context, trigger string) {
+	if NoSyncFlag {
+		return
+	}
+	ctx2, cancel := context.WithTimeout(ctx, autoSyncTimeout)
+	defer cancel()
+	skipped, err := syncpkg.AutoSync(ctx2, autoSyncRunner, trigger)
+	if skipped {
+		return
+	}
+	d := caller.Identify(a.Override)
+	if err != nil {
+		reason := fmt.Sprintf("auto-sync after %s: %s", trigger, err.Error())
+		a.writeAudit(ctx, audit.ActionSyncPush, "", d, audit.ResultError, reason)
+		w := a.stderr()
+		fmt.Fprintf(w, "warning: auto-sync failed (%s) — run \"mys sync push\" manually when online\n", err.Error())
+		return
+	}
+	a.writeAudit(ctx, audit.ActionSyncPush, "", d, audit.ResultOK,
+		fmt.Sprintf("auto-sync after %s", trigger))
+}
+
+// stderr returns a.Stderr or os.Stderr as a fallback. Extracted so
+// tests can pin it to a buffer without having to protect against nil.
+func (a *App) stderr() io.Writer {
+	if a.Stderr != nil {
+		return a.Stderr
+	}
+	return os.Stderr
 }
 
 // AuditInit records a one-time init event.
