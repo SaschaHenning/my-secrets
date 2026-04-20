@@ -26,18 +26,18 @@ Ein schlankes Go-Binary (`mys`), das die [gopass](https://github.com/gopasspw/go
 | Go ≥ 1.22            | `brew install go`                    | Build                        |
 | gopass ≥ 1.15        | `brew install gopass`                | Storage-Backend              |
 | GnuPG ≥ 2.2          | `brew install gnupg`                 | Krypto (Private Key im Keychain) |
-| pinentry-touchid *   | siehe unten                          | Touch-ID-Unlock (optional)   |
+| pinentry-mac *   | siehe unten                          | Touch-ID-Unlock (optional)   |
 
 \* Der Homebrew-Tap `jorgelbg/tap` lässt sich auf manchen Systemen wegen
 eines Ruby-`type_member`-Bugs nicht adden. In dem Fall das Binary direkt
 bauen:
 
 ```bash
-git clone https://github.com/jorgelbg/pinentry-touchid /tmp/ptid && \
-  cd /tmp/ptid && go build -o $(brew --prefix)/bin/pinentry-touchid .
+git clone https://github.com/jorgelbg/pinentry-mac /tmp/ptid && \
+  cd /tmp/ptid && go build -o $(brew --prefix)/bin/pinentry-mac .
 ```
 
-Ohne `pinentry-touchid` funktioniert alles — du bekommst dann den
+Ohne `pinentry-mac` funktioniert alles — du bekommst dann den
 Standard-`pinentry`-Prompt statt Touch ID.
 
 ## Install
@@ -48,13 +48,13 @@ Auf einer frischen Maschine ohne GPG-Key, ohne gopass-Store, ohne
 irgendwas:
 
 ```bash
-brew install gopass pinentry-touchid
+brew install gopass pinentry-mac
 mys init --install-skill
 ```
 
 Das reicht. `mys init` erzeugt einen Ed25519-GPG-Key (Name/Email aus
 `git config --global` abgeleitet), initialisiert den gopass-Store, trägt
-`pinentry-touchid` in `~/.gnupg/gpg-agent.conf` ein, legt Policy + Audit-
+`pinentry-mac` in `~/.gnupg/gpg-agent.conf` ein, legt Policy + Audit-
 DB an und verlinkt den Claude-Skill nach `~/.claude/skills/my-secrets`.
 Danach funktionieren `mys add`, `mys get`, `mys doctor` sofort.
 
@@ -67,7 +67,7 @@ mys init --yes --install-skill --with-sync
 Im `--yes`-Modus werden `git config user.name` / `user.email` als
 Defaults genommen; fehlen sie, bricht der Befehl ab statt zu fragen.
 `--no-passphrase` überspringt die Passphrase-Abfrage — sinnvoll, wenn
-`pinentry-touchid` die Authentisierung übernimmt.
+`pinentry-mac` die Authentisierung übernimmt.
 
 **TL;DR — one-shot install via Skript:**
 
