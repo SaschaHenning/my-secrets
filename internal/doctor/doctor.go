@@ -132,17 +132,51 @@ func Run(ctx context.Context, only []string) Report {
 // Check implementations
 // ----------------------------------------------------------------------------
 
-// passwordStoreDir returns the resolved store directory: $PASSWORD_STORE_DIR
-// if set, else ~/.password-store.
+// passwordStoreDir returns the active gopass store directory.
+//
+// Priority order matches gopass itself:
+//  1. $PASSWORD_STORE_DIR if set.
+//  2. The path reported by `gopass config mounts.path` — this picks up
+//     any non-default store the user (or a bootstrap script) has
+//     configured.
+//  3. ~/.password-store as the conventional fallback.
 func passwordStoreDir() (string, error) {
 	if p := strings.TrimSpace(os.Getenv("PASSWORD_STORE_DIR")); p != "" {
 		return p, nil
+	}
+	if gopass := gopassBinary(); gopass != "" {
+		if out, err := exec.Command(gopass, "config", "mounts.path").Output(); err == nil {
+			if path := filterGopassOutput(string(out)); path != "" {
+				return path, nil
+			}
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(home, ".password-store"), nil
+}
+
+// filterGopassOutput returns the last non-empty line of a gopass command's
+// stdout that is NOT a „⚠ Running '...' in <path>..." prefix. Recent
+// gopass versions print such a banner before the actual command output,
+// which every parser that used to treat the whole stdout as data now has
+// to strip.
+func filterGopassOutput(s string) string {
+	var last string
+	for _, line := range strings.Split(s, "\n") {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		// Skip the banner — works with emoji warnings as well as plain.
+		if strings.Contains(l, "Running '") && strings.Contains(l, "' in ") {
+			continue
+		}
+		last = l
+	}
+	return last
 }
 
 // CheckStore — check #1: gopass store directory exists.
@@ -314,7 +348,15 @@ func CheckGitRemote(ctx context.Context) Check {
 		c.Remedy = "configure a remote with `gopass git remote add origin <url>`"
 		return c
 	}
-	lines := trimmedLines(string(out))
+	// Strip the „Running '...'"-banner gopass prints before the actual
+	// git output.
+	var lines []string
+	for _, l := range trimmedLines(string(out)) {
+		if strings.Contains(l, "Running '") && strings.Contains(l, "' in ") {
+			continue
+		}
+		lines = append(lines, l)
+	}
 	if len(lines) == 0 {
 		c.Status = StatusWarn
 		c.Message = "no git remote configured"
@@ -347,7 +389,8 @@ func CheckSyncAge(ctx context.Context) Check {
 	// when the store has never fetched.
 	ref := "FETCH_HEAD"
 	out, err := exec.CommandContext(ctx, gopass, "git", "log", "-1", "--format=%ct", ref).Output()
-	if err != nil || strings.TrimSpace(string(out)) == "" {
+	tsStr := filterGopassOutput(string(out))
+	if err != nil || tsStr == "" {
 		ref = "HEAD"
 		out, err = exec.CommandContext(ctx, gopass, "git", "log", "-1", "--format=%ct", ref).Output()
 		if err != nil {
@@ -356,8 +399,8 @@ func CheckSyncAge(ctx context.Context) Check {
 			c.Remedy = "initialise git in the store: `gopass git init`"
 			return c
 		}
+		tsStr = filterGopassOutput(string(out))
 	}
-	tsStr := strings.TrimSpace(string(out))
 	if tsStr == "" {
 		c.Status = StatusWarn
 		c.Message = "no commits in store"
