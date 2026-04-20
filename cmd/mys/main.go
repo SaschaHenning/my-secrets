@@ -40,6 +40,7 @@ func rootCmd() *cobra.Command {
 		addCmd(&requester),
 		rotateCmd(&requester),
 		rmCmd(&requester),
+		keyCmd(&requester),
 		auditCmd(),
 		webCmd(),
 		mcpCmd(),
