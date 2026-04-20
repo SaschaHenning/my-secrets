@@ -30,16 +30,47 @@ func DefaultStoreDir() (string, error) {
 	return filepath.Join(home, ".password-store"), nil
 }
 
-// IsInitialised reports whether a usable gopass store already exists
-// at DefaultStoreDir(). We look for the .gpg-id file rather than just
-// the directory — an empty `~/.password-store` left over from a failed
-// run would otherwise confuse the init step.
+// IsInitialised reports whether a usable gopass store already exists.
+//
+// Lookup order mirrors what gopass itself does:
+//  1. If PASSWORD_STORE_DIR is set, check <that>/.gpg-id.
+//  2. Otherwise, ask `gopass config mounts.path` — this respects the
+//     user's persistent gopass config (~/.config/gopass/config), which
+//     is where a previous `gopass init`/test run may have stashed a
+//     non-default store path.
+//  3. Fall back to ~/.password-store/.gpg-id.
+//
+// Step 2 is what catches the „my store lives at /tmp/... per gopass
+// config, but ~/.password-store does not exist" case. Without it
+// `mys init` would try to init a store gopass already considers
+// initialised, fail, and leave the user stuck.
 func IsInitialised() bool {
-	dir, err := DefaultStoreDir()
+	return isInitialisedWithBin("gopass")
+}
+
+func isInitialisedWithBin(gopassBin string) bool {
+	// Explicit env-var always wins — matches gopass's own precedence.
+	if env := os.Getenv("PASSWORD_STORE_DIR"); env != "" {
+		_, err := os.Stat(filepath.Join(env, ".gpg-id"))
+		return err == nil
+	}
+	// Ask gopass for its configured store path. If the binary is there
+	// and the config lookup works, trust the path it returned.
+	if _, lerr := exec.LookPath(gopassBin); lerr == nil {
+		if out, err := exec.Command(gopassBin, "config", "mounts.path").Output(); err == nil {
+			path := strings.TrimSpace(string(out))
+			if path != "" {
+				_, statErr := os.Stat(filepath.Join(path, ".gpg-id"))
+				return statErr == nil
+			}
+		}
+	}
+	// Final fallback: the conventional ~/.password-store location.
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return false
 	}
-	_, err = os.Stat(filepath.Join(dir, ".gpg-id"))
+	_, err = os.Stat(filepath.Join(home, ".password-store", ".gpg-id"))
 	return err == nil
 }
 
@@ -62,7 +93,7 @@ func initialiseWithBin(ctx context.Context, gopassBin, keyID string) error {
 	if strings.TrimSpace(keyID) == "" {
 		return fmt.Errorf("gopass init: keyID required")
 	}
-	if IsInitialised() {
+	if isInitialisedWithBin(gopassBin) {
 		return nil
 	}
 	if _, err := exec.LookPath(gopassBin); err != nil {
@@ -77,6 +108,14 @@ func initialiseWithBin(ctx context.Context, gopassBin, keyID string) error {
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		// gopass itself might know about the store even if our pre-check
+		// missed it (user ran `gopass init` by hand, weird config state,
+		// etc.). Treat its „already initialized" response as success so
+		// a re-run of `mys init` does not block the user.
+		msg := strings.ToLower(string(out))
+		if strings.Contains(msg, "already initialized") {
+			return nil
+		}
 		return fmt.Errorf("gopass init: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
