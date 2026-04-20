@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>my-secrets — Audit Log</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header>
+  <h1>my-secrets</h1>
+  <nav>
+    <a href="/">Overview</a>
+    <a href="/audit" class="active">Audit Log</a>
+  </nav>
+</header>
+<main>
+
+<section>
+  <h2>Audit log</h2>
+  <form class="filters" method="get">
+    <label>Actor
+      <select name="actor">
+        <option value="">any</option>
+        <option value="human" {{if eq .Filter.Actor "human"}}selected{{end}}>human</option>
+        <option value="ai" {{if eq .Filter.Actor "ai"}}selected{{end}}>ai</option>
+        <option value="script" {{if eq .Filter.Actor "script"}}selected{{end}}>script</option>
+      </select>
+    </label>
+    <label>Action
+      <select name="action">
+        <option value="">any</option>
+        <option value="get" {{if eq .Filter.Action "get"}}selected{{end}}>get</option>
+        <option value="list" {{if eq .Filter.Action "list"}}selected{{end}}>list</option>
+        <option value="search" {{if eq .Filter.Action "search"}}selected{{end}}>search</option>
+        <option value="add" {{if eq .Filter.Action "add"}}selected{{end}}>add</option>
+        <option value="rotate" {{if eq .Filter.Action "rotate"}}selected{{end}}>rotate</option>
+        <option value="remove" {{if eq .Filter.Action "remove"}}selected{{end}}>remove</option>
+      </select>
+    </label>
+    <label>Org
+      <input type="text" name="org" value="{{.Filter.Org}}" placeholder="jasp">
+    </label>
+    <label>Path contains
+      <input type="text" name="path" value="{{.Filter.Path}}" placeholder="github">
+    </label>
+    <label>Limit
+      <input type="number" name="limit" value="{{.Filter.Limit}}" min="1" max="1000">
+    </label>
+    <button type="submit">Apply</button>
+    <a href="/audit" class="btn-link">reset</a>
+  </form>
+
+  <table class="audit">
+    <thead><tr><th>seq</th><th>time</th><th>actor</th><th>action</th><th>path</th><th>org</th><th>result</th><th>reason / actor detail</th></tr></thead>
+    <tbody>
+    {{range .Entries}}
+      <tr>
+        <td>{{.Seq}}</td>
+        <td>{{shortTime .TS}}</td>
+        <td>{{actorBadge .ActorKind}}</td>
+        <td>{{.Action}}</td>
+        <td><code>{{.SecretPath}}</code></td>
+        <td>{{.Org}}</td>
+        <td>{{resultBadge .Result}}</td>
+        <td>
+          <div class="reason">{{.Reason}}</div>
+          {{if .ActorDetail}}<details><summary>actor detail</summary><pre>{{printf "%s" .ActorDetail}}</pre></details>{{end}}
+        </td>
+      </tr>
+    {{else}}
+      <tr><td colspan="8" class="empty">no events match these filters</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+
+</main>
+<footer>local read-only UI · bound to 127.0.0.1 · no secret values are rendered here</footer>
+</body>
+</html>
