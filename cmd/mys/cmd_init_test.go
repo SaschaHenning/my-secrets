@@ -13,28 +13,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// TestInstallSkillHelper exercises the installSkill helper in isolation:
-// it must locate a repo-relative skills/my-secrets directory, create the
-// ~/.claude/skills parent, and place a symlink at ~/.claude/skills/my-secrets
-// pointing at that source directory.
+// TestInstallSkillHelper installs the embedded skill into a fake HOME
+// and asserts that SKILL.md lands as a real file (not a symlink, since
+// we no longer depend on the repo being present at install time).
 func TestInstallSkillHelper(t *testing.T) {
-	// Build a fake "repo" that contains a skills/my-secrets directory so
-	// findSkillSource can locate it via its upward CWD walk.
-	repo := t.TempDir()
-	skillSrc := filepath.Join(repo, "skills", "my-secrets")
-	if err := os.MkdirAll(skillSrc, 0o755); err != nil {
-		t.Fatalf("mkdir skill source: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(skillSrc, "SKILL.md"), []byte("# test\n"), 0o644); err != nil {
-		t.Fatalf("write sentinel: %v", err)
-	}
-
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
-	t.Chdir(repo)
 
 	cmd := &cobra.Command{Use: "test"}
-	dst, src, err := installSkill(cmd)
+	dst, _, err := installSkill(cmd)
 	if err != nil {
 		t.Fatalf("installSkill: %v", err)
 	}
@@ -44,44 +31,28 @@ func TestInstallSkillHelper(t *testing.T) {
 		t.Fatalf("dst = %q, want %q", dst, wantDst)
 	}
 
-	fi, err := os.Lstat(dst)
+	skillFile := filepath.Join(dst, "SKILL.md")
+	fi, err := os.Lstat(skillFile)
 	if err != nil {
-		t.Fatalf("lstat dst: %v", err)
+		t.Fatalf("lstat SKILL.md: %v", err)
 	}
-	if fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("dst is not a symlink: mode=%v", fi.Mode())
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("SKILL.md is a symlink; embedded install should produce a regular file")
 	}
-	target, err := os.Readlink(dst)
+	data, err := os.ReadFile(skillFile)
 	if err != nil {
-		t.Fatalf("readlink: %v", err)
+		t.Fatal(err)
 	}
-	if target != src {
-		t.Fatalf("symlink target %q != returned src %q", target, src)
-	}
-	wantSuffix := filepath.Join("skills", "my-secrets")
-	if !strings.HasSuffix(target, wantSuffix) {
-		t.Fatalf("symlink target %q does not end with %q", target, wantSuffix)
+	if len(data) == 0 {
+		t.Fatal("SKILL.md is empty")
 	}
 }
 
 // TestInstallSkillAt_LocalScope installs into a CWD-relative location
-// and verifies the symlink lands under <cwd>/.claude/skills/my-secrets.
+// and verifies the skill content lands under <cwd>/.claude/skills/my-secrets.
 func TestInstallSkillAt_LocalScope(t *testing.T) {
-	repo := t.TempDir()
-	skillSrc := filepath.Join(repo, "skills", "my-secrets")
-	if err := os.MkdirAll(skillSrc, 0o755); err != nil {
-		t.Fatalf("mkdir skill source: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(skillSrc, "SKILL.md"), []byte("# test\n"), 0o644); err != nil {
-		t.Fatalf("write sentinel: %v", err)
-	}
-	// Distinct project cwd — local install should land here, NOT in HOME.
-	projectCwd := filepath.Join(repo, "project-x")
-	if err := os.MkdirAll(projectCwd, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	projectCwd := t.TempDir()
 	t.Setenv("HOME", t.TempDir())
-	t.Chdir(repo) // findSkillSource walks up from here
 
 	cmd := &cobra.Command{Use: "test"}
 	dst, _, err := installSkillAt(cmd, skillScopeLocal, projectCwd)
@@ -92,8 +63,8 @@ func TestInstallSkillAt_LocalScope(t *testing.T) {
 	if dst != wantDst {
 		t.Fatalf("dst = %q, want %q", dst, wantDst)
 	}
-	if fi, err := os.Lstat(dst); err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("dst is not a symlink: err=%v fi=%v", err, fi)
+	if _, err := os.Stat(filepath.Join(dst, "SKILL.md")); err != nil {
+		t.Fatalf("expected SKILL.md in local install: %v", err)
 	}
 }
 
