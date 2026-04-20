@@ -378,6 +378,128 @@ func TestToolsCall_BadParams(t *testing.T) {
 	}
 }
 
+// unmarshalContentJSON extracts and parses the JSON payload out of the
+// first content item of an MCP tool response. Both creds_list and
+// creds_search return structured JSON wrapped in a text-content envelope.
+func unmarshalContentJSON(t *testing.T, line string) map[string]any {
+	t.Helper()
+	var r struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(line), &r); err != nil {
+		t.Fatalf("unmarshal outer: %v (line=%s)", err, line)
+	}
+	if len(r.Result.Content) == 0 {
+		t.Fatalf("no content in response: %s", line)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(r.Result.Content[0].Text), &payload); err != nil {
+		t.Fatalf("unmarshal inner: %v (text=%s)", err, r.Result.Content[0].Text)
+	}
+	return payload
+}
+
+func TestToolsCall_CredsSearch_SimilarOnEmptyMatches(t *testing.T) {
+	a, _ := newFakeApp(t,
+		&store.Entry{Path: "jasp/site", Domain: "jasp.eu", Password: "p"},
+		&store.Entry{Path: "jasp/mail", Domain: "mail.jasp.eu", Password: "p"},
+	)
+	// "jazp.eu" has no direct substring match but should surface jasp.eu
+	// in similar[] via MatchDomain's fuzzy tier.
+	lines := sendAndReceive(t, a, []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"creds_search","arguments":{"query":"jazp.eu"}}}`,
+	})
+	payload := unmarshalContentJSON(t, lines[0])
+	// matches may be empty (nothing contains "jazp.eu" as substring).
+	similar, ok := payload["similar"].([]any)
+	if !ok {
+		t.Fatalf("similar field missing or wrong type: %v", payload["similar"])
+	}
+	var foundFuzzy bool
+	for _, item := range similar {
+		m := item.(map[string]any)
+		if m["path"] == "jasp/site" && m["tier"] == "fuzzy" {
+			foundFuzzy = true
+			if _, hasPw := m["password"]; hasPw {
+				t.Error("similar entry must not contain a password field")
+			}
+		}
+	}
+	if !foundFuzzy {
+		t.Errorf("expected fuzzy match for jasp/site in similar, got %+v", similar)
+	}
+}
+
+func TestToolsCall_CredsSearch_NoSimilarWhenMatchesPresent(t *testing.T) {
+	a, _ := newFakeApp(t,
+		&store.Entry{Path: "jasp/github", Domain: "github.com", Username: "alice", Password: "p"},
+	)
+	// include_similar defaults to false because matches are non-empty —
+	// the payload should then have matches but no similar array.
+	lines := sendAndReceive(t, a, []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"creds_search","arguments":{"query":"alice"}}}`,
+	})
+	payload := unmarshalContentJSON(t, lines[0])
+	if _, ok := payload["similar"]; ok {
+		t.Errorf("similar must be absent on non-empty matches, got %v", payload["similar"])
+	}
+}
+
+func TestToolsCall_CredsList_DomainWithSimilar(t *testing.T) {
+	a, _ := newFakeApp(t,
+		&store.Entry{Path: "jasp/aws", Domain: "aws.amazon.com", Password: "p"},
+		&store.Entry{Path: "jasp/site", Domain: "jasp.eu", Password: "p"},
+	)
+	// Query "amazon" — substring tier, so it only surfaces in similar.
+	lines := sendAndReceive(t, a, []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"creds_list","arguments":{"domain":"amazon","include_similar":true}}}`,
+	})
+	payload := unmarshalContentJSON(t, lines[0])
+	similar, ok := payload["similar"].([]any)
+	if !ok {
+		t.Fatalf("similar missing: %v", payload)
+	}
+	if len(similar) == 0 {
+		t.Fatal("expected at least one similar entry")
+	}
+	// Tier must be set, password must not leak.
+	m := similar[0].(map[string]any)
+	if m["tier"] != "substring" {
+		t.Errorf("tier = %v, want substring", m["tier"])
+	}
+	if _, has := m["password"]; has {
+		t.Error("password must not appear in similar")
+	}
+}
+
+func TestToolsCall_CredsList_DomainExactMatch(t *testing.T) {
+	a, _ := newFakeApp(t,
+		&store.Entry{Path: "jasp/site", Domain: "jasp.eu", Password: "p"},
+		&store.Entry{Path: "jasp/mail", Domain: "mail.jasp.eu", Password: "p"},
+	)
+	lines := sendAndReceive(t, a, []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"creds_list","arguments":{"domain":"jasp.eu"}}}`,
+	})
+	payload := unmarshalContentJSON(t, lines[0])
+	matches, ok := payload["matches"].([]any)
+	if !ok {
+		t.Fatalf("matches missing: %v", payload)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("want 2 matches (exact + subdomain), got %d: %+v", len(matches), matches)
+	}
+	for _, item := range matches {
+		m := item.(map[string]any)
+		if _, has := m["password"]; has {
+			t.Error("password must not appear in matches either")
+		}
+	}
+}
+
 func TestEmptyLinesSkipped(t *testing.T) {
 	a := newAuditOnlyApp(t)
 	// Interleave blank lines. Only the real request should produce output.

@@ -82,7 +82,25 @@ type Entry struct {
 	TOTPAlgorithm string
 	TOTPDigits    int
 	TOTPPeriod    int
+	// Domain is the canonical host associated with this entry, e.g.
+	// "aws.amazon.com" or "mail.jasp.eu". If left empty at Add/Rotate time
+	// and URL is non-empty, the app layer populates it from URL via
+	// DeriveDomain so domain-based search works out of the box.
+	Domain string
+	// Fields carries arbitrary structured extras like account_id, region,
+	// tenant, etc. Keys are validated at the CLI layer against
+	// ^[a-z][a-z0-9_]{0,30}$ to keep the serialised form predictable.
+	// Values stored under keys whose name contains "password" or "secret"
+	// are intentionally kept out of free-text search — see fake.entryMatches
+	// and search handling in the store/fake layer.
+	Fields map[string]string
 }
+
+// fieldKeyPrefix is the gopass-secret key prefix used for entries in
+// Entry.Fields. Keeping the prefix out of band of the well-known keys
+// (username, url, kind, github_project, notes, tags, domain) avoids any
+// chance of collision when older entries are read back.
+const fieldKeyPrefix = "field."
 
 // Open opens the existing gopass store. Callers must have previously run
 // `gopass setup` (the store initialisation flow). Returns ErrNotInitialized
@@ -185,8 +203,16 @@ func secretMatches(sec gopass.Secret, q string) bool {
 		return false
 	}
 	for _, k := range sec.Keys() {
-		if strings.Contains(strings.ToLower(k), q) {
+		lk := strings.ToLower(k)
+		if strings.Contains(lk, q) {
 			return true
+		}
+		// Values of secret-like keys (a field literally named "password",
+		// "secret", or "field.password" / "field.api_secret" etc.) must not
+		// be searchable — the key name is, the value is not. Same guard the
+		// fake store applies, kept in sync here.
+		if isSecretLikeKey(lk) {
+			continue
 		}
 		if v, ok := sec.Get(k); ok && strings.Contains(strings.ToLower(v), q) {
 			return true
@@ -196,6 +222,15 @@ func secretMatches(sec gopass.Secret, q string) bool {
 		return true
 	}
 	return false
+}
+
+// isSecretLikeKey is the shared rule: any key whose terminal segment
+// contains "password" or "secret" is treated as value-opaque for search.
+// We strip the field. prefix first so "field.api_secret" is classified
+// by the suffix ("api_secret") rather than the prefix.
+func isSecretLikeKey(lowerKey string) bool {
+	name := strings.TrimPrefix(lowerKey, fieldKeyPrefix)
+	return strings.Contains(name, "password") || strings.Contains(name, "secret")
 }
 
 // Get returns the decrypted entry at path.
@@ -224,6 +259,12 @@ func (s *Store) Set(ctx context.Context, e *Entry) error {
 		// Always persist in RFC3339 UTC so parsing is unambiguous.
 		_ = sec.Set("rotated_at", e.RotatedAt.UTC().Format(time.RFC3339))
 	}
+	// Domain is canonicalised before persisting so every on-disk value
+	// is comparable byte-for-byte regardless of how the user spelt it
+	// when calling `mys add --domain`.
+	if d := NormalizeDomain(e.Domain); d != "" {
+		_ = sec.Set("domain", d)
+	}
 	if len(e.Tags) > 0 {
 		// Store tags as a single comma-separated header; gopass Get returns
 		// the first value for a key anyway.
@@ -238,6 +279,19 @@ func (s *Store) Set(ctx context.Context, e *Entry) error {
 	}
 	if e.TOTPPeriod > 0 {
 		_ = sec.Set("totp_period", fmt.Sprintf("%d", e.TOTPPeriod))
+	}
+	// Fields are serialised as field.<key>: <value> headers. We iterate a
+	// sorted key list so the on-disk representation is deterministic across
+	// rewrites — helpful for diff-based auditing of the gopass git tree.
+	if len(e.Fields) > 0 {
+		keys := make([]string, 0, len(e.Fields))
+		for k := range e.Fields {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			_ = sec.Set(fieldKeyPrefix+k, e.Fields[k])
+		}
 	}
 	return s.gp.Set(ctx, e.Path, sec)
 }
@@ -350,6 +404,31 @@ func entryFromSecret(path string, sec gopass.Secret) *Entry {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
 			e.TOTPPeriod = n
 		}
+	}
+	if v, ok := sec.Get("domain"); ok {
+		// Defensive: canonicalise even when we read it back, so a legacy
+		// entry written before the Set-normalisation lands here as a
+		// predictable lowercase host.
+		e.Domain = NormalizeDomain(v)
+	}
+	// Harvest any field.<key> headers into the Fields map. We do the prefix
+	// check on the raw key so no other header-space collisions leak in.
+	for _, k := range sec.Keys() {
+		if !strings.HasPrefix(k, fieldKeyPrefix) {
+			continue
+		}
+		name := strings.TrimPrefix(k, fieldKeyPrefix)
+		if name == "" {
+			continue
+		}
+		v, ok := sec.Get(k)
+		if !ok {
+			continue
+		}
+		if e.Fields == nil {
+			e.Fields = make(map[string]string)
+		}
+		e.Fields[name] = v
 	}
 	return e
 }
