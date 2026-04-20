@@ -55,8 +55,29 @@ type initOptions struct {
 	In  io.Reader
 	Out io.Writer
 
+	// inReader wraps opts.In once, so multiple prompts can read from the
+	// same buffered source without losing bytes between them. The naive
+	// pattern of calling bufio.NewReader(opts.In) at every prompt drops
+	// everything the previous reader buffered ahead — piped input then
+	// only reaches the first prompt. Lazy-initialised on first use.
+	inReader *bufio.Reader
+
 	// Injectable hooks for tests. Nil falls back to the real thing.
 	readPassphrase func(prompt string) (string, error)
+}
+
+// stdinReader returns the shared buffered reader bound to opts.In.
+// Subsequent calls return the SAME reader so buffered bytes survive
+// across prompts.
+func (o *initOptions) stdinReader() *bufio.Reader {
+	if o.inReader == nil {
+		src := o.In
+		if src == nil {
+			src = os.Stdin
+		}
+		o.inReader = bufio.NewReader(src)
+	}
+	return o.inReader
 }
 
 // initCmd builds the `mys init` subcommand.
@@ -279,7 +300,7 @@ func resolveNameEmail(opts *initOptions) (string, string, error) {
 			return "", "", fmt.Errorf(
 				"cannot derive name/email in --yes mode; pass --name/--email or set git config user.name/user.email")
 		}
-		br := bufio.NewReader(opts.In)
+		br := opts.stdinReader()
 		if name == "" {
 			fmt.Fprint(opts.Out, "Full name for the new GPG key: ")
 			line, err := br.ReadString('\n')
@@ -367,7 +388,7 @@ func promptSelectKey(opts *initOptions, keys []gpgsetup.KeyInfo) (gpgsetup.KeyIn
 	for i, k := range keys {
 		fmt.Fprintf(opts.Out, "  [%d] %s (%s)\n", i+1, uidOrFingerprint(k), shortFpr(k.Fingerprint))
 	}
-	br := bufio.NewReader(opts.In)
+	br := opts.stdinReader()
 	for {
 		fmt.Fprintf(opts.Out, "Selection [1]: ")
 		line, err := br.ReadString('\n')
@@ -497,7 +518,7 @@ func promptInstallPinentryMac(opts *initOptions) (bool, error) {
 		fmt.Fprintln(opts.Out, "Installiere Homebrew unter https://brew.sh und re-run.")
 		return false, nil
 	}
-	br := bufio.NewReader(opts.In)
+	br := opts.stdinReader()
 	for {
 		fmt.Fprint(opts.Out, "Jetzt `brew install pinentry-mac`? [j/N]: ")
 		line, err := br.ReadString('\n')
@@ -630,7 +651,7 @@ func promptSkillInstall(opts *initOptions) (string, bool, error) {
 	fmt.Fprintln(opts.Out, "  [l]okal   — <CWD>/.claude/skills/my-secrets (nur aktuelles Projekt)")
 	fmt.Fprintln(opts.Out, "  [n]ein    — überspringen")
 	fmt.Fprintln(opts.Out, "")
-	br := bufio.NewReader(opts.In)
+	br := opts.stdinReader()
 	for {
 		fmt.Fprint(opts.Out, "Auswahl [g/l/n] (default: g): ")
 		line, err := br.ReadString('\n')
@@ -723,7 +744,7 @@ func promptSync(opts *initOptions) (bool, error) {
 	fmt.Fprintln(opts.Out, "Orgs, oder ein eigenes Repo pro Org (jasp, zuhause, …).")
 	fmt.Fprintln(opts.Out, "Scope bleibt persönlich: für Team-Sharing gibt es Bitwarden.")
 	fmt.Fprintln(opts.Out, "")
-	br := bufio.NewReader(opts.In)
+	br := opts.stdinReader()
 	for {
 		fmt.Fprint(opts.Out, "Jetzt einrichten? [j/N]: ")
 		line, err := br.ReadString('\n')

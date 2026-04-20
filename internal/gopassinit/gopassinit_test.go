@@ -9,8 +9,10 @@ import (
 	"testing"
 )
 
-// TestDefaultStoreDir covers the env-var override and the fallback to
-// the user's HOME.
+// TestDefaultStoreDir covers the env-var override and the HOME fallback.
+// The gopass-config branch (priority 2) is covered separately by the
+// integration tests that set up a real gopass store — it cannot be
+// unit-tested without either a gopass stub or a fake PATH.
 func TestDefaultStoreDir(t *testing.T) {
 	t.Setenv("PASSWORD_STORE_DIR", "/tmp/custom-store")
 	got, err := DefaultStoreDir()
@@ -21,7 +23,11 @@ func TestDefaultStoreDir(t *testing.T) {
 		t.Fatalf("env override: got %q, want /tmp/custom-store", got)
 	}
 
+	// For the HOME fallback to trigger in isolation we need gopass NOT
+	// to be on PATH — otherwise the gopass-config branch wins and the
+	// test asserts against the wrong priority level.
 	os.Unsetenv("PASSWORD_STORE_DIR")
+	t.Setenv("PATH", t.TempDir()) // empty dir → no gopass binary
 	t.Setenv("HOME", "/tmp/fake-home")
 	got, err = DefaultStoreDir()
 	if err != nil {

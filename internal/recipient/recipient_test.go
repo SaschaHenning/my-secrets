@@ -88,11 +88,15 @@ func TestParseKeyDetails_NoExpiry(t *testing.T) {
 	}
 }
 
+// Realistic gopass output: the "0x..." header contains the short key id
+// (the LAST 16 chars of the fingerprint), with the full 40-char
+// fingerprint listed on the line below. The parser must deduplicate
+// these pairs so we return one Recipient per key, not two.
 const gopassRecipientsFixture = `gopass
 └── gpg
-    ├── 0xAAAA1111BBBB2222 - Alice Example <alice@example.org>
+    ├── 0xDDDD4444EEEE5555 - Alice Example <alice@example.org>
     │   AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555
-    └── 0xDDDDEEEEFFFF0000 - Bob Builder <bob@example.org>
+    └── 0x3333444455556666 - Bob Builder <bob@example.org>
         DDDDEEEEFFFF0000111122223333444455556666
 `
 
