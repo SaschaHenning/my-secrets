@@ -61,27 +61,52 @@ Expire-Date: 1y
 	return fpr
 }
 
-// TestPaperExportIntegration pipes gpg --export-secret-keys through
-// paperkey and asserts the output is non-empty and recognisable as a
-// paperkey document. Skipped when paperkey or gpg is missing.
-func TestPaperExportIntegration(t *testing.T) {
+// TestPaperExportIntegration_Base16 asserts the default format is a
+// printable ASCII paperkey document (hex + comments with per-line
+// CRC). Skipped when paperkey or gpg is missing.
+func TestPaperExportIntegration_Base16(t *testing.T) {
 	if _, err := exec.LookPath("paperkey"); err != nil {
 		t.Skip("paperkey not on PATH — skipping (install with `brew install paperkey`)")
 	}
 	fpr := setupThrowawayGPG(t)
 
 	var out bytes.Buffer
-	if err := PaperExport(context.Background(), &out, fpr); err != nil {
-		t.Fatalf("PaperExport: %v", err)
+	if err := PaperExport(context.Background(), &out, fpr, PaperBase16); err != nil {
+		t.Fatalf("PaperExport base16: %v", err)
 	}
 	if out.Len() == 0 {
 		t.Fatal("paperkey output is empty")
 	}
-	// paperkey --output-type raw emits a hex+checksum document. The first
-	// non-comment line typically starts with metadata about the key. We
-	// only assert non-empty + contains at least one hex-looking token.
+	// Base16 paperkey output is printable text with a "# Secret Key
+	// Data" header or comment lines introduced by '#'. We assert the
+	// output is 7-bit-clean ASCII to catch accidental regressions back
+	// to the binary 'raw' format.
+	for i, b := range out.Bytes() {
+		if b > 0x7e && b != '\n' && b != '\r' && b != '\t' {
+			t.Fatalf("non-ASCII byte 0x%02x at offset %d — base16 output should be printable", b, i)
+		}
+	}
 	if !bytes.ContainsAny(out.Bytes(), "0123456789abcdefABCDEF") {
 		t.Errorf("paperkey output contains no hex: %q", out.String())
+	}
+}
+
+// TestPaperExportIntegration_Raw verifies that PaperRaw still produces
+// non-empty output (the compact binary format). We don't assert on
+// byte-level contents because the raw format is intentionally
+// opaque — we only guarantee it routes through paperkey successfully.
+func TestPaperExportIntegration_Raw(t *testing.T) {
+	if _, err := exec.LookPath("paperkey"); err != nil {
+		t.Skip("paperkey not on PATH — skipping (install with `brew install paperkey`)")
+	}
+	fpr := setupThrowawayGPG(t)
+
+	var out bytes.Buffer
+	if err := PaperExport(context.Background(), &out, fpr, PaperRaw); err != nil {
+		t.Fatalf("PaperExport raw: %v", err)
+	}
+	if out.Len() == 0 {
+		t.Fatal("paperkey raw output is empty")
 	}
 }
 

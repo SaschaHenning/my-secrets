@@ -44,6 +44,7 @@ team sharing instead.`,
 func keyBackupCmd(requester *string) *cobra.Command {
 	var (
 		paper     bool
+		paperRaw  bool
 		armored   bool
 		symmetric bool
 		status    bool
@@ -57,8 +58,11 @@ func keyBackupCmd(requester *string) *cobra.Command {
 
 Three modes, exactly one required:
 
-  --paper      Runs paperkey on the secret-key export. Default output is
-               stdout ("pipe into lp"); use --out FILE to save.
+  --paper      Runs paperkey on the secret-key export. Output is
+               base16 (printable, hand-copiable hex with per-line CRC).
+               Add --paper-raw for the compact binary encoding (only
+               useful as input to a QR encoder or similar). Use
+               --out FILE to save, or pipe into lp / qrencode.
 
   --armored    Writes the ASCII-armored secret key. With --symmetric the
                export is additionally wrapped in gpg --symmetric
@@ -163,7 +167,11 @@ for team sharing.`,
 					writeKeyBackupAudit(ctx, a, *requester, method, fpr, audit.ResultError, ierr.Error())
 					return ierr
 				}
-				err = keybackup.PaperExport(ctx, w, keyID)
+				format := keybackup.PaperBase16
+				if paperRaw {
+					format = keybackup.PaperRaw
+				}
+				err = keybackup.PaperExport(ctx, w, keyID, format)
 			case armored:
 				err = keybackup.ArmoredExport(ctx, w, keyID, symmetric, passphrase)
 			}
@@ -191,7 +199,8 @@ for team sharing.`,
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&paper, "paper", false, "produce a paperkey-encoded backup (needs `paperkey`)")
+	c.Flags().BoolVar(&paper, "paper", false, "produce a paperkey-encoded backup (needs `paperkey`; default format is base16 / printable)")
+	c.Flags().BoolVar(&paperRaw, "paper-raw", false, "use paperkey's compact binary format instead of printable base16 (for QR-encoding etc.)")
 	c.Flags().BoolVar(&armored, "armored", false, "produce an ASCII-armored secret-key backup")
 	c.Flags().BoolVar(&symmetric, "symmetric", false, "wrap --armored output in gpg --symmetric (AES256)")
 	c.Flags().BoolVar(&status, "status", false, "list recorded backups (metadata only) and exit")
