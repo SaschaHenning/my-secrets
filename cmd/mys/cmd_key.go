@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 
@@ -152,6 +153,16 @@ for team sharing.`,
 
 			switch {
 			case paper:
+				// Paperkey is an optional dependency — offer to install
+				// it rather than bouncing the user out with a bare
+				// error. Analogous to the pinentry-mac install prompt
+				// in `mys init`. Non-interactive sessions (piped stdin
+				// or --no-install) skip the prompt and let the
+				// existing "not on PATH" error surface.
+				if ierr := ensurePaperkey(ctx, cmd.OutOrStdout(), cmd.InOrStdin(), cmd.ErrOrStderr()); ierr != nil {
+					writeKeyBackupAudit(ctx, a, *requester, method, fpr, audit.ResultError, ierr.Error())
+					return ierr
+				}
 				err = keybackup.PaperExport(ctx, w, keyID)
 			case armored:
 				err = keybackup.ArmoredExport(ctx, w, keyID, symmetric, passphrase)
@@ -287,4 +298,74 @@ func writeKeyBackupAudit(ctx context.Context, a *app.App, override string, metho
 		Result:      result,
 		Reason:      r,
 	})
+}
+
+// ensurePaperkey makes sure the `paperkey` binary is on PATH, offering
+// to install it via Homebrew if it is missing and the session is
+// interactive. Mirrors the pinentry-mac install prompt in `mys init`.
+//
+// Returns nil if paperkey is already available or was successfully
+// installed. Returns an error with an actionable install hint in every
+// other case (user declined, brew missing, install failed, …) so the
+// caller can surface it verbatim.
+func ensurePaperkey(ctx context.Context, out io.Writer, in io.Reader, errOut io.Writer) error {
+	if _, err := exec.LookPath("paperkey"); err == nil {
+		return nil
+	}
+	// Skip the prompt if stdin is not an interactive terminal: scripted
+	// / piped invocations should still get the crisp "not on PATH"
+	// error rather than hang on a y/n question nobody can answer.
+	if !isInteractiveStdin() {
+		return errors.New("paperkey not on PATH (install with `brew install paperkey`)")
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "`paperkey` ist nicht installiert.")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "`paperkey` destilliert aus deinem GPG-Secret-Key den minimalen")
+	fmt.Fprintln(out, "geheimen Teil — klein genug, um ihn zu drucken oder ins Feuerwehr-")
+	fmt.Fprintln(out, "Tresor-Fach zu legen. Ohne Binary kein `--paper`-Backup.")
+	fmt.Fprintln(out)
+	if _, err := exec.LookPath("brew"); err != nil {
+		fmt.Fprintln(out, "`brew` ist nicht auf PATH — Installation wird hier übersprungen.")
+		fmt.Fprintln(out, "Installiere Homebrew unter https://brew.sh oder paperkey manuell,")
+		fmt.Fprintln(out, "dann re-run `mys key backup --paper`.")
+		return errors.New("paperkey not on PATH (install with `brew install paperkey`)")
+	}
+	br := bufio.NewReader(in)
+	for {
+		fmt.Fprint(out, "Jetzt `brew install paperkey`? [j/N]: ")
+		line, err := br.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("read answer: %w", err)
+		}
+		choice := strings.ToLower(strings.TrimSpace(line))
+		switch choice {
+		case "", "n", "nein", "no":
+			return errors.New("paperkey not on PATH (install with `brew install paperkey`)")
+		case "j", "ja", "y", "yes":
+			fmt.Fprintln(out, "→ brew install paperkey …")
+			cmd := exec.CommandContext(ctx, "brew", "install", "paperkey")
+			cmd.Stdout = out
+			cmd.Stderr = errOut
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("brew install paperkey failed: %w", err)
+			}
+			if _, err := exec.LookPath("paperkey"); err != nil {
+				return errors.New("paperkey installed via brew but still not on PATH — open a new shell and retry")
+			}
+			return nil
+		default:
+			fmt.Fprintln(out, "Bitte j oder n.")
+		}
+	}
+}
+
+// isInteractiveStdin reports whether stdin is attached to a TTY.
+// Wrapped as a function so tests can override it.
+var isInteractiveStdin = func() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
 }

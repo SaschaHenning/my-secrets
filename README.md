@@ -243,7 +243,7 @@ mys doctor — 2026-04-20 16:43:01
 [PASS] audit log gaps — no gaps (142 rows)
 [SKIP] signed audit chain — signed mode not enabled (MYS_AUDIT_SIGN unset)
 [WARN] paperkey backup recorded — no paperkey backup recorded
-         -> create one with `mys paperkey backup`
+         -> create one with `mys key backup --paper`
 [WARN] scope policy file — missing at …/scope-policy.yaml (using baked-in defaults)
          -> run `mys init` to write the default policy
 

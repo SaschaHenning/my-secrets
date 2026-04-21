@@ -580,7 +580,7 @@ func CheckPaperkeyBackup(_ context.Context) Check {
 	if err != nil {
 		c.Status = StatusWarn
 		c.Message = "no paperkey backup recorded"
-		c.Remedy = "create one with `mys paperkey backup`"
+		c.Remedy = "create one with `mys key backup --paper`"
 		return c
 	}
 	// Accept either a JSON array or an object with an „entries" array — we
@@ -589,7 +589,7 @@ func CheckPaperkeyBackup(_ context.Context) Check {
 	if trim == "" || trim == "[]" || trim == "{}" {
 		c.Status = StatusWarn
 		c.Message = "backups.json is empty"
-		c.Remedy = "create one with `mys paperkey backup`"
+		c.Remedy = "create one with `mys key backup --paper`"
 		return c
 	}
 	var arr []backupEntry
@@ -597,7 +597,7 @@ func CheckPaperkeyBackup(_ context.Context) Check {
 		if len(arr) == 0 {
 			c.Status = StatusWarn
 			c.Message = "backups.json has 0 entries"
-			c.Remedy = "create one with `mys paperkey backup`"
+			c.Remedy = "create one with `mys key backup --paper`"
 			return c
 		}
 		c.Status = StatusPass
@@ -614,7 +614,7 @@ func CheckPaperkeyBackup(_ context.Context) Check {
 	}
 	c.Status = StatusWarn
 	c.Message = "backups.json present but no entries parsed"
-	c.Remedy = "check the file format or re-create with `mys paperkey backup`"
+	c.Remedy = "check the file format or re-create with `mys key backup --paper`"
 	return c
 }
 
