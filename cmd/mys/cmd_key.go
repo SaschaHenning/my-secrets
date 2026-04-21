@@ -203,8 +203,21 @@ for team sharing.`,
 // openBackupWriter returns a writer for the backup payload plus a cleanup
 // function. An empty path streams to stdout. Files are created 0600, with
 // O_EXCL to avoid silently overwriting an existing backup.
+//
+// Safety gate: if the caller did NOT pass --out AND stdout is an
+// interactive terminal, refuse. The backup payload is secret-key
+// material; dumping it into the user's terminal scrollback defeats
+// every other precaution mys takes. On a TTY the operator must pick
+// a concrete destination (`--out <file>`) or pipe into something
+// (`| lp`, `| qrencode`, …). Scripted/pipe invocations are unaffected.
 func openBackupWriter(cmd *cobra.Command, outPath string) (io.Writer, func(), error) {
 	if outPath == "" {
+		if isStdoutTTY() {
+			return nil, func() {}, errors.New(
+				"refusing to write secret-key material to an interactive terminal — " +
+					"pass `--out <file>` to save to disk, or pipe into a downstream " +
+					"command (e.g. `mys key backup --paper | lp` or `| qrencode …`)")
+		}
 		return cmd.OutOrStdout(), func() {}, nil
 	}
 	f, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -213,6 +226,17 @@ func openBackupWriter(cmd *cobra.Command, outPath string) (io.Writer, func(), er
 	}
 	cleanup := func() { _ = f.Close() }
 	return f, cleanup, nil
+}
+
+// isStdoutTTY reports whether the current process's stdout is a
+// terminal. Wrapped as a variable so tests can flip it without
+// juggling file descriptors.
+var isStdoutTTY = func() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
 // readSymmetricPassphrase obtains the AES passphrase. When stdin is piped

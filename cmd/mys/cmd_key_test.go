@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/keybackup"
+	"github.com/spf13/cobra"
 )
 
 // withFakeHome redirects $HOME so `mys key backup --status` reads our test
@@ -155,6 +156,52 @@ func TestEnsurePaperkey_NonInteractiveReturnsInstallHint(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("non-interactive branch must not write explainer text, got: %q", out.String())
+	}
+}
+
+// TestOpenBackupWriter_RefusesTTY ensures we never stream secret-key
+// material into an interactive terminal's scrollback. An empty --out
+// combined with a TTY stdout must return an error that names the safe
+// alternatives (`--out <file>` or pipe).
+func TestOpenBackupWriter_RefusesTTY(t *testing.T) {
+	prev := isStdoutTTY
+	isStdoutTTY = func() bool { return true }
+	t.Cleanup(func() { isStdoutTTY = prev })
+
+	_, _, err := openBackupWriter(nil, "")
+	if err == nil {
+		t.Fatal("expected error when stdout is a TTY and --out is empty")
+	}
+	for _, want := range []string{"--out", "|"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q, got: %v", want, err)
+		}
+	}
+}
+
+// TestOpenBackupWriter_AllowsPipedStdout verifies the scripted path:
+// no --out, stdout piped/redirected, must pass through so
+// `mys key backup --paper | lp` still works.
+func TestOpenBackupWriter_AllowsPipedStdout(t *testing.T) {
+	prev := isStdoutTTY
+	isStdoutTTY = func() bool { return false }
+	t.Cleanup(func() { isStdoutTTY = prev })
+
+	// A minimal Cobra command is enough to supply cmd.OutOrStdout().
+	var buf bytes.Buffer
+	fake := &cobra.Command{}
+	fake.SetOut(&buf)
+
+	w, cleanup, err := openBackupWriter(fake, "")
+	if err != nil {
+		t.Fatalf("piped stdout must be allowed: %v", err)
+	}
+	defer cleanup()
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if buf.String() != "hello" {
+		t.Errorf("output not routed through cmd writer, got: %q", buf.String())
 	}
 }
 
