@@ -193,11 +193,26 @@ func ResolveFingerprint(ctx context.Context) (string, error) {
 	return "", errors.New("no GPG secret key fingerprint found — run `gpg --list-secret-keys` to check")
 }
 
-// PaperExport streams the paperkey-raw encoding of the secret key identified
-// by keyID to w. keyID may be a fingerprint, long key ID, or email; an empty
-// string lets gpg pick its default secret key. The caller is responsible for
-// flushing / closing w.
-func PaperExport(ctx context.Context, w io.Writer, keyID string) error {
+// PaperFormat selects the paperkey output encoding. Base16 is the
+// default because a "paper key" backup is expected to be printable and
+// hand-copiable; Raw is a compact binary blob suitable for QR-encoding
+// or downstream tooling that expects the original paperkey format.
+type PaperFormat int
+
+const (
+	// PaperBase16 is printable hex (paperkey's own default). Each line
+	// carries a CRC-24 so hand-copy errors are detectable.
+	PaperBase16 PaperFormat = iota
+	// PaperRaw is the compact binary encoding. Only useful as input to
+	// something that re-encodes it (QR, base64, …).
+	PaperRaw
+)
+
+// PaperExport streams the paperkey-encoded secret key identified by
+// keyID to w using the chosen format. keyID may be a fingerprint, long
+// key ID, or email; an empty string lets gpg pick its default secret
+// key. The caller is responsible for flushing / closing w.
+func PaperExport(ctx context.Context, w io.Writer, keyID string, format PaperFormat) error {
 	if err := RequireBinaries("gpg", "paperkey"); err != nil {
 		return err
 	}
@@ -206,7 +221,14 @@ func PaperExport(ctx context.Context, w io.Writer, keyID string) error {
 		args = append(args, keyID)
 	}
 	exportCmd := exec.CommandContext(ctx, "gpg", args...)
-	paperCmd := exec.CommandContext(ctx, "paperkey", "--output-type", "raw")
+	// Base16 is paperkey's own default; we pass `--output-type base16`
+	// explicitly anyway so the behaviour survives future paperkey
+	// releases that might change their default.
+	paperArgs := []string{"--output-type", "base16"}
+	if format == PaperRaw {
+		paperArgs = []string{"--output-type", "raw"}
+	}
+	paperCmd := exec.CommandContext(ctx, "paperkey", paperArgs...)
 
 	pipe, err := exportCmd.StdoutPipe()
 	if err != nil {
