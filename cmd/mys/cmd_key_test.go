@@ -133,3 +133,50 @@ func TestKeyBackupModeValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestEnsurePaperkey_NonInteractiveReturnsInstallHint verifies that
+// when paperkey is missing AND stdin is not a TTY, ensurePaperkey
+// returns the crisp install-hint error instead of hanging on an
+// unanswerable y/n prompt. Scripted / piped invocations rely on this.
+func TestEnsurePaperkey_NonInteractiveReturnsInstallHint(t *testing.T) {
+	// Pretend paperkey is missing by shadowing PATH.
+	t.Setenv("PATH", t.TempDir())
+	prev := isInteractiveStdin
+	isInteractiveStdin = func() bool { return false }
+	t.Cleanup(func() { isInteractiveStdin = prev })
+
+	var out, errOut bytes.Buffer
+	err := ensurePaperkey(t.Context(), &out, bytes.NewReader(nil), &errOut)
+	if err == nil {
+		t.Fatal("expected error when paperkey missing + non-interactive, got nil")
+	}
+	if !strings.Contains(err.Error(), "brew install paperkey") {
+		t.Errorf("error should name the brew install command, got: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Errorf("non-interactive branch must not write explainer text, got: %q", out.String())
+	}
+}
+
+// TestEnsurePaperkey_InteractiveDecline verifies that an interactive
+// user who answers "n" gets the same install-hint error and the brew
+// command is NOT invoked.
+func TestEnsurePaperkey_InteractiveDecline(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	prev := isInteractiveStdin
+	isInteractiveStdin = func() bool { return true }
+	t.Cleanup(func() { isInteractiveStdin = prev })
+
+	var out, errOut bytes.Buffer
+	// Empty answer = default = n.
+	err := ensurePaperkey(t.Context(), &out, strings.NewReader("\n"), &errOut)
+	if err == nil {
+		t.Fatal("expected error when user declines install, got nil")
+	}
+	if !strings.Contains(err.Error(), "brew install paperkey") {
+		t.Errorf("error should name the brew install command, got: %v", err)
+	}
+	if !strings.Contains(out.String(), "paperkey") {
+		t.Errorf("interactive branch must print the explainer, got: %q", out.String())
+	}
+}
