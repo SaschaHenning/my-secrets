@@ -572,8 +572,12 @@ func TestIsMountPristine(t *testing.T) {
 // path is actually exercised: with mount == DefaultStoreMount the flag
 // is omitted and the test would pass incidentally.
 func TestGopassGitPull_ExplicitOriginBranch(t *testing.T) {
+	// rev-parse output includes the real gopass „⚠ Running '...' in
+	// <path>..." banner that gopass prefixes onto git subcommand
+	// stdout. currentGitBranch must strip it; otherwise the banner
+	// leaks into the refspec (regression seen in production after #51).
 	r := runnerFor(map[string]scriptedResult{
-		"gopass git --store work rev-parse --abbrev-ref HEAD": {out: []byte("feature/x\n")},
+		"gopass git --store work rev-parse --abbrev-ref HEAD": {out: []byte("⚠ Running 'git rev-parse --abbrev-ref HEAD' in /home/sascha/.local/share/gopass/stores/work...\nfeature/x\n")},
 		"gopass git --store work pull origin feature/x":       {out: []byte("Already up to date.\n")},
 	})
 	if _, err := GopassGitPull(context.Background(), r, "work"); err != nil {
