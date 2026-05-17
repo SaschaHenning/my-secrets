@@ -562,3 +562,45 @@ func TestIsMountPristine(t *testing.T) {
 		})
 	}
 }
+
+// TestGopassGitPull_ExplicitOriginBranch covers the missing-upstream bug:
+// a bare `git pull` fails when the current branch has no tracking info,
+// so GopassGitPull must resolve the branch and pull explicitly from
+// `origin <branch>`.
+func TestGopassGitPull_ExplicitOriginBranch(t *testing.T) {
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git rev-parse --abbrev-ref HEAD": {out: []byte("main\n")},
+		"gopass git pull origin main":            {out: []byte("Already up to date.\n")},
+	})
+	if _, err := GopassGitPull(context.Background(), r, "root"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !keyStartsWith(r.calls, "gopass", "git", "pull", "origin", "main") {
+		t.Fatalf("expected explicit `gopass git pull origin main`, got calls: %v", r.calls)
+	}
+	if keyStartsWith(r.calls, "gopass", "git", "pull") &&
+		!keyStartsWith(r.calls, "gopass", "git", "pull", "origin") {
+		t.Errorf("must not issue a bare `git pull` when the branch is known")
+	}
+}
+
+// TestGopassGitPull_DetachedHeadFallback ensures we fall back to the
+// historical bare-pull behaviour rather than guessing a branch name
+// when HEAD is detached.
+func TestGopassGitPull_DetachedHeadFallback(t *testing.T) {
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git rev-parse --abbrev-ref HEAD": {out: []byte("HEAD\n")},
+		"gopass git pull":                        {out: []byte("ok")},
+	})
+	if _, err := GopassGitPull(context.Background(), r, "root"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !keyStartsWith(r.calls, "gopass", "git", "pull") {
+		t.Fatalf("expected fallback `gopass git pull`, got calls: %v", r.calls)
+	}
+	for _, c := range r.calls {
+		if len(c) >= 5 && c[2] == "git" && c[3] == "pull" && c[4] == "origin" {
+			t.Errorf("must not guess origin/<branch> on detached HEAD: %v", c)
+		}
+	}
+}

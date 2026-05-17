@@ -332,16 +332,40 @@ func GopassSync(ctx context.Context, r Runner, mount string) ([]byte, error) {
 }
 
 // GopassGitPull runs `gopass git pull` for the given mount.
+//
+// A bare `git pull` requires upstream tracking on the current branch.
+// A store cloned or `gopass git init`-ed without `--set-upstream` (or
+// one whose branch.<name>.* config was lost) has none, and git then
+// aborts with „There is no tracking information for the current
+// branch" → exit 1, which surfaces to the user as a bare
+// „Error: exit status 1". To stay robust regardless of tracking
+// config we resolve the current branch and pull explicitly from
+// `origin <branch>`.
 func GopassGitPull(ctx context.Context, r Runner, mount string) ([]byte, error) {
 	if r == nil {
 		r = ExecRunner{}
 	}
-	args := []string{"git"}
-	if mount != "" && mount != DefaultStoreMount {
-		args = append(args, "--store", mount)
+	branch := currentGitBranch(ctx, r, mount)
+	if branch == "" {
+		// Detached HEAD or branch lookup failed — fall back to the
+		// historical bare-pull behaviour rather than guessing.
+		return GopassGit(ctx, r, mount, "pull")
 	}
-	args = append(args, "pull")
-	return r.Run(ctx, "gopass", args...)
+	return GopassGit(ctx, r, mount, "pull", "origin", branch)
+}
+
+// currentGitBranch returns the checked-out branch name of the mount's
+// embedded git repo, or "" if HEAD is detached or the lookup fails.
+func currentGitBranch(ctx context.Context, r Runner, mount string) string {
+	out, err := GopassGit(ctx, r, mount, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return ""
+	}
+	branch := strings.TrimSpace(string(out))
+	if branch == "" || branch == "HEAD" {
+		return ""
+	}
+	return branch
 }
 
 // GopassGitInit runs `gopass git init` on the given mount.
