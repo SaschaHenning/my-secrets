@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -560,5 +561,50 @@ func TestIsMountPristine(t *testing.T) {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestGopassGitPull_ExplicitOriginBranch covers the missing-upstream bug:
+// a bare `git pull` fails when the current branch has no tracking info,
+// so GopassGitPull must resolve the branch and pull explicitly from
+// `origin <branch>`.
+// Uses a non-default mount ("work") so the `--store work` forwarding
+// path is actually exercised: with mount == DefaultStoreMount the flag
+// is omitted and the test would pass incidentally.
+func TestGopassGitPull_ExplicitOriginBranch(t *testing.T) {
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git --store work rev-parse --abbrev-ref HEAD": {out: []byte("feature/x\n")},
+		"gopass git --store work pull origin feature/x":       {out: []byte("Already up to date.\n")},
+	})
+	if _, err := GopassGitPull(context.Background(), r, "work"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !keyStartsWith(r.calls, "gopass", "git", "--store", "work", "pull", "origin", "feature/x") {
+		t.Fatalf("expected explicit `gopass git --store work pull origin feature/x`, got calls: %v", r.calls)
+	}
+	if keyStartsWith(r.calls, "gopass", "git", "--store", "work", "pull") &&
+		!keyStartsWith(r.calls, "gopass", "git", "--store", "work", "pull", "origin") {
+		t.Errorf("must not issue a bare `git pull` when the branch is known")
+	}
+}
+
+// TestGopassGitPull_DetachedHeadError ensures a detached HEAD yields a
+// descriptive error instead of a bare `git pull` (which would reproduce
+// the very „exit status 1" this function exists to eliminate).
+func TestGopassGitPull_DetachedHeadError(t *testing.T) {
+	r := runnerFor(map[string]scriptedResult{
+		"gopass git rev-parse --abbrev-ref HEAD": {out: []byte("HEAD\n")},
+	})
+	_, err := GopassGitPull(context.Background(), r, "root")
+	if err == nil {
+		t.Fatalf("expected an error on detached HEAD, got nil")
+	}
+	if !strings.Contains(err.Error(), "detached HEAD") {
+		t.Errorf("error should mention detached HEAD, got: %v", err)
+	}
+	for _, c := range r.calls {
+		if len(c) >= 4 && c[2] == "git" && c[3] == "pull" {
+			t.Errorf("must not issue any `git pull` on detached HEAD: %v", c)
+		}
 	}
 }
