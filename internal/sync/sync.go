@@ -347,9 +347,15 @@ func GopassGitPull(ctx context.Context, r Runner, mount string) ([]byte, error) 
 	}
 	branch := currentGitBranch(ctx, r, mount)
 	if branch == "" {
-		// Detached HEAD or branch lookup failed — fall back to the
-		// historical bare-pull behaviour rather than guessing.
-		return GopassGit(ctx, r, mount, "pull")
+		// Detached HEAD or branch lookup failed. A bare `git pull`
+		// here would reproduce the exact opaque „exit status 1" this
+		// function exists to eliminate, so fail with a descriptive
+		// error instead of re-hitting the same wall.
+		m := mount
+		if m == "" {
+			m = DefaultStoreMount
+		}
+		return nil, fmt.Errorf("gopass store %q has no checked-out branch (detached HEAD) — cannot pull; check out a branch or set upstream tracking", m)
 	}
 	return GopassGit(ctx, r, mount, "pull", "origin", branch)
 }
