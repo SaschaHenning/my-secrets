@@ -6,6 +6,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/spf13/cobra"
@@ -15,10 +18,55 @@ import (
 var Version = "dev"
 
 func main() {
+	ensureGPGTTY()
 	if err := rootCmd().Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func ensureGPGTTY() {
+	if os.Getenv("GPG_TTY") == "" {
+		tty := detectControllingTTY()
+		if tty == "" {
+			return
+		}
+		_ = os.Setenv("GPG_TTY", tty)
+	}
+	_ = exec.Command("gpg-connect-agent", "updatestartuptty", "/bye").Run()
+}
+
+func detectControllingTTY() string {
+	for _, fd := range []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()} {
+		if target, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(int(fd))); err == nil {
+			if tty := normalizeTTY(target); tty != "" {
+				return tty
+			}
+		}
+	}
+
+	out, err := exec.Command("ps", "-o", "tty=", "-p", strconv.Itoa(os.Getpid())).Output()
+	if err != nil {
+		return ""
+	}
+	return normalizeTTY(string(out))
+}
+
+func normalizeTTY(raw string) string {
+	tty := strings.TrimSpace(raw)
+	if tty == "" || tty == "?" || tty == "??" {
+		return ""
+	}
+	if strings.HasPrefix(tty, "pipe:") || strings.HasPrefix(tty, "socket:") {
+		return ""
+	}
+	if strings.HasPrefix(tty, "/dev/") {
+		return tty
+	}
+	if strings.HasPrefix(tty, "pts/") || strings.HasPrefix(tty, "tty") {
+		return "/dev/" + tty
+	}
+	return ""
 }
 
 func rootCmd() *cobra.Command {
