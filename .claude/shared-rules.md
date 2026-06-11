@@ -1,1 +1,1 @@
-/Users/sascha/Code/JASP-Shared/AI-Rules/CLAUDE.md
+../../JASP-Shared/AI-Rules/CLAUDE.md
