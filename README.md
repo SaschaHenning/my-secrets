@@ -16,8 +16,10 @@ Ein schlankes Go-Binary (`mys`), das die [gopass](https://github.com/gopasspw/go
    alles.
 3. **Drei Eintrittspunkte — ein Audit-Pfad.** Interaktives CLI, eingebettete
    Web-UI (`127.0.0.1`, read-only) und MCP-Server über stdio laufen alle
-   durch dieselbe `app`-Orchestrierungsschicht. Für Claude Code ist der
-   MCP-Server die einzige sanktionierte Tür zum Store.
+   durch dieselbe `app`-Orchestrierungsschicht. Für Claude Code ist MCP der
+   bevorzugte Standardweg; Shell-/Skript-Kontexte dürfen nur die `mys`-CLI
+   mit auditierter, consumer-sicherer Ausgabe nutzen. Direkte Store-Backends
+   bleiben tabu.
 
 ## Voraussetzungen
 
@@ -127,6 +129,30 @@ mys audit tail --limit 30
 mys audit tail --actor ai
 mys audit verify                          # prüft Hash-Lücken
 ```
+
+### Consumer-safe output
+
+`mys get <path>` is for humans: it prints a labelled, multi-line record and
+masks the password by default. Do not feed that text into `curl`, `DATABASE_URL`,
+`Authorization`, or other machine consumers.
+
+Use one of the narrow output modes instead:
+
+```bash
+# raw password value for a single process argument/env var
+TOKEN="$(mys get jasp/github-token --field password --reveal)"
+
+# shell env assignments for source/eval workflows
+mys get jasp/github-token --format env --reveal
+
+# machine-readable setup diagnostics
+mys doctor --json
+```
+
+If `mys` is not on `PATH`, use the installed absolute path or run
+`mys doctor` first; do not fall back to `gopass`, `bw`, `op`, `security`, or
+direct password-store reads. `mys doctor` also strips known gopass banner noise
+from its own probes, so prefer it when debugging setup/PATH problems.
 
 ## TOTP / 2FA
 

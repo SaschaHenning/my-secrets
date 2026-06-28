@@ -44,7 +44,9 @@ and its output is no longer machine-bound — handle with care.
 ## Claude / AI containment
 
 The hard guarantee is narrow: **Claude Code, invoked via the MCP server,
-cannot reach a denied path.** Two layers make that stick:
+cannot reach a denied path.** CLI calls through `mys` are also audited and
+policy-checked when used by scripts/shells, but MCP remains the preferred
+Claude Code path. Two layers make the MCP guarantee stick:
 
 1. `cmd/mys mcp` hard-codes `actor_kind=ai` before any App operation runs.
    It is not possible to impersonate `human` through the MCP entry.
@@ -59,7 +61,7 @@ What we explicitly do **not** protect against:
   binary. Mitigation: `$PATH` shaping during onboarding, plus the
   understanding that the whole point of the tool is to make the AI path
   tight — humans can read what they could always read.
-- An AI agent that has shell access and is NOT restricted to MCP tools.
+- An AI agent that has shell access and is NOT restricted to `mys` MCP/CLI.
   The Claude Code skill forbids direct `gopass` / `security` / `bw`
   calls, but a rogue AI with unrestricted bash could bypass this. The
   project-level `.claude/settings.json` should also deny `Read` of

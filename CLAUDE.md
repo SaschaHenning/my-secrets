@@ -32,7 +32,7 @@ See `docs/plan.html` for the full planning overview with three evaluated archite
 - **Caller identification**: PPID walk up to PID 1, env-var inspection (`CLAUDECODE=1`, `ANTHROPIC_*`, `TERM_PROGRAM`), optional explicit `--requester` flag set by the Claude skill.
 - **Org scoping**: gopass folder structure maps to orgs (`jasp/`, `zuhause/`, `private/`), a `scope-policy.yaml` defines which caller classes may access which orgs.
 - **Web UI**: small embedded HTTP server on localhost, reads the audit DB and gopass store read-only, gated behind Touch ID.
-- **MCP server**: the binary can run in MCP mode over stdio — this is the ONLY entry point for Claude Code to read secrets, guaranteeing audit coverage for AI access.
+- **MCP server**: the binary can run in MCP mode over stdio. Claude Code should prefer MCP; scripts and shells may use the `mys` CLI with explicit consumer-safe output. Both routes use the same audited App path.
 - **Bitwarden sync** (optional, explicit, one-way): exports to Bitwarden JSON format; no live cloud backend.
 
 ## Code Style
@@ -49,7 +49,7 @@ The CLI binary is named `mys` (short for my-secrets). Commands follow the patter
 
 ## Security Boundaries
 
-- The binary is the only sanctioned entry point for AI access. The Claude skill must never call `gopass` directly, must never read `~/.password-store` files, must always go through `mys` (CLI or MCP).
+- The binary is the only sanctioned entry point for AI access. The Claude skill must never call `gopass` directly, must never read `~/.password-store` files, and must always go through `mys` (MCP preferred; CLI allowed for scripts/shells with consumer-safe flags).
 - Secrets must never appear in logs, terminal output without `--reveal`, or commit messages.
 - The audit log is append-only; deletion requires an explicit `mys audit purge` command that itself writes an audit entry.
 - Org policy denials are hard failures, never warnings.
