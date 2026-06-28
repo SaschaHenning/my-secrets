@@ -1,19 +1,21 @@
 ---
 name: my-secrets
-description: Access local credentials via the `mys` MCP server. Use when any task needs an API key, token, password, or other secret. Provides list/search/get with org-scoped access and full audit logging.
+description: Access local credentials via `mys`. Use when any task needs an API key, token, password, or other secret. Prefer the MCP tools when available; otherwise use the `mys` CLI with consumer-safe output modes. Provides list/search/get with org-scoped access and full audit logging.
 ---
 
 # my-secrets
 
-Local credential access for Claude Code, routed exclusively through the `mys` MCP server.
+Local credential access for Claude Code, routed through `mys`. Prefer the
+`mys` MCP server when it is configured; use the `mys` CLI for scripts, shell
+commands, or runtimes without the MCP tools.
 
 ## Absolute rules
 
 - **NEVER** read `~/.password-store/` files directly.
-- **NEVER** invoke `gopass`, `security`, `bw`, `op`, or any other credential CLI.
+- **NEVER** invoke direct secret-store backends such as `gopass`, `security`, `bw`, `op`, or password-manager-specific CLIs.
 - **NEVER** log, echo, or print secret values in your own output. Copy them into tool arguments only.
-- **ALWAYS** go through the `mys` MCP server (`creds_list`, `creds_search`, `creds_get`). No shell fallback.
-- If the MCP server is not available, tell the user — do not try to work around it.
+- **ALWAYS** go through `mys`: MCP tools (`creds_list`, `creds_search`, `creds_get`) or the `mys` CLI. No direct store fallback.
+- If `mys` denies an operation, do not retry with a backend tool. Tell the user what was denied and wait for guidance.
 
 ## Tools exposed by the MCP server
 
@@ -25,9 +27,27 @@ Local credential access for Claude Code, routed exclusively through the `mys` MC
 
 The MCP server enforces a scope policy (`~/.config/my-secrets/scope-policy.yaml`). Denied calls return `{ "denied": true, "reason": "..." }` — **never retry on deny**. Tell the user what was denied and wait for guidance.
 
+## CLI fallback and consumer-safe output
+
+Use `/home/sascha/bin/mys` if `mys` is not on `PATH`.
+
+`mys get <path>` is human-readable output: it prints a labelled record and
+masks the password by default. Do not pass that whole output into another
+program. For machine consumers use one of these narrow forms:
+
+| Need | Command |
+|---|---|
+| Raw secret value for the current process only | `mys get <path> --field password --reveal --requester ai` |
+| Shell env assignments | `mys get <path> --format env --reveal --requester ai` |
+| Setup/PATH diagnostics | `mys doctor --json --requester ai` |
+
+Never use `$(mys get <path>)` without `--field password --reveal` when a raw
+token/password is expected. If gopass or shell banners appear while debugging,
+run `mys doctor` instead of scraping backend command output.
+
 ## Org inference
 
-Before calling `creds_get` or `creds_list`, infer the org from the project context:
+Before calling `creds_get`, `creds_list`, `mys get`, or `mys ls`, infer the org from the project context:
 
 | CWD pattern | Org |
 |---|---|
