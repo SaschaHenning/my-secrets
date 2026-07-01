@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -1315,6 +1317,12 @@ func TestPathTraversal_PolicyAndStoreAgreeOnBytes(t *testing.T) {
 			t.Fatal("want denied/invalid-path error, got nil")
 		}
 	})
+	t.Run("History", func(t *testing.T) {
+		a, _ := appWithFake(t, "claude-code", entries...)
+		if _, err := a.History(context.Background(), traversal, 10); err == nil {
+			t.Fatal("want denied/invalid-path error, got nil")
+		}
+	})
 	t.Run("GenerateTOTP", func(t *testing.T) {
 		a, _ := appWithFake(t, "claude-code", entries...)
 		if _, _, err := a.GenerateTOTP(context.Background(), traversal, time.Now()); err == nil {
@@ -1413,6 +1421,66 @@ func TestInspect_DoesNotWriteGetRow(t *testing.T) {
 	getRows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionGet, Limit: 5})
 	if len(getRows) != 0 {
 		t.Fatalf("Inspect must not write ActionGet rows, got %d", len(getRows))
+	}
+}
+
+// gitRepoForHistory creates a minimal real git repo with one commit
+// touching jasp/github.gpg, and points PASSWORD_STORE_DIR at it so
+// App.History's underlying history.Log call resolves against a real
+// repo rather than the fake store (History never touches store.Interface
+// at all — it only shells out to git).
+func gitRepoForHistory(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "Test")
+	full := filepath.Join(dir, "jasp", "github.gpg")
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "jasp/github.gpg")
+	run("commit", "-q", "-m", "add jasp/github")
+	t.Setenv("PASSWORD_STORE_DIR", dir)
+}
+
+func TestHistory_OK(t *testing.T) {
+	gitRepoForHistory(t)
+	a, _ := appWithFake(t, "human", sampleEntries()...)
+	revs, err := a.History(context.Background(), "jasp/github", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(revs) != 1 || revs[0].Message != "add jasp/github" {
+		t.Fatalf("unexpected revisions: %+v", revs)
+	}
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionHistory, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultOK {
+		t.Fatalf("want one ok history audit row, got %+v", rows)
+	}
+}
+
+func TestHistory_Denied(t *testing.T) {
+	a, _ := appWithFake(t, "claude-code", sampleEntries()...)
+	if _, err := a.History(context.Background(), "private/bank", 10); err == nil {
+		t.Fatal("want denied error")
+	}
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionHistory, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultDenied {
+		t.Fatalf("want one denied history audit row, got %+v", rows)
 	}
 }
 

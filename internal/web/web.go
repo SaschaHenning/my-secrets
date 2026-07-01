@@ -591,17 +591,28 @@ func renderMaskedEntry(w http.ResponseWriter, r *http.Request, a *app.App, path,
 // renderEntry looks up "last read" for e.Path via audit.Log.LastAccess —
 // a best-effort UI enhancement, not a security control, so a query error
 // degrades to "never shown" rather than failing the whole page.
+// historyLimit caps how many git-log revisions the entry detail page
+// requests — this is a UI convenience list, not an audit trail; the full
+// history remains available via `git -C <store> log` for anyone who
+// needs it.
+const historyLimit = 10
+
 func renderEntry(w http.ResponseWriter, r *http.Request, a *app.App, e *store.Entry, revealed bool, errMsg string) {
 	var lastRead time.Time
 	if a.Audit != nil {
 		lastRead, _ = a.Audit.LastAccess(r.Context(), e.Path)
 	}
+	// Best-effort: a history error (denied/git unavailable/no repo)
+	// degrades to an empty list, never a failed page — this mirrors how
+	// history.Log itself fails soft for anything below policy denial.
+	revisions, _ := a.History(r.Context(), e.Path, historyLimit)
 	data := map[string]any{
 		"Page":     "entries",
 		"Entry":    e,
 		"Revealed": revealed,
 		"Error":    errMsg,
 		"LastRead": lastRead,
+		"History":  revisions,
 	}
 	if err := templates.ExecuteTemplate(w, "entry.html", data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

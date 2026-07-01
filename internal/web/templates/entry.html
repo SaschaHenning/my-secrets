@@ -57,6 +57,24 @@
     {{range .Entry.Tags}}<span class="tag">{{.}}</span>{{end}}
   </div>
   {{end}}
+
+  {{if .History}}
+  <details class="history" open>
+    <summary>Historie ({{len .History}})</summary>
+    <table class="audit" style="margin-top:0.5rem;">
+      <thead><tr><th>commit</th><th>zeit</th><th>nachricht</th></tr></thead>
+      <tbody>
+      {{range .History}}
+        <tr>
+          <td><code>{{printf "%.7s" .Hash}}</code></td>
+          <td>{{shortTime .When}}</td>
+          <td>{{.Message}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </details>
+  {{end}}
 </section>
 
 </main>

@@ -371,6 +371,13 @@ Login-Session, die nur fürs Browsen der maskierten Ansicht reicht. Jeder
 Reveal erzeugt exakt dieselbe Audit-Zeile wie `mys get --reveal`. Bindet
 ausschließlich auf das Loopback-Interface.
 
+Die Detailseite zeigt außerdem eine „Historie"-Sektion mit den letzten
+Git-Commits, die die verschlüsselte Datei des Eintrags verändert haben
+(Hash, Zeitpunkt, Commit-Message aus dem gopass-Store selbst) — nützlich,
+um zu sehen, wann ein Secret zuletzt geändert wurde, unabhängig vom
+Audit-Log. Kein Entschlüsseln dafür nötig; fehlt `git` auf dem `PATH`
+oder gibt es noch keine Historie, bleibt die Sektion einfach leer.
+
 Screenshots siehe [`docs/screenshots/`](docs/screenshots).
 
 ## Org-Scoping
@@ -486,6 +493,7 @@ my-secrets/
 │   ├── caller/        # PPID/Env-Klassifikation
 │   ├── policy/        # YAML-Scope-Policy
 │   ├── app/           # Orchestrator (caller → policy → store → audit)
+│   ├── history/       # Git-Log pro Eintrag (shellt zu `git`, mount-aware)
 │   ├── mcp/           # JSON-RPC 2.0 über stdio
 │   └── web/           # Localhost HTTP UI (embed.FS)
 ├── skills/my-secrets/ # Claude-Code-Skill

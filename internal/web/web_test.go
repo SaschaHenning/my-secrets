@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -453,6 +454,73 @@ func TestHandleEntryDetail_ShowsLastRead(t *testing.T) {
 
 	if !strings.Contains(w.Body.String(), "2026-03-04") {
 		t.Errorf("expected last-read date in detail page: %s", w.Body.String())
+	}
+}
+
+// gitRepoForWebHistory mirrors internal/app's gitRepoForHistory helper:
+// a minimal real git repo with one commit, wired up via
+// PASSWORD_STORE_DIR so App.History resolves against it.
+func gitRepoForWebHistory(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "Test")
+	full := filepath.Join(dir, "jasp", "github.gpg")
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("v1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "jasp/github.gpg")
+	run("commit", "-q", "-m", "add jasp/github")
+	t.Setenv("PASSWORD_STORE_DIR", dir)
+}
+
+func TestHandleEntryDetail_ShowsHistory(t *testing.T) {
+	gitRepoForWebHistory(t)
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	r := httptest.NewRequest("GET", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "add jasp/github") {
+		t.Errorf("expected commit message in history section: %s", w.Body.String())
+	}
+}
+
+func TestHandleEntryDetail_NoHistorySection_WhenGitUnavailable(t *testing.T) {
+	// No repo set up, and PATH points at an empty dir so exec.LookPath
+	// ("git") fails inside history.Log — the page must still render.
+	t.Setenv("PATH", t.TempDir())
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	r := httptest.NewRequest("GET", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 even when git/history is unavailable; body=%q", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "Historie (") {
+		t.Error("history section should be omitted entirely when there is no history")
 	}
 }
 

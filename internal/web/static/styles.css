@@ -152,6 +152,8 @@ table.audit code { font-family: 'SF Mono', Menlo, monospace; font-size: 0.8rem; 
   font-size: 0.7rem;
 }
 details { margin-top: 0.3rem; }
+details.history { margin-top: 1.5rem; }
+details.history summary { font-size: 0.95rem; color: var(--text); font-weight: 600; }
 details summary { color: var(--muted); font-size: 0.75rem; cursor: pointer; }
 details pre {
   background: var(--bg);
