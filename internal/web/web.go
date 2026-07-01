@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -189,21 +190,47 @@ func localhostOnly(h http.Handler) http.Handler {
 
 // authGate wraps a handler so it only fires for callers with a valid
 // session cookie. Missing/stale cookies get a 303 See Other back to
-// /login. Every gated response also gets Cache-Control: no-store — set
-// here once rather than per-handler, since it must cover everything
-// behind the gate (entry metadata, and since the reveal endpoint below,
-// actual secret values), not just the one route that first needed it.
+// /login?next=<original request>, so a deep link (e.g. the PWA's
+// start_url, or a bookmarked /entries/{path}) survives a re-login
+// instead of always dumping the user back on the stats overview. Every
+// gated response also gets Cache-Control: no-store — set here once
+// rather than per-handler, since it must cover everything behind the
+// gate (entry metadata, and since the reveal endpoint below, actual
+// secret values), not just the one route that first needed it.
 func authGate(store *sessionStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(sessionCookieName)
 		if err != nil || !store.Validate(c.Value) {
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Pragma", "no-cache")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// defaultLandingPath is where a successful login goes when there's no
+// (valid) next= target — the search-first entries browser, per the PWA's
+// start_url, not the stats overview.
+const defaultLandingPath = "/entries"
+
+// safeNextPath validates a caller-supplied redirect target, returning
+// defaultPath unless next is unambiguously a same-origin path. Guards
+// against open-redirect tricks: a bare "//host" or "http://host" would
+// send the post-login redirect off this server entirely. A leading
+// backslash is rejected too — some browsers resolve it the same as a
+// forward slash when following a Location header, which url.Parse alone
+// would not flag as absolute.
+func safeNextPath(next, defaultPath string) string {
+	if next == "" || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") || strings.ContainsRune(next, '\\') {
+		return defaultPath
+	}
+	u, err := url.Parse(next)
+	if err != nil || u.IsAbs() || u.Host != "" {
+		return defaultPath
+	}
+	return next
 }
 
 // extendWriteDeadlineForTouchID pushes the current request's write
@@ -228,12 +255,13 @@ func handleLogin(store *sessionStore, ttl time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			renderLogin(w, "")
+			renderLogin(w, "", r.URL.Query().Get("next"))
 		case http.MethodPost:
+			next := safeNextPath(r.FormValue("next"), defaultLandingPath)
 			extendWriteDeadlineForTouchID(w)
 			if err := requireTouchID(r.Context()); err != nil {
 				w.WriteHeader(http.StatusUnauthorized)
-				renderLogin(w, err.Error())
+				renderLogin(w, err.Error(), next)
 				return
 			}
 			id := store.Issue()
@@ -253,7 +281,7 @@ func handleLogin(store *sessionStore, ttl time.Duration) http.HandlerFunc {
 				SameSite: http.SameSiteLaxMode,
 				MaxAge:   int(ttl.Seconds()),
 			})
-			http.Redirect(w, r, "/", http.StatusSeeOther)
+			http.Redirect(w, r, next, http.StatusSeeOther)
 		default:
 			w.Header().Set("Allow", "GET, POST")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -263,12 +291,20 @@ func handleLogin(store *sessionStore, ttl time.Duration) http.HandlerFunc {
 
 // renderLogin writes the tiny inline login page. We do not route this
 // through html/template because the page is static aside from an
-// optional error message, which we escape manually.
-func renderLogin(w http.ResponseWriter, errMsg string) {
+// optional error message and the next= redirect target, both of which
+// we escape manually. next is echoed back as a hidden form field (not
+// re-validated here — handleLogin's POST branch is what enforces
+// safeNextPath before ever issuing a redirect) so a retry after a failed
+// Touch-ID challenge doesn't lose the original destination.
+func renderLogin(w http.ResponseWriter, errMsg, next string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	errBlock := ""
 	if errMsg != "" {
 		errBlock = fmt.Sprintf(`<p class="empty" style="color:#f87171">%s</p>`, template.HTMLEscapeString(errMsg))
+	}
+	nextField := ""
+	if next != "" {
+		nextField = fmt.Sprintf(`<input type="hidden" name="next" value="%s">`, template.HTMLEscapeString(next))
 	}
 	_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
 <html lang="de">
@@ -276,6 +312,11 @@ func renderLogin(w http.ResponseWriter, errMsg string) {
 <meta charset="UTF-8">
 <title>my-secrets — Anmelden</title>
 <link rel="stylesheet" href="/static/styles.css">
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="my-secrets">
+<meta name="theme-color" content="#0f1117">
 </head>
 <body>
 <header><h1>my-secrets</h1></header>
@@ -288,6 +329,7 @@ func renderLogin(w http.ResponseWriter, errMsg string) {
       Die Sitzung läuft nach 30&nbsp;Minuten Inaktivität automatisch ab.
     </p>
     <form method="post" action="/login" style="margin-top:1rem;">
+      %s
       <button type="submit" class="btn-link" style="background:var(--accent);color:white;padding:0.5rem 1rem;border:none;border-radius:4px;cursor:pointer;font-weight:600;">
         Mit Touch ID anmelden
       </button>
@@ -297,8 +339,11 @@ func renderLogin(w http.ResponseWriter, errMsg string) {
 </section>
 </main>
 <footer>local read-only UI · bound to 127.0.0.1 · no secret values are rendered here</footer>
+<script>
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/static/sw.js');
+</script>
 </body>
-</html>`, errBlock)
+</html>`, nextField, errBlock)
 }
 
 // --- handlers --------------------------------------------------------------

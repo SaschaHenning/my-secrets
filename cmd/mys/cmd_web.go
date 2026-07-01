@@ -35,5 +35,6 @@ func webCmd() *cobra.Command {
 		},
 	}
 	c.Flags().IntVar(&port, "port", 7823, "listen port")
+	c.AddCommand(webInstallCmd(), webUninstallCmd(), webStatusCmd())
 	return c
 }

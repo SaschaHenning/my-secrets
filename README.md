@@ -380,6 +380,33 @@ oder gibt es noch keine Historie, bleibt die Sektion einfach leer.
 
 Screenshots siehe [`docs/screenshots/`](docs/screenshots).
 
+### Als App aus dem Dock/Launchpad starten
+
+Die Web-UI ist eine installierbare PWA: Chrome/Edge bieten „App
+installieren" an, Safari „Zum Dock hinzufügen". `start_url` ist
+`/entries` — nach dem Touch-ID-Login landest du direkt auf der
+Such-Seite mit Fokus im Suchfeld, nicht auf der Statistik-Übersicht.
+Ein `?next=`-Parameter sorgt dafür, dass ein Tiefenlink (z. B. direkt zu
+einem Eintrag) den Login-Umweg übersteht.
+
+Damit ein Klick auf das App-Icon nicht auf „Verbindung abgelehnt" trifft
+— `mys web` läuft normalerweise nur, solange du es manuell im Terminal
+gestartet hast, und beendet sich nach 30 Minuten Inaktivität selbst —
+gibt es einen Autostart via macOS LaunchAgent:
+
+```bash
+mys web install              # startet mys web beim Login, per Autostart
+mys web status                # zeigt an, ob der LaunchAgent aktiv ist
+mys web uninstall              # entfernt ihn wieder
+```
+
+`KeepAlive` ist bewusst unbedingt gesetzt: launchd startet den Prozess
+auch nach dem regulären Idle-Shutdown sofort neu — das Sicherheitsverhalten
+bleibt dabei unverändert, denn die Login-Session selbst läuft weiterhin
+nach 30 Minuten Inaktivität ab; nur der Server-*Prozess* schläft nie
+mehr dauerhaft ein, sodass der Port für den nächsten Klick immer
+erreichbar ist. Jeder Neustart verlangt wieder Touch ID.
+
 ## Org-Scoping
 
 Orgs = Top-Level-Ordner im gopass-Store. `~/.config/my-secrets/scope-policy.yaml`:

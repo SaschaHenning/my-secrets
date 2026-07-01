@@ -219,6 +219,44 @@ result, no page error) when `git` is missing or the path has no history.
 Auto-shutdown on parent context cancel. A `localhostOnly` middleware
 rejects non-loopback `RemoteAddr`.
 
+### PWA shell + LaunchAgent autostart
+
+The UI is an installable PWA: `internal/web/static/manifest.webmanifest`
+(`start_url: "/entries"`, colors matching `styles.css`), a minimal
+`internal/web/static/sw.js` (pure network passthrough — no
+`caches.open`/`cache.put` anywhere, enforced by
+`TestSWJS_NeverCaches`, since a Cache Storage entry for a reveal
+response would be an unencrypted, disk-persistent copy outside the
+audit log's reach), and two generated icons. A shared
+`templates/_head.html` (`{{define "head"}}`) carries the manifest link
++ Apple meta tags + SW registration into every templated page; the
+hand-written `renderLogin` (not routed through `html/template`, so it
+can't use the partial) duplicates the same tags inline.
+
+`authGate` redirects an unauthenticated request to
+`/login?next=<original request>` instead of a bare `/login`, so the
+PWA's `start_url` (or any deep link) survives the login round trip.
+`safeNextPath` validates the `next` value before it's ever used in a
+redirect — same-origin absolute path only, rejecting `//host`,
+`http://host`, and a leading backslash (which some browsers resolve the
+same as a forward slash when following a `Location` header) — this is
+the one place in the web package that has to actively defend against an
+open-redirect trick, since `next` is otherwise fully attacker-controlled
+input reflected into a `Location` header and a hidden form field.
+
+`mys web install`/`uninstall`/`status` (`cmd/mys/cmd_web_install.go`)
+manage a `~/Library/LaunchAgents/com.jasp.my-secrets.web.plist`
+LaunchAgent with `RunAtLoad` and unconditional `KeepAlive` — the latter
+matters because it restarts the process even after the *normal*
+30-minute idle-shutdown exit, not just a crash, so an installed app icon
+always finds a live server rather than a connection error. The security
+posture is unchanged: the session cookie still expires after 30 minutes
+of inactivity, and a fresh process starts with an empty in-memory
+session store, so every relaunch still demands Touch ID. All `launchctl`
+calls go through the package-level `launchctlRun` var (same indirection
+pattern as `requireTouchIDFunc`/`mountPathLookup` elsewhere) so tests
+never touch the real, global launchd session.
+
 ## Trade-offs documented in plan.html
 
 - We did not build the signed hash-chain audit log from Ansatz B —

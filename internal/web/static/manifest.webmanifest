@@ -1,0 +1,14 @@
+{
+  "name": "my-secrets",
+  "short_name": "mys",
+  "description": "Lokaler Credential-Manager — durchsuchbare Secrets, Audit-Log, Reveal mit Touch ID",
+  "start_url": "/entries",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0f1117",
+  "theme_color": "#0f1117",
+  "icons": [
+    { "src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}
