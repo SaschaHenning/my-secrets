@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/SaschaHenning/my-secrets/internal/policy"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	"github.com/SaschaHenning/my-secrets/internal/store/fake"
+	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
 )
 
 // Verify that the loopback middleware rejects non-loopback addresses.
@@ -288,6 +290,10 @@ func TestLoginRejectsOtherMethods(t *testing.T) {
 // seeded rows. Store is nil — the web UI never touches it.
 func newAuditApp(t *testing.T) *app.App {
 	t.Helper()
+	// handleIndex reads syncpkg.Load(""), which resolves its path via
+	// os.UserHomeDir() — isolate HOME so tests never read (or are
+	// affected by) the real developer's ~/.config/my-secrets/sync.yaml.
+	t.Setenv("HOME", t.TempDir())
 	l, err := audit.Open(filepath.Join(t.TempDir(), "audit.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -319,6 +325,11 @@ func newAuditApp(t *testing.T) *app.App {
 // classifier actually picks.
 func newFakeApp(t *testing.T, override string, entries ...*store.Entry) (*app.App, *fake.Store) {
 	t.Helper()
+	// Mirrors newAuditApp's HOME isolation (see its comment) — any test
+	// using this helper with writeTempSyncConfig must land in an
+	// isolated tempdir, never the real developer's
+	// ~/.config/my-secrets/sync.yaml.
+	t.Setenv("HOME", t.TempDir())
 	l, err := audit.Open(filepath.Join(t.TempDir(), "audit.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -814,6 +825,72 @@ func TestHandleIndex(t *testing.T) {
 		if !strings.Contains(body, substr) {
 			t.Errorf("index body missing %q: %s", substr, body[:minInt(len(body), 300)])
 		}
+	}
+}
+
+// writeTempSyncConfig writes a sync.yaml under the current $HOME (which
+// newAuditApp/newFakeApp already isolate to a per-test tempdir) so
+// syncpkg.Load("") — resolving its path via os.UserHomeDir() — picks it
+// up without ever touching the real developer's sync config. Must be
+// called AFTER whichever helper set HOME, not before, or it would write
+// into a directory a later t.Setenv("HOME", ...) immediately discards.
+func writeTempSyncConfig(t *testing.T, cfg *syncpkg.Config) {
+	t.Helper()
+	home := os.Getenv("HOME")
+	if home == "" {
+		t.Fatal("writeTempSyncConfig: HOME is not set — call after newAuditApp/newFakeApp")
+	}
+	path := filepath.Join(home, ".config", "my-secrets", "sync.yaml")
+	if err := syncpkg.Save(path, cfg); err != nil {
+		t.Fatalf("save sync config: %v", err)
+	}
+}
+
+func TestHandleIndex_ShowsSyncStatus(t *testing.T) {
+	a := newAuditApp(t)
+	lastSync := time.Date(2026, 2, 1, 9, 0, 0, 0, time.UTC)
+	writeTempSyncConfig(t, &syncpkg.Config{
+		Version: 1,
+		Layout:  syncpkg.LayoutSingle,
+		Remotes: []syncpkg.StoreRemote{
+			{Mount: syncpkg.DefaultStoreMount, URL: "git@github.com:me/my-secrets-store.git", LastSync: lastSync},
+		},
+	})
+	r := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handleIndex(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	// shortTime renders in local time, so assert against the same
+	// conversion rather than a hardcoded UTC date string — otherwise
+	// this test is timezone-fragile (fails west of UTC-9, where
+	// 2026-02-01T09:00Z's local date rolls back to 2026-01-31).
+	wantDate := lastSync.Local().Format("2006-01-02")
+	for _, want := range []string{"my-secrets-store.git", wantDate} {
+		if !strings.Contains(body, want) {
+			t.Errorf("index body missing sync status %q: %s", want, body)
+		}
+	}
+}
+
+func TestHandleIndex_NoSyncConfigured(t *testing.T) {
+	// No sync.yaml written (newAuditApp already isolates HOME to an
+	// empty tempdir) — syncpkg.Load("") returns an empty Config, not an
+	// error, and the page must render a plain empty state rather than
+	// fail or block on a network probe.
+	a := newAuditApp(t)
+	r := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handleIndex(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "kein Sync konfiguriert") {
+		t.Error("expected empty-state message when no sync.yaml exists")
 	}
 }
 

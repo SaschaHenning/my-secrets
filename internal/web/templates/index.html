@@ -24,6 +24,26 @@
 </section>
 
 <section>
+  <h2>Sync</h2>
+  {{if .SyncRemotes}}
+  <table class="audit">
+    <thead><tr><th>mount</th><th>remote</th><th>zuletzt gesynct</th></tr></thead>
+    <tbody>
+    {{range .SyncRemotes}}
+      <tr>
+        <td>{{.Mount}}</td>
+        <td><code>{{.URL}}</code></td>
+        <td>{{if .LastSync.IsZero}}nie{{else}}{{shortTime .LastSync}}{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">kein Sync konfiguriert — `mys sync setup`</p>
+  {{end}}
+</section>
+
+<section>
   <h2>Recent activity</h2>
   <table class="audit">
     <thead><tr><th>seq</th><th>time</th><th>actor</th><th>action</th><th>path</th><th>org</th><th>result</th><th>reason</th></tr></thead>

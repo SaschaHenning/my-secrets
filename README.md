@@ -444,6 +444,11 @@ den gopass-Remote und führt einen ersten Sync aus. Der Zustand landet
 in `~/.config/my-secrets/sync.yaml`; jede Sync-Aktion schreibt eine
 Zeile ins Audit-Log (`action=sync_push|sync_pull|sync_setup`).
 
+Die Web-UI (`/`) zeigt denselben letzten Sync-Zeitpunkt pro Remote an —
+gelesen direkt aus `sync.yaml`, ohne Netzwerk-Check beim Seitenaufruf
+(die Erreichbarkeitsprüfung bleibt `mys sync status` auf der CLI
+vorbehalten).
+
 ### Auto-Sync nach Schreiboperationen
 
 Sobald `mys sync setup` einmal gelaufen ist, wird nach jedem

@@ -22,6 +22,7 @@ import (
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/store"
+	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
 )
 
 //go:embed templates/*.html static/*
@@ -316,13 +317,24 @@ func handleIndex(a *app.App) http.HandlerFunc {
 		humanCount := countActor(a, ctx, audit.ActorHuman)
 		deniedCount := countResult(a, ctx, audit.ResultDenied)
 
+		// Sync status: read the local config file directly, no network
+		// call. A page load must never block on reachability — that
+		// probe (`git ls-remote`) stays CLI-only, in `mys sync status`.
+		// Load() returns an empty Config (not an error) when sync isn't
+		// configured, which renders as a natural empty state.
+		var syncRemotes []syncpkg.StoreRemote
+		if cfg, err := syncpkg.Load(""); err == nil {
+			syncRemotes = cfg.Remotes
+		}
+
 		data := map[string]any{
-			"Total":  total,
-			"AI":     aiCount,
-			"Human":  humanCount,
-			"Denied": deniedCount,
-			"Recent": last,
-			"Page":   "index",
+			"Total":       total,
+			"AI":          aiCount,
+			"Human":       humanCount,
+			"Denied":      deniedCount,
+			"Recent":      last,
+			"Page":        "index",
+			"SyncRemotes": syncRemotes,
 		}
 		if err := templates.ExecuteTemplate(w, "index.html", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
