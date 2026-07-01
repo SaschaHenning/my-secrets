@@ -17,6 +17,7 @@ import (
 
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
+	"github.com/SaschaHenning/my-secrets/internal/history"
 	"github.com/SaschaHenning/my-secrets/internal/policy"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
@@ -330,6 +331,31 @@ func (a *App) Inspect(ctx context.Context, path string) (*store.Entry, error) {
 	}
 	a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultOK, decision.MatchedRule)
 	return e, nil
+}
+
+// History returns recent git-log revisions for path — commit
+// hash/timestamp/message only, never decrypted content. Policy-gated the
+// same way as every other path-taking method: a denied path shouldn't
+// leak how many times it was ever changed, any more than it should leak
+// its metadata (App.Inspect) or its value (App.Get).
+func (a *App) History(ctx context.Context, path string, limit int) ([]history.Revision, error) {
+	d := caller.Identify(a.Override)
+	if err := cleanSecretPath(path); err != nil {
+		a.writeAudit(ctx, audit.ActionHistory, path, d, audit.ResultDenied, err.Error())
+		return nil, &ErrDenied{Path: path, Reason: err.Error()}
+	}
+	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
+	if !decision.Allowed {
+		a.writeAudit(ctx, audit.ActionHistory, path, d, audit.ResultDenied, decision.Reason)
+		return nil, &ErrDenied{Path: path, Reason: decision.Reason}
+	}
+	revs, err := history.Log(ctx, path, limit)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionHistory, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	a.writeAudit(ctx, audit.ActionHistory, path, d, audit.ResultOK, fmt.Sprintf("%d revisions", len(revs)))
+	return revs, nil
 }
 
 // storeSearcher is the minimal interface App.Search needs from the store.

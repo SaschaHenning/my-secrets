@@ -122,7 +122,9 @@ pairs). The `store.Entry` type maps:
 audit_log (
   seq           INTEGER PRIMARY KEY AUTOINCREMENT,
   ts            TEXT    (RFC3339 UTC),
-  action        TEXT    (init|get|list|search|add|rotate|remove|export|web_open|mcp_start),
+  action        TEXT    (init|get|list|list_detail|search|add|rotate|remove|export|
+                         history|web_open|mcp_start|... — see internal/audit/audit.go
+                         for the full, current list of Action* constants),
   secret_path   TEXT,
   org           TEXT,
   actor_kind    TEXT    (human|ai|script),
@@ -200,6 +202,19 @@ value; every other view stays masked (`store.MaskedPassword`,
 `store.IsSecretLikeFieldKey` for custom `Fields` values). `authGate` sets
 `Cache-Control: no-store` on every gated response so a revealed value is
 never cached.
+
+The entry detail page also renders a "Historie" section from
+`App.History` → `internal/history.Log`, which shells out to `git log
+--follow` against the store's own on-disk git repository (gopass's
+`api.Gopass.Revisions` is unimplemented upstream, so there is no library
+path). Mount-aware: `internal/history.resolveDir` checks `gopass config
+mounts.<org>.path` first and strips the org prefix from the on-disk
+relative path when the entry lives in its own mount repo (gopass's
+`root.Store` does the same stripping when writing), falling back to
+`internal/gopassinit.DefaultStoreDir()` for the default single-store
+case. Policy-gated like `Get`/`Inspect` (`ActionHistory` audit rows) —
+metadata-only, never touches decrypted content — and fails soft (empty
+result, no page error) when `git` is missing or the path has no history.
 
 Auto-shutdown on parent context cancel. A `localhostOnly` middleware
 rejects non-loopback `RemoteAddr`.

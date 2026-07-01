@@ -43,6 +43,11 @@ const (
 	// queries (LastAccessByPath) stay meaningful: browsing the web UI's
 	// entries list must never look like reading every secret in it.
 	ActionListDetail = "list_detail"
+	// ActionHistory is written by App.History — reading an entry's git
+	// commit metadata (hash/timestamp/message), never its decrypted
+	// content. Policy-gated like every other path-taking action, so a
+	// denied path doesn't leak how many times it was ever changed.
+	ActionHistory = "history"
 )
 
 // Results recorded against each action.
