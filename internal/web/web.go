@@ -8,6 +8,7 @@ package web
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -18,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
@@ -128,7 +130,7 @@ func serveWith(ctx context.Context, a *app.App, port int, stdout io.Writer, ttl,
 	// redirects to /login on a missing / stale cookie.
 	mux.Handle("/", authGate(store, handleIndex(a)))
 	mux.Handle("/audit", authGate(store, handleAudit(a)))
-	mux.Handle("/entries", authGate(store, handleEntries(a)))
+	mux.Handle("/entries", authGate(store, handleEntries(a, newEntriesCache())))
 	mux.Handle("/entries/{path...}", authGate(store, handleEntryDetail(a)))
 
 	srv := &http.Server{
@@ -502,13 +504,62 @@ func searchableText(e *store.Entry) string {
 // "q" only pre-fills the search box's initial value — the inline script
 // applies the same client-side filter to it on load, so a bookmarked/
 // shared link (e.g. entry.html's "back to org") still narrows the view.
-func handleEntries(a *app.App) http.HandlerFunc {
+// entriesCacheTTL bounds how stale the cached decrypt can be. Short
+// enough that a write from another `mys` CLI invocation (the only way
+// the store changes while `mys web` is running — this UI has no write
+// endpoints) or a `mys sync pull` shows up quickly on the next load;
+// long enough that clicking around the entries page during normal use
+// (the "back to org" link, revisiting after glancing at one entry's
+// detail page) doesn't pay the full-store decrypt cost every time.
+const entriesCacheTTL = 30 * time.Second
+
+// entriesCache holds the last App.BrowseDetailed(ctx, "") result so
+// repeated /entries loads within entriesCacheTTL don't repeat the full
+// decrypt — found necessary in practice: on a real store, decrypting
+// every entry took long enough (tens of seconds) that "click a link,
+// wait, nothing happens" was the actual user experience even after
+// extendWriteDeadline stopped the request from being cut off outright.
+// A cache hit skips App.BrowseDetailed entirely, so it also skips that
+// call's ActionListDetail audit row — no decrypt happened on a hit, so
+// logging one would misrepresent what actually occurred.
+//
+// Only successful decrypts are ever cached: an error is returned as-is
+// and neither stored nor timestamped, so a transient failure (e.g. a
+// denied/unreachable store during a refresh) is retried on the very
+// next request instead of wedging /entries into repeat errors — served
+// alongside stale-but-otherwise-good cached entries — for the rest of
+// the TTL.
+type entriesCache struct {
+	mu      sync.Mutex
+	at      time.Time
+	entries []*store.Entry
+}
+
+func newEntriesCache() *entriesCache {
+	return &entriesCache{}
+}
+
+func (c *entriesCache) get(ctx context.Context, a *app.App) ([]*store.Entry, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries != nil && time.Since(c.at) < entriesCacheTTL {
+		return c.entries, nil
+	}
+	entries, err := a.BrowseDetailed(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	c.entries, c.at = entries, time.Now()
+	return entries, nil
+}
+
+func handleEntries(a *app.App, cache *entriesCache) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		initial := strings.TrimSpace(r.URL.Query().Get("q"))
 
 		extendWriteDeadline(w, entriesWriteBudget)
-		entries, err := a.BrowseDetailed(ctx, "")
+		entries, err := cache.get(ctx, a)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -578,6 +629,7 @@ func handleEntryDetail(a *app.App) http.HandlerFunc {
 // App.Get, so a web reveal produces the exact same `get` audit row shape
 // as `mys get --reveal` on the CLI.
 func handleReveal(w http.ResponseWriter, r *http.Request, a *app.App, path string) {
+	jsonMode := wantsJSON(r)
 	masked, err := a.Inspect(r.Context(), path)
 	if err != nil {
 		writeEntryError(w, err)
@@ -585,6 +637,10 @@ func handleReveal(w http.ResponseWriter, r *http.Request, a *app.App, path strin
 	}
 	extendWriteDeadline(w, touchIDWriteBudget)
 	if err := requireTouchID(r.Context()); err != nil {
+		if jsonMode {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
 		renderEntry(w, r, a, masked, false, "Touch ID erforderlich: "+err.Error())
 		return
 	}
@@ -593,7 +649,30 @@ func handleReveal(w http.ResponseWriter, r *http.Request, a *app.App, path strin
 		writeEntryError(w, err)
 		return
 	}
+	if jsonMode {
+		writeRevealJSON(w, e)
+		return
+	}
 	renderEntry(w, r, a, e, true, "")
+}
+
+// wantsJSON reports whether the caller asked for a JSON reveal response
+// (the entries table's inline "copy password" button) instead of the
+// full HTML page. Same handler, same Inspect→TouchID→Get gate either
+// way — only the response format branches, at the very end.
+func wantsJSON(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "application/json")
+}
+
+// writeRevealJSON is the inline-copy response shape: just the password,
+// nothing else — the caller already has every other field rendered in
+// the table, it only needs the one value it can't otherwise get without
+// this reveal.
+func writeRevealJSON(w http.ResponseWriter, e *store.Entry) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Password string `json:"password"`
+	}{Password: e.Password})
 }
 
 // renderMaskedEntry re-fetches metadata via App.Inspect (never a `get`

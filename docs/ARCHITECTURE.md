@@ -184,18 +184,18 @@ entries by org, with metadata (kind, tags, domain, username). Templates
 embedded via `//go:embed`.
 
 `/entries` always decrypts and renders every policy-visible entry on one
-page, grouped by org (`groupByOrg`) — there is no separate cheap/scoped/
-expensive tiering, and no server-side search round trip. Each entry card
-carries a `data-search` attribute (`searchableText`, HTML-attribute-escaped
-by `html/template` like any other interpolated value) that an inline
-script in `entries.html` filters against on every keystroke, entirely
-client-side; `?q=` only pre-fills the search box's initial value for
-deep links (e.g. `entry.html`'s "back to org"). This trades the earlier
-three-tier design (deliberately cheap landing page, avoid decrypting
-until asked) for a simpler always-decrypt one, since `App.BrowseDetailed`
-already writes exactly one aggregated audit row per call regardless of
-entry count — for a personal store this size, that's fast enough that
-hiding entries behind an extra click was pure friction.
+page as a table, grouped by org (`groupByOrg`) — there is no separate
+cheap/scoped/expensive tiering, and no server-side search round trip.
+Each row carries a `data-search` attribute (`searchableText`,
+HTML-attribute-escaped by `html/template` like any other interpolated
+value) that an inline script in `entries.html` filters against on every
+keystroke, entirely client-side; `?q=` only pre-fills the search box's
+initial value for deep links (e.g. `entry.html`'s "back to org"). This
+trades the earlier three-tier design (deliberately cheap landing page,
+avoid decrypting until asked) for a simpler always-decrypt one, since
+`App.BrowseDetailed` already writes exactly one aggregated audit row per
+call regardless of entry count — for a personal store this size, that's
+fast enough that hiding entries behind an extra click was pure friction.
 
 Decrypting every entry on one page load is slower than the server's
 default 10s `WriteTimeout`, once the store has enough entries — a real
@@ -205,10 +205,27 @@ remaining `Store.Get` calls) and the connection was torn down before any
 response reached the browser, so the page silently "loaded nothing".
 `handleEntries` calls `extendWriteDeadline(w, entriesWriteBudget)` (2
 minutes) before decrypting, the same `http.ResponseController`-based
-override already used for the Touch-ID write budget. "Zuletzt gelesen"/
+override already used for the Touch-ID write budget. That alone still
+meant every load re-paid the full decrypt cost, though (found via the
+same real store — clicking a link and waiting tens of seconds for
+nothing to visibly change is still a broken experience even once it no
+longer times out), so `handleEntries` also wraps `App.BrowseDetailed` in
+an `entriesCache` (30s TTL, shared for the server's lifetime): a cache
+hit skips the decrypt AND the `list_detail` audit row it would have
+written, since no access actually happened on a hit. "Zuletzt gelesen"/
 "zuletzt gesynct" render via `relativeTime` (recency-first: "gerade
 eben"/"vor N Minuten" within the last hour, "heute"/"gestern" for the
 last two calendar days, the absolute date only once it's older).
+
+Each row also has an inline "copy username" button (client-side only —
+Username isn't secret, already rendered in the row) and "copy password"
+button. The latter is not a shortcut around the reveal gate: it POSTs to
+the same `/entries/{path...}` endpoint as the detail page's Reveal
+button — same `App.Inspect`→Touch-ID→`App.Get` sequence, same audit row
+— just with `Accept: application/json` (`wantsJSON`/`writeRevealJSON`
+in `handleReveal`), returning `{"password": "..."}` instead of the full
+HTML page, so the button can copy it directly without a page
+navigation. A fresh Touch-ID prompt still fires on every click.
 
 The page decrypts entries to render metadata (gopass has no
 metadata-only decrypt) but does so through `App.BrowseDetailed`/`App.Inspect`,
