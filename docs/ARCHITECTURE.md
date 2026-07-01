@@ -179,11 +179,25 @@ without retry loops.
 Loopback-only (`127.0.0.1`), behind a Touch-ID login (`internal/web/auth_darwin.go`)
 with a cookie-based session (`internal/web/session.go`, 30 min idle
 timeout). Three page groups: overview + audit filters, and a secrets
-browser (`/entries`, `/entries/{path...}`) for browsing/searching
-policy-visible entries by org, with metadata (kind, tags, domain,
-username). Templates embedded via `//go:embed`.
+browser (`/entries`, `/entries/{path...}`) for browsing policy-visible
+entries by org, with metadata (kind, tags, domain, username). Templates
+embedded via `//go:embed`.
 
-The browser decrypts entries to render metadata (gopass has no
+`/entries` always decrypts and renders every policy-visible entry on one
+page, grouped by org (`groupByOrg`) — there is no separate cheap/scoped/
+expensive tiering, and no server-side search round trip. Each entry card
+carries a `data-search` attribute (`searchableText`, HTML-attribute-escaped
+by `html/template` like any other interpolated value) that an inline
+script in `entries.html` filters against on every keystroke, entirely
+client-side; `?q=` only pre-fills the search box's initial value for
+deep links (e.g. `entry.html`'s "back to org"). This trades the earlier
+three-tier design (deliberately cheap landing page, avoid decrypting
+until asked) for a simpler always-decrypt one, since `App.BrowseDetailed`
+already writes exactly one aggregated audit row per call regardless of
+entry count — for a personal store this size, that's fast enough that
+hiding entries behind an extra click was pure friction.
+
+The page decrypts entries to render metadata (gopass has no
 metadata-only decrypt) but does so through `App.BrowseDetailed`/`App.Inspect`,
 which write a single aggregated `list_detail` audit row per call instead of
 one `get` row per path — browsing the list must not look, in the audit

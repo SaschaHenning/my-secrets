@@ -16,63 +16,68 @@
 <main>
 
 <section>
-  <form class="filters" method="get" action="/entries">
-    <label>Search everywhere
-      <input type="text" name="q" value="{{.Query}}" placeholder="path, domain, username, tag…" autofocus>
-    </label>
-    <button type="submit">Search</button>
-    <a href="/entries" class="btn-link">reset</a>
-  </form>
+  <label for="search" class="sr-only">Search entries</label>
+  <input type="search" id="search" value="{{.Query}}" placeholder="path, domain, username, tag…" aria-label="Search entries" autofocus autocomplete="off">
 
-{{if .Orgs}}
-  <h2>Orgs</h2>
-  <div class="org-grid">
-  {{range .Orgs}}
-    <a class="org-card" href="/entries?org={{.}}">
-      <div class="org-name">{{.}}</div>
-      <div class="org-count">{{index $.OrgCounts .}} entries</div>
-    </a>
+  {{if not .Groups}}
+    <p class="empty">no entries yet — run `mys add` to create your first one</p>
   {{end}}
-  </div>
-{{else if not .Entries}}
-  <p class="empty">no orgs yet — run `mys add` to create your first entry</p>
-{{end}}
 
-{{if .Entries}}
-  <h2>
-    {{if .CrossOrgSearch}}Search results across all orgs{{else}}{{.SelectedOrg}}{{end}}
-    <span class="muted-count">({{len .Entries}})</span>
-  </h2>
-  {{if .CrossOrgSearch}}<p class="hint">Cross-org search decrypts every visible entry — slower than browsing a single org.</p>{{end}}
-  <div class="entry-grid">
-  {{range .Entries}}
-    <a class="entry-card" href="/entries/{{.Path}}">
-      <div class="entry-path"><code>{{.Path}}</code></div>
-      <div class="entry-meta">
-        {{if .Kind}}<span class="badge kind-badge">{{.Kind}}</span>{{end}}
-        {{if .Username}}<span class="muted">{{.Username}}</span>{{end}}
-        {{if .Domain}}<span class="muted">{{.Domain}}</span>{{end}}
-      </div>
-      {{if .Tags}}
-      <div class="tag-row">
-        {{range .Tags}}<span class="tag">{{.}}</span>{{end}}
-      </div>
-      {{end}}
-      <div class="last-read">zuletzt gelesen: {{lastReadText (index $.LastReads .Path)}}</div>
-    </a>
-  {{else}}
-    <p class="empty">no entries match this search</p>
-  {{end}}
+  {{range .Groups}}
+  <div class="org-group">
+    <h2>{{.Org}} <span class="muted-count">({{len .Entries}})</span></h2>
+    <div class="entry-grid">
+    {{range .Entries}}
+      <a class="entry-card" href="/entries/{{.Path}}" data-search="{{searchBlob .}}">
+        <div class="entry-path"><code>{{.Path}}</code></div>
+        <div class="entry-meta">
+          {{if .Kind}}<span class="badge kind-badge">{{.Kind}}</span>{{end}}
+          {{if .Username}}<span class="muted">{{.Username}}</span>{{end}}
+          {{if .Domain}}<span class="muted">{{.Domain}}</span>{{end}}
+        </div>
+        {{if .Tags}}
+        <div class="tag-row">
+          {{range .Tags}}<span class="tag">{{.}}</span>{{end}}
+        </div>
+        {{end}}
+        <div class="last-read">zuletzt gelesen: {{lastReadText (index $.LastReads .Path)}}</div>
+      </a>
+    {{end}}
+    </div>
   </div>
-{{end}}
+  {{end}}
+
+  <p class="empty" id="no-results" style="display:none;">no entries match this search</p>
 </section>
 
 </main>
 <footer>local read-only UI · bound to 127.0.0.1 · no secret values are rendered here</footer>
 <script>
   (function () {
-    var input = document.querySelector('input[name="q"]');
+    var input = document.getElementById('search');
+    var groups = document.querySelectorAll('.org-group');
+    var noResults = document.getElementById('no-results');
     if (!input) return;
+
+    function applyFilter() {
+      var q = input.value.trim().toLowerCase();
+      var totalVisible = 0;
+      groups.forEach(function (group) {
+        var visibleInGroup = 0;
+        group.querySelectorAll('.entry-card').forEach(function (card) {
+          var match = q === '' || card.dataset.search.indexOf(q) !== -1;
+          card.style.display = match ? '' : 'none';
+          if (match) visibleInGroup++;
+        });
+        group.style.display = visibleInGroup > 0 ? '' : 'none';
+        totalVisible += visibleInGroup;
+      });
+      if (noResults) noResults.style.display = (groups.length > 0 && totalVisible === 0) ? '' : 'none';
+    }
+
+    input.addEventListener('input', applyFilter);
+    applyFilter(); // apply an initial ?q= value, if any
+
     var focus = function () { input.focus(); };
     if (!input.value) focus();
     window.addEventListener('pageshow', function (e) { if (e.persisted && !input.value) focus(); });

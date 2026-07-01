@@ -85,6 +85,7 @@ func init() {
 			}
 			return value
 		},
+		"searchBlob": searchableText,
 	}
 	templates = template.Must(template.New("").Funcs(funcs).ParseFS(assets, "templates/*.html"))
 }
@@ -440,119 +441,87 @@ func handleAudit(a *app.App) http.HandlerFunc {
 	}
 }
 
-// handleEntries serves the secrets browser at /entries.
+// orgGroup is one org's worth of entries, pre-sorted, for the always-show-
+// everything entries page.
+type orgGroup struct {
+	Org     string
+	Entries []*store.Entry
+}
+
+// groupByOrg buckets entries by their Org field (already populated by the
+// store) and returns groups sorted by org name, with entries sorted by
+// path within each group.
+func groupByOrg(entries []*store.Entry) []orgGroup {
+	byOrg := make(map[string][]*store.Entry)
+	var orgs []string
+	for _, e := range entries {
+		if _, ok := byOrg[e.Org]; !ok {
+			orgs = append(orgs, e.Org)
+		}
+		byOrg[e.Org] = append(byOrg[e.Org], e)
+	}
+	sort.Strings(orgs)
+	groups := make([]orgGroup, 0, len(orgs))
+	for _, o := range orgs {
+		es := byOrg[o]
+		sort.Slice(es, func(i, j int) bool { return es[i].Path < es[j].Path })
+		groups = append(groups, orgGroup{Org: o, Entries: es})
+	}
+	return groups
+}
+
+// searchableText returns the lowercase blob of an entry's non-secret
+// metadata used for filtering — path, username, url, domain, notes,
+// kind, tags. Password and custom Fields values are never included,
+// matching the store's own search semantics (never match on secret
+// values). Rendered into each entry card's data-search attribute so the
+// entries.html filter box can match client-side with zero server round
+// trips.
+func searchableText(e *store.Entry) string {
+	parts := []string{e.Path, e.Username, e.URL, e.Domain, e.Notes, e.Kind}
+	parts = append(parts, e.Tags...)
+	return strings.ToLower(strings.Join(parts, " "))
+}
+
+// handleEntries serves the secrets browser at /entries. Always decrypts
+// and shows every policy-visible entry, grouped by org, in one page —
+// filtering then happens entirely client-side (see entries.html's inline
+// script) against each card's data-search attribute, so typing narrows
+// the view instantly with no server round trip. This trades the previous
+// three-tier cheap/scoped/expensive design for a simpler, always-decrypt
+// one, at the user's explicit request: for a personal store this size,
+// one App.BrowseDetailed(ctx, "") call (one aggregated audit row,
+// regardless of entry count) is fast enough that hiding entries behind an
+// extra click just adds friction.
 //
-// Three shapes, in increasing cost:
-//   - no "org", no "q": the cheap landing view — org names + per-org
-//     counts, derived from a single App.List(ctx, "") call, no decrypts.
-//   - "org" set: App.BrowseDetailed(ctx, org) — decrypts that org's
-//     entries so metadata can be shown, filtered by "q" if present.
-//   - "q" set without "org": cross-org search, App.BrowseDetailed(ctx,
-//     ""); explicitly the most expensive shape since it decrypts
-//     everything visible to the caller, so the UI labels it distinctly.
+// "q" only pre-fills the search box's initial value — the inline script
+// applies the same client-side filter to it on load, so a bookmarked/
+// shared link (e.g. entry.html's "back to org") still narrows the view.
 func handleEntries(a *app.App) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		q := r.URL.Query()
-		org := strings.TrimSpace(q.Get("org"))
-		query := strings.TrimSpace(q.Get("q"))
+		initial := strings.TrimSpace(r.URL.Query().Get("q"))
 
-		if org == "" && query == "" {
-			renderOrgList(w, r, a, ctx)
-			return
-		}
-
-		entries, err := a.BrowseDetailed(ctx, org)
+		entries, err := a.BrowseDetailed(ctx, "")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if query != "" {
-			entries = filterEntries(entries, query)
-		}
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 
 		// Best-effort: a query error just means "last read" shows as
 		// blank for this render, not a failed page.
 		lastReads, _ := a.Audit.LastAccessByPath(ctx)
 
 		data := map[string]any{
-			"Page":           "entries",
-			"SelectedOrg":    org,
-			"Query":          query,
-			"CrossOrgSearch": org == "" && query != "",
-			"Entries":        entries,
-			"LastReads":      lastReads,
+			"Page":      "entries",
+			"Query":     initial,
+			"Groups":    groupByOrg(entries),
+			"LastReads": lastReads,
 		}
 		if err := templates.ExecuteTemplate(w, "entries.html", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
-}
-
-// renderOrgList renders the cheap landing view of /entries: org names and
-// counts only, no entry decrypts. A single App.List(ctx, "") call backs
-// both — calling App.Orgs() here too would add N more App.List(ctx, org)
-// calls (one per org, for the counts) and multiply the ActionList audit
-// rows a single page load produces.
-func renderOrgList(w http.ResponseWriter, r *http.Request, a *app.App, ctx context.Context) {
-	paths, err := a.List(ctx, "")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	counts := make(map[string]int)
-	var orgs []string
-	for _, p := range paths {
-		o := store.OrgOf(p)
-		if o == "" {
-			continue
-		}
-		if _, ok := counts[o]; !ok {
-			orgs = append(orgs, o)
-		}
-		counts[o]++
-	}
-	sort.Strings(orgs)
-	data := map[string]any{
-		"Page":      "entries",
-		"Orgs":      orgs,
-		"OrgCounts": counts,
-	}
-	if err := templates.ExecuteTemplate(w, "entries.html", data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-}
-
-// filterEntries keeps entries whose Path, Username, URL, Domain, Notes,
-// Kind, or Tags contain query (case-insensitive). Password and TOTP seed
-// material are never matched — this mirrors the store's own search
-// semantics (internal/store/fake package doc: "matches ... NEVER
-// against password values").
-func filterEntries(entries []*store.Entry, query string) []*store.Entry {
-	q := strings.ToLower(query)
-	out := make([]*store.Entry, 0, len(entries))
-	for _, e := range entries {
-		if entryMatches(e, q) {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
-func entryMatches(e *store.Entry, q string) bool {
-	fields := []string{e.Path, e.Username, e.URL, e.Domain, e.Notes, e.Kind}
-	for _, f := range fields {
-		if strings.Contains(strings.ToLower(f), q) {
-			return true
-		}
-	}
-	for _, t := range e.Tags {
-		if strings.Contains(strings.ToLower(t), q) {
-			return true
-		}
-	}
-	return false
 }
 
 // handleEntryDetail serves the entry-detail page at /entries/{path...}.
