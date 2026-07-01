@@ -119,7 +119,7 @@ func (s *Store) Search(_ context.Context, query string, allow func(path string) 
 
 // entryMatches returns true if the query substring appears in the path or any
 // metadata field. Password VALUES are intentionally excluded from matching.
-// Fields keyed on a name containing "password" or "secret" are matched by
+// Fields whose key matches store.IsSecretLikeFieldKey are matched by
 // key-name only — never by value — matching the rule the real store applies
 // through secretMatches/isSecretLikeKey.
 func entryMatches(path string, e *store.Entry, q string) bool {
@@ -155,12 +155,14 @@ func entryMatches(path string, e *store.Entry, q string) bool {
 		}
 	}
 	// Fields: key-name is always searchable, value only for non-secret keys.
+	// Uses store.IsSecretLikeFieldKey directly rather than a second copy of
+	// the substring rule, so the two can no longer drift out of sync.
 	for k, v := range e.Fields {
 		lk := strings.ToLower(k)
 		if strings.Contains(lk, q) {
 			return true
 		}
-		if strings.Contains(lk, "password") || strings.Contains(lk, "secret") {
+		if store.IsSecretLikeFieldKey(k) {
 			continue
 		}
 		if v != "" && strings.Contains(strings.ToLower(v), q) {

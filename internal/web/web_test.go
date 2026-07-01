@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -210,6 +211,62 @@ func TestLoginPOSTFailureReturns401(t *testing.T) {
 		if c.Name == sessionCookieName {
 			t.Fatal("failed login must not issue a cookie")
 		}
+	}
+}
+
+// TestLoginPOST_SlowTouchIDDoesNotHitWriteTimeout is a regression test
+// for a review finding: the server's default WriteTimeout (10s) is
+// shorter than defaultRequireTouchID's own timeout (30s, and it
+// explicitly supports a slow password-fallback path) — without
+// extendWriteDeadlineForTouchID overriding the deadline for this
+// request, a legitimate but slow Touch-ID confirmation would have its
+// response cut off even though authentication succeeded. This runs a
+// real net/http server (httptest.ResponseRecorder does not support
+// per-request write deadlines at all, so this can't be a table test)
+// and sleeps just past the *old* 10s window.
+func TestLoginPOST_SlowTouchIDDoesNotHitWriteTimeout(t *testing.T) {
+	withStubTouchID(t, func(ctx context.Context) error {
+		select {
+		case <-time.After(10500 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	a := newAuditApp(t)
+	port := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- serveWith(ctx, a, port, &stdout, time.Minute, time.Second) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		// Inspect the login POST's own response, not whatever it
+		// redirects to — the point of this test is whether THAT
+		// response arrives before the server's write deadline, not
+		// whether the redirect chain eventually reaches something.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", port))
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%d/login", port), "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		t.Fatalf("login POST failed, likely truncated by the server's WriteTimeout: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("status = %d, want 303 (redirect after a successful, slow Touch-ID confirmation)", resp.StatusCode)
 	}
 }
 
@@ -436,6 +493,35 @@ func TestHandleEntryDetail_MasksSecretLikeFields(t *testing.T) {
 	}
 }
 
+// TestHandleEntryDetail_MasksCredentialShapedFields is a regression test
+// for a security review finding: the original secret-like-key rule only
+// matched "password"/"secret" substrings, so fields like api_key/token/
+// private_key rendered raw with no Touch-ID gate at all — a bigger leak
+// than the un-gated Password mask, since these are exactly the values a
+// hijacked browser session would want.
+func TestHandleEntryDetail_MasksCredentialShapedFields(t *testing.T) {
+	e := &store.Entry{
+		Path: "jasp/aws", Username: "bob", Password: "p2",
+		Fields: map[string]string{
+			"api_key":      "AKIA-raw-value",
+			"access_token": "gho_raw-token-value",
+			"private_key":  "-----BEGIN RSA PRIVATE KEY-----raw",
+		},
+	}
+	a, _ := newFakeApp(t, "human", e)
+	r := httptest.NewRequest("GET", "/entries/jasp/aws", nil)
+	r.SetPathValue("path", "jasp/aws")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	body := w.Body.String()
+	for _, raw := range []string{"AKIA-raw-value", "gho_raw-token-value", "-----BEGIN RSA PRIVATE KEY-----raw"} {
+		if strings.Contains(body, raw) {
+			t.Errorf("credential-shaped field value must be masked, found raw value %q", raw)
+		}
+	}
+}
+
 func TestHandleEntryDetail_Denied(t *testing.T) {
 	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
 	r := httptest.NewRequest("GET", "/entries/private/bank", nil)
@@ -457,6 +543,132 @@ func TestHandleEntryDetail_MethodNotAllowed(t *testing.T) {
 
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestHandleReveal_Success(t *testing.T) {
+	withStubTouchID(t, func(context.Context) error { return nil })
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "p1") {
+		t.Error("successful reveal should render the real password value")
+	}
+	if w.Header().Get("Cache-Control") != "" {
+		// handleEntryDetail is exercised directly here (bypassing authGate,
+		// same as every other handler test in this file), so no-store is
+		// asserted separately in TestAuthGate_SetsNoStoreHeader — this
+		// check just documents that the handler itself sets no headers
+		// that would fight authGate's Cache-Control.
+		t.Logf("handler set its own Cache-Control=%q (authGate also sets one)", w.Header().Get("Cache-Control"))
+	}
+
+	// Reveal must produce a `get` audit row — parity with `mys get --reveal`.
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionGet, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultOK || rows[0].SecretPath != "jasp/github" {
+		t.Fatalf("want 1 ok get row for jasp/github, got %+v", rows)
+	}
+}
+
+func TestHandleReveal_TouchIDFailure_StaysMasked(t *testing.T) {
+	withStubTouchID(t, func(context.Context) error { return errors.New("user cancelled") })
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (masked re-render, not an HTTP error); body=%q", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "p1") {
+		t.Error("failed Touch ID must not reveal the password")
+	}
+	if !strings.Contains(body, "user cancelled") {
+		t.Error("failed Touch ID should surface an error message")
+	}
+	// No `get` row on a failed reveal attempt — nothing was actually read.
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionGet, Limit: 5})
+	if len(rows) != 0 {
+		t.Errorf("failed Touch ID must not write a get row, got %d", len(rows))
+	}
+}
+
+func TestHandleReveal_RequiresFreshTouchIDEveryTime(t *testing.T) {
+	calls := 0
+	withStubTouchID(t, func(context.Context) error {
+		calls++
+		return nil
+	})
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	for i := 0; i < 2; i++ {
+		r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
+		r.SetPathValue("path", "jasp/github")
+		w := httptest.NewRecorder()
+		handleEntryDetail(a)(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("reveal %d: status = %d", i, w.Code)
+		}
+	}
+	if calls != 2 {
+		t.Errorf("Touch ID challenge count = %d, want 2 (one per reveal, no session-cookie shortcut)", calls)
+	}
+}
+
+func TestHandleReveal_DeniedNeverCallsTouchIDOrRendersValue(t *testing.T) {
+	touchIDCalled := false
+	withStubTouchID(t, func(context.Context) error {
+		touchIDCalled = true
+		return nil
+	})
+	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
+
+	r := httptest.NewRequest("POST", "/entries/private/bank", nil)
+	r.SetPathValue("path", "private/bank")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "p4") {
+		t.Error("denied reveal must not render the password value")
+	}
+	// Policy denial happens inside App.Get before Touch ID would even
+	// matter for authorization, but a denied caller should not be able to
+	// trigger the Touch-ID prompt at all via a path they can't read.
+	if touchIDCalled {
+		t.Error("Touch ID should not fire for a policy-denied path")
+	}
+}
+
+func TestAuthGate_SetsNoStoreHeader(t *testing.T) {
+	store := newSessionStore(time.Minute)
+	id := store.Issue()
+	h := authGate(store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	r := httptest.NewRequest("GET", "/entries/jasp/github", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: id})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	if got := w.Header().Get("Pragma"); got != "no-cache" {
+		t.Errorf("Pragma = %q, want no-cache", got)
 	}
 }
 

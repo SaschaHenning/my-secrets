@@ -230,7 +230,25 @@ func secretMatches(sec gopass.Secret, q string) bool {
 // by the suffix ("api_secret") rather than the prefix.
 func isSecretLikeKey(lowerKey string) bool {
 	name := strings.TrimPrefix(lowerKey, fieldKeyPrefix)
-	return strings.Contains(name, "password") || strings.Contains(name, "secret")
+	for _, marker := range secretLikeKeyMarkers {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// secretLikeKeyMarkers are substrings that mark a custom Fields key as
+// value-opaque. Kept as a blocklist (not an allowlist of known-safe
+// names) so existing non-secret custom fields never start rendering as
+// "*** unexpected mask" just because they weren't anticipated — but the
+// list must stay broad enough to cover the common credential-shaped
+// field names a user is realistically going to type, since these values
+// get rendered in the web UI's masked view with no Touch-ID gate at all
+// (unlike Password, which always requires a fresh reveal).
+var secretLikeKeyMarkers = []string{
+	"password", "secret", "token", "api_key", "apikey",
+	"private_key", "privatekey", "credential",
 }
 
 // IsSecretLikeFieldKey is the exported form of isSecretLikeKey, for

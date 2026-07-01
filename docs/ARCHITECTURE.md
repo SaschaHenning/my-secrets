@@ -186,8 +186,17 @@ metadata-only decrypt) but does so through `App.BrowseDetailed`/`App.Inspect`,
 which write a single aggregated `list_detail` audit row per call instead of
 one `get` row per path — browsing the list must not look, in the audit
 log, like reading every secret in it. `App.Get` (an actual reveal) stays
-the only path that writes `get` rows. The UI still has no write endpoints
-and does not render password values.
+the only path that writes `get` rows.
+
+`POST /entries/{path...}` is the one write-shaped-but-actually-read
+endpoint: reveal. It re-runs the policy check via `App.Inspect` first (so
+a denied path never even triggers the next step), then a *fresh*
+Touch-ID challenge — independent of the session cookie — then
+`App.Get`. This is the one place the UI renders an actual password
+value; every other view stays masked (`store.MaskedPassword`,
+`store.IsSecretLikeFieldKey` for custom `Fields` values). `authGate` sets
+`Cache-Control: no-store` on every gated response so a revealed value is
+never cached.
 
 Auto-shutdown on parent context cancel. A `localhostOnly` middleware
 rejects non-loopback `RemoteAddr`.

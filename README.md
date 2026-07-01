@@ -356,10 +356,16 @@ mys web --port 7823
 # → http://127.0.0.1:7823
 ```
 
-Read-only, hinter Touch-ID-Login. Neben Statistiken und Audit-Log gibt es
-unter `/entries` einen durchsuchbaren Secrets-Browser — gruppiert nach Org,
-mit Metadaten (Kind, Tags, Domain, Username) je Eintrag. **Niemals**
-Passwort-Werte. Bindet ausschließlich auf das Loopback-Interface.
+Hinter Touch-ID-Login. Neben Statistiken und Audit-Log gibt es unter
+`/entries` einen durchsuchbaren Secrets-Browser — gruppiert nach Org, mit
+Metadaten (Kind, Tags, Domain, Username) je Eintrag. Werte bleiben dabei
+**immer maskiert**.
+
+Ein Eintrag lässt sich gezielt aufdecken: der „Reveal"-Button auf der
+Detailseite verlangt **jedes Mal erneut Touch ID** — unabhängig von der
+Login-Session, die nur fürs Browsen der maskierten Ansicht reicht. Jeder
+Reveal erzeugt exakt dieselbe Audit-Zeile wie `mys get --reveal`. Bindet
+ausschließlich auf das Loopback-Interface.
 
 Screenshots siehe [`docs/screenshots/`](docs/screenshots).
 
