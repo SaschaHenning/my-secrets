@@ -356,25 +356,26 @@ mys web --port 7823
 # → http://127.0.0.1:7823
 ```
 
-Hinter Touch-ID-Login. Neben Statistiken und Audit-Log gibt es unter
-`/entries` einen Secrets-Browser als Tabelle: alle sichtbaren Einträge
-laden sofort, gruppiert nach Org, mit Metadaten (Kind, Tags, Domain,
-Username — immer sichtbar, auch wenn leer) und „zuletzt gelesen" je
-Zeile. Das Suchfeld filtert **live im Browser**, ohne Seiten-Reload —
-kein Klick, kein Formular-Submit. Jede Zeile hat zwei Kopier-Buttons:
-Nutzername sofort (kein Geheimnis, kein Touch-ID nötig), Passwort mit
-frischer Touch-ID-Abfrage direkt aus der Liste, ohne erst zur
-Detailseite zu wechseln. Werte bleiben sonst **immer maskiert**.
+Login einmal (Touch ID, sonst macOS-Passwort). Die Startseite bietet
+sofort ein Suchfeld (tippen + Enter → gefilterte Entries) und eine
+Liste der zuletzt benutzten Einträge mit Ein-Klick-Passwort-Kopie.
 
-„Zuletzt gelesen" stammt ausschließlich aus echten `get`-Audit-Zeilen —
-reines Browsen der Liste zählt nicht als Lesen, sonst würde jeder
-Seitenaufruf alle sichtbaren Einträge auf „gerade eben" setzen.
+Unter `/entries` gibt es einen Secrets-Browser als Tabelle: alle
+sichtbaren Einträge laden sofort, gruppiert nach Org, mit Metadaten
+(Kind, Tags, Domain, Username — immer sichtbar) und „zuletzt gelesen" je
+Zeile. Das Suchfeld filtert **live im Browser**, ohne Seiten-Reload.
+Jede Zeile hat zwei Kopier-Buttons: Nutzername und Passwort, beide
+direkt aus der Liste. Werte bleiben sonst **immer maskiert**.
 
-Ein Eintrag lässt sich gezielt aufdecken: der „Reveal"-Button auf der
-Detailseite verlangt **jedes Mal erneut Touch ID** — unabhängig von der
-Login-Session, die nur fürs Browsen der maskierten Ansicht reicht. Jeder
-Reveal erzeugt exakt dieselbe Audit-Zeile wie `mys get --reveal`. Bindet
-ausschließlich auf das Loopback-Interface.
+**Reveal ist session-gebunden:** einmal eingeloggt, deckt/kopiert man
+Werte ohne erneute Abfrage — bewusst so, weil die Konsole
+(`mys get --reveal`) ohnehin ungebremst und mächtiger ist, eine
+Pro-Reveal-Biometrie im lokalen Loopback-UI also nur Reibung ohne echten
+Sicherheitsgewinn wäre. Was bleibt: die Scope-Policy prüft jeden Reveal
+(verbotene Pfade → 403), und jeder Reveal erzeugt exakt dieselbe
+`get`-Audit-Zeile wie `mys get --reveal`. „Zuletzt gelesen"/„zuletzt
+benutzt" stammen ausschließlich aus diesen `get`-Zeilen — reines Browsen
+zählt nicht als Lesen. Bindet ausschließlich auf das Loopback-Interface.
 
 Die Detailseite zeigt außerdem eine „Historie"-Sektion mit den letzten
 Git-Commits, die die verschlüsselte Datei des Eintrags verändert haben

@@ -180,10 +180,10 @@ table.audit code, .entries-table code { font-family: 'SF Mono', Menlo, monospace
   border: 0;
 }
 
-#search {
+#search, #home-search {
   display: block;
   width: 100%;
-  max-width: 480px;
+  max-width: 560px;
   background: var(--surface);
   border: 1px solid var(--border);
   color: var(--text);
@@ -192,7 +192,7 @@ table.audit code, .entries-table code { font-family: 'SF Mono', Menlo, monospace
   font-size: 1rem;
   margin-bottom: 1.5rem;
 }
-#search:focus { outline: none; border-color: var(--accent); }
+#search:focus, #home-search:focus { outline: none; border-color: var(--accent); }
 
 .org-group { margin-bottom: 2rem; }
 .kind-badge { background: var(--surface2); color: var(--text); }

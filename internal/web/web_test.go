@@ -280,6 +280,60 @@ func TestLoginPOST_SlowTouchIDDoesNotHitWriteTimeout(t *testing.T) {
 	}
 }
 
+// TestHandleReveal_SlowDecryptDoesNotHitWriteTimeout guards the reveal
+// write-deadline extension (a regression the reviewer caught): a reveal
+// whose decrypt is slow — e.g. a cold gopass agent prompting pinentry —
+// must not be truncated by the server's default 10s WriteTimeout after
+// App.Get already logged a `get` row. Runs a real server (httptest can't
+// exercise write deadlines), logs in to get a session cookie, then
+// reveals against a store whose Get sleeps past the old 10s window.
+func TestHandleReveal_SlowDecryptDoesNotHitWriteTimeout(t *testing.T) {
+	withStubTouchID(t, func(context.Context) error { return nil })
+	a, f := newFakeApp(t, "human", &store.Entry{Path: "jasp/github", Org: "jasp", Username: "a", Password: "p1"})
+
+	port := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- serveWith(ctx, a, port, &stdout, time.Minute, time.Second) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Timeout: 20 * time.Second, Jar: jar}
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, err := client.Get(base + "/healthz"); err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	// Log in (fast) to obtain a session cookie in the jar.
+	loginResp, err := client.Post(base+"/login", "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	loginResp.Body.Close()
+
+	// Now make the reveal's decrypt slow, past the old 10s window.
+	f.GetDelay = 10500 * time.Millisecond
+
+	resp, err := client.Post(base+"/entries/jasp/github", "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		t.Fatalf("reveal POST failed, likely truncated by the server's WriteTimeout: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "p1") {
+		t.Errorf("slow-but-successful reveal should still deliver the value: %s", body)
+	}
+}
+
 // TestSafeNextPath checks the open-redirect guard: same-origin paths
 // pass through unchanged, anything that could send the post-login
 // redirect off this server falls back to the default.
@@ -946,7 +1000,6 @@ func TestHandleEntryDetail_MethodNotAllowed(t *testing.T) {
 }
 
 func TestHandleReveal_Success(t *testing.T) {
-	withStubTouchID(t, func(context.Context) error { return nil })
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 
 	r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
@@ -960,15 +1013,6 @@ func TestHandleReveal_Success(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "p1") {
 		t.Error("successful reveal should render the real password value")
 	}
-	if w.Header().Get("Cache-Control") != "" {
-		// handleEntryDetail is exercised directly here (bypassing authGate,
-		// same as every other handler test in this file), so no-store is
-		// asserted separately in TestAuthGate_SetsNoStoreHeader — this
-		// check just documents that the handler itself sets no headers
-		// that would fight authGate's Cache-Control.
-		t.Logf("handler set its own Cache-Control=%q (authGate also sets one)", w.Header().Get("Cache-Control"))
-	}
-
 	// Reveal must produce a `get` audit row — parity with `mys get --reveal`.
 	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionGet, Limit: 5})
 	if len(rows) != 1 || rows[0].Result != audit.ResultOK || rows[0].SecretPath != "jasp/github" {
@@ -976,12 +1020,38 @@ func TestHandleReveal_Success(t *testing.T) {
 	}
 }
 
+// TestHandleReveal_IsSessionOnly is the load-bearing test for the
+// session-only reveal model (#74): once the login session is valid,
+// revealing must NOT invoke the OS auth prompt at all — not per reveal,
+// not ever. requireTouchIDFunc is stubbed to record calls; a successful
+// reveal must leave that count at zero.
+func TestHandleReveal_IsSessionOnly(t *testing.T) {
+	calls := 0
+	withStubTouchID(t, func(context.Context) error { calls++; return nil })
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	for i := 0; i < 3; i++ {
+		r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
+		r.SetPathValue("path", "jasp/github")
+		w := httptest.NewRecorder()
+		handleEntryDetail(a)(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("reveal %d: status = %d; body=%q", i, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "p1") {
+			t.Errorf("reveal %d did not render the value", i)
+		}
+	}
+	if calls != 0 {
+		t.Errorf("reveal must not invoke the OS auth prompt (session-only), got %d calls", calls)
+	}
+}
+
 // TestHandleReveal_JSONMode covers the entries table's inline "copy
-// password" button: same Inspect→TouchID→Get gate as the full-page
-// reveal, just a JSON {"password": "..."} response instead of rendering
-// entry.html, requested via Accept: application/json.
+// password" button: same App.Get gate as the full-page reveal, just a
+// JSON {"password": "..."} response instead of rendering entry.html,
+// requested via Accept: application/json.
 func TestHandleReveal_JSONMode(t *testing.T) {
-	withStubTouchID(t, func(context.Context) error { return nil })
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 
 	r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
@@ -1013,24 +1083,6 @@ func TestHandleReveal_JSONMode(t *testing.T) {
 	}
 }
 
-func TestHandleReveal_JSONMode_TouchIDFailure(t *testing.T) {
-	withStubTouchID(t, func(context.Context) error { return errors.New("cancelled") })
-	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
-
-	r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
-	r.SetPathValue("path", "jasp/github")
-	r.Header.Set("Accept", "application/json")
-	w := httptest.NewRecorder()
-	handleEntryDetail(a)(w, r)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", w.Code)
-	}
-	if strings.Contains(w.Body.String(), "p1") {
-		t.Error("failed Touch ID must not reveal the password in JSON mode either")
-	}
-}
-
 func TestHandleReveal_JSONMode_Denied(t *testing.T) {
 	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
 
@@ -1048,60 +1100,7 @@ func TestHandleReveal_JSONMode_Denied(t *testing.T) {
 	}
 }
 
-func TestHandleReveal_TouchIDFailure_StaysMasked(t *testing.T) {
-	withStubTouchID(t, func(context.Context) error { return errors.New("user cancelled") })
-	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
-
-	r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
-	r.SetPathValue("path", "jasp/github")
-	w := httptest.NewRecorder()
-	handleEntryDetail(a)(w, r)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (masked re-render, not an HTTP error); body=%q", w.Code, w.Body.String())
-	}
-	body := w.Body.String()
-	if strings.Contains(body, "p1") {
-		t.Error("failed Touch ID must not reveal the password")
-	}
-	if !strings.Contains(body, "user cancelled") {
-		t.Error("failed Touch ID should surface an error message")
-	}
-	// No `get` row on a failed reveal attempt — nothing was actually read.
-	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionGet, Limit: 5})
-	if len(rows) != 0 {
-		t.Errorf("failed Touch ID must not write a get row, got %d", len(rows))
-	}
-}
-
-func TestHandleReveal_RequiresFreshTouchIDEveryTime(t *testing.T) {
-	calls := 0
-	withStubTouchID(t, func(context.Context) error {
-		calls++
-		return nil
-	})
-	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
-
-	for i := 0; i < 2; i++ {
-		r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
-		r.SetPathValue("path", "jasp/github")
-		w := httptest.NewRecorder()
-		handleEntryDetail(a)(w, r)
-		if w.Code != http.StatusOK {
-			t.Fatalf("reveal %d: status = %d", i, w.Code)
-		}
-	}
-	if calls != 2 {
-		t.Errorf("Touch ID challenge count = %d, want 2 (one per reveal, no session-cookie shortcut)", calls)
-	}
-}
-
-func TestHandleReveal_DeniedNeverCallsTouchIDOrRendersValue(t *testing.T) {
-	touchIDCalled := false
-	withStubTouchID(t, func(context.Context) error {
-		touchIDCalled = true
-		return nil
-	})
+func TestHandleReveal_DeniedDoesNotRenderValue(t *testing.T) {
 	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
 
 	r := httptest.NewRequest("POST", "/entries/private/bank", nil)
@@ -1115,11 +1114,11 @@ func TestHandleReveal_DeniedNeverCallsTouchIDOrRendersValue(t *testing.T) {
 	if strings.Contains(w.Body.String(), "p4") {
 		t.Error("denied reveal must not render the password value")
 	}
-	// Policy denial happens inside App.Get before Touch ID would even
-	// matter for authorization, but a denied caller should not be able to
-	// trigger the Touch-ID prompt at all via a path they can't read.
-	if touchIDCalled {
-		t.Error("Touch ID should not fire for a policy-denied path")
+	// Denial is enforced by App.Get's policy check, and writes a denied
+	// get row (not an ok one).
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionGet, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultDenied {
+		t.Fatalf("want 1 denied get row, got %+v", rows)
 	}
 }
 
@@ -1226,6 +1225,60 @@ func TestHandleIndex(t *testing.T) {
 		if !strings.Contains(body, substr) {
 			t.Errorf("index body missing %q: %s", substr, body[:minInt(len(body), 300)])
 		}
+	}
+}
+
+// TestHandleIndex_SearchAndRecentlyUsed covers the redesigned start page:
+// a search form pointing at /entries, and a "zuletzt benutzt" list built
+// from the audit log's get/ok rows (never from denied gets), each with a
+// one-click copy-password button — all without decrypting anything.
+func TestHandleIndex_SearchAndRecentlyUsed(t *testing.T) {
+	// newAuditApp seeds a get/ok for jasp/github and a get/denied for
+	// private/bank; only the former is "recently used".
+	a := newAuditApp(t)
+	r := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handleIndex(a)(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+
+	// Search form → /entries with an input named q.
+	if !strings.Contains(body, `action="/entries"`) || !strings.Contains(body, `name="q"`) {
+		t.Errorf("start page missing a search form pointing at /entries: %s", body)
+	}
+	// Recently-used shows the successfully-read path with a copy button…
+	if !strings.Contains(body, `data-copy-password="jasp/github"`) {
+		t.Errorf("recently-used missing jasp/github copy button: %s", body)
+	}
+	// …but never a path that was only ever denied.
+	if strings.Contains(body, `data-copy-password="private/bank"`) {
+		t.Error("a denied get must not appear in recently-used")
+	}
+}
+
+func TestRecentlyUsed_OrdersByMostRecentAndCapsLimit(t *testing.T) {
+	l, err := audit.Open(filepath.Join(t.TempDir(), "audit.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	a := &app.App{Audit: l, Policy: policy.Default(), Override: "human"}
+	ctx := context.Background()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i, p := range []string{"jasp/old", "jasp/mid", "jasp/new"} {
+		_, _ = l.Write(ctx, audit.Entry{
+			TS: base.Add(time.Duration(i) * time.Hour), Action: audit.ActionGet,
+			SecretPath: p, ActorKind: audit.ActorHuman, Result: audit.ResultOK,
+		})
+	}
+	got := recentlyUsed(a, ctx, 2)
+	if len(got) != 2 {
+		t.Fatalf("want 2 (capped), got %d", len(got))
+	}
+	if got[0].Path != "jasp/new" || got[1].Path != "jasp/mid" {
+		t.Errorf("want most-recent-first [jasp/new jasp/mid], got %+v", got)
 	}
 }
 
