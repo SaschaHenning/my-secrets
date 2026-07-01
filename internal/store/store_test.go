@@ -229,6 +229,28 @@ func TestSecretMatches_SecretLikeFieldValueHidden(t *testing.T) {
 	}
 }
 
+func TestIsSecretLikeFieldKey(t *testing.T) {
+	secretLike := []string{
+		"password", "field.password", "db_password",
+		"secret", "api_secret", "client_secret",
+		"token", "access_token", "refresh_token",
+		"api_key", "apikey",
+		"private_key", "privatekey",
+		"credential", "credentials",
+	}
+	for _, k := range secretLike {
+		if !IsSecretLikeFieldKey(k) {
+			t.Errorf("IsSecretLikeFieldKey(%q) = false, want true", k)
+		}
+	}
+	safe := []string{"account_id", "region", "tenant", "username", "url", "notes"}
+	for _, k := range safe {
+		if IsSecretLikeFieldKey(k) {
+			t.Errorf("IsSecretLikeFieldKey(%q) = true, want false", k)
+		}
+	}
+}
+
 // Close on a nil Store must not panic.
 func TestStore_Close_Nil(t *testing.T) {
 	var s *Store

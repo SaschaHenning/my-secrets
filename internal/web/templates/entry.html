@@ -20,6 +20,8 @@
   <p><a href="/entries?org={{.Entry.Org}}" class="btn-link">&larr; {{.Entry.Org}}</a></p>
   <h2><code>{{.Entry.Path}}</code></h2>
 
+  {{if .Error}}<p class="empty" style="color:#f87171">{{.Error}}</p>{{end}}
+
   <table class="audit">
     <tbody>
       {{if .Entry.Kind}}<tr><td>Kind</td><td><span class="badge kind-badge">{{.Entry.Kind}}</span></td></tr>{{end}}
@@ -27,7 +29,21 @@
       {{if .Entry.URL}}<tr><td>URL</td><td>{{.Entry.URL}}</td></tr>{{end}}
       {{if .Entry.Domain}}<tr><td>Domain</td><td>{{.Entry.Domain}}</td></tr>{{end}}
       {{if .Entry.GitHubProject}}<tr><td>GitHub project</td><td>{{.Entry.GitHubProject}}</td></tr>{{end}}
-      <tr><td>Password</td><td><code>{{mask .Entry.Password}}</code></td></tr>
+      <tr>
+        <td>Password</td>
+        <td>
+          {{if .Revealed}}
+            <code id="pw-value">{{.Entry.Password}}</code>
+            <button type="button" class="btn-link" onclick="navigator.clipboard.writeText(document.getElementById('pw-value').textContent)">Copy</button>
+            <span class="hint" id="pw-hint">wird in 30s wieder maskiert</span>
+          {{else}}
+            <code>{{mask .Entry.Password}}</code>
+            <form method="post" action="/entries/{{.Entry.Path}}" style="display:inline;">
+              <button type="submit" class="btn-link">Reveal (Touch ID)</button>
+            </form>
+          {{end}}
+        </td>
+      </tr>
       {{if .Entry.RotateAfter}}<tr><td>Rotate after</td><td>{{.Entry.RotateAfter}}</td></tr>{{end}}
       {{if not .Entry.RotatedAt.IsZero}}<tr><td>Last rotated</td><td>{{shortTime .Entry.RotatedAt}}</td></tr>{{end}}
       {{if .Entry.Notes}}<tr><td>Notes</td><td>{{.Entry.Notes}}</td></tr>{{end}}
@@ -43,6 +59,19 @@
 </section>
 
 </main>
-<footer>local read-only UI · bound to 127.0.0.1 · no secret values are rendered here</footer>
+<footer>local UI · bound to 127.0.0.1 · revealing a value needs Touch ID every time and is logged like `mys get --reveal`</footer>
+{{if .Revealed}}
+<script>
+  // Cosmetic only, not a security control — the value already round-tripped
+  // over HTTP. The real control is the no-store response header and the
+  // Touch-ID challenge required to get here in the first place.
+  setTimeout(function () {
+    var el = document.getElementById('pw-value');
+    var hint = document.getElementById('pw-hint');
+    if (el) el.textContent = '••••••••';
+    if (hint) hint.textContent = 'maskiert';
+  }, 30000);
+</script>
+{{end}}
 </body>
 </html>

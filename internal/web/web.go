@@ -1,6 +1,8 @@
-// Package web serves a minimal read-only localhost UI for browsing the
-// audit log and entry list. The UI never decrypts secret values — it talks
-// only to the audit DB and to a path-list helper.
+// Package web serves a read-only-except-reveal localhost UI: browsing
+// the audit log, browsing/searching secrets metadata (never decrypts a
+// value just to render a list — see App.BrowseDetailed/App.Inspect), and
+// an explicit, re-authenticated reveal action for a single value (see
+// handleReveal) that mirrors `mys get --reveal` in the audit log.
 package web
 
 import (
@@ -39,6 +41,17 @@ const defaultSessionTTL = 30 * time.Minute
 // Kept short enough to respond promptly once ttl is exceeded but long
 // enough not to waste cycles.
 const idleTickInterval = 30 * time.Second
+
+// touchIDWriteBudget is how long a Touch-ID-gated handler (login, reveal)
+// gets to write its response, overriding the server's normal 10s
+// WriteTimeout for just that request. defaultRequireTouchID itself waits
+// up to 30s (auth_darwin.go) and explicitly supports falling back to a
+// typed password, which routinely takes longer than the server's default
+// write budget — without this override, a slow-but-successful Touch-ID
+// challenge would still get its response cut off, even though App.Get
+// already ran and wrote a `get` audit row for a value the browser never
+// actually received.
+const touchIDWriteBudget = 45 * time.Second
 
 func init() {
 	funcs := template.FuncMap{
@@ -166,7 +179,10 @@ func localhostOnly(h http.Handler) http.Handler {
 
 // authGate wraps a handler so it only fires for callers with a valid
 // session cookie. Missing/stale cookies get a 303 See Other back to
-// /login.
+// /login. Every gated response also gets Cache-Control: no-store — set
+// here once rather than per-handler, since it must cover everything
+// behind the gate (entry metadata, and since the reveal endpoint below,
+// actual secret values), not just the one route that first needed it.
 func authGate(store *sessionStore, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(sessionCookieName)
@@ -174,8 +190,23 @@ func authGate(store *sessionStore, next http.Handler) http.Handler {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// extendWriteDeadlineForTouchID pushes the current request's write
+// deadline out to touchIDWriteBudget, overriding the server-wide
+// WriteTimeout for handlers that are about to block on requireTouchID.
+// Best-effort: SetWriteDeadline returns http.ErrNotSupported for a
+// ResponseWriter that doesn't implement the deadline-setting interface
+// (e.g. httptest.ResponseRecorder in unit tests) — that's fine, tests
+// stub requireTouchIDFunc to return instantly so the real timeout window
+// never matters there, and production always runs behind the real
+// net/http server, which does support it.
+func extendWriteDeadlineForTouchID(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(touchIDWriteBudget))
 }
 
 // --- login handler ---------------------------------------------------------
@@ -189,6 +220,7 @@ func handleLogin(store *sessionStore, ttl time.Duration) http.HandlerFunc {
 		case http.MethodGet:
 			renderLogin(w, "")
 		case http.MethodPost:
+			extendWriteDeadlineForTouchID(w)
 			if err := requireTouchID(r.Context()); err != nil {
 				w.WriteHeader(http.StatusUnauthorized)
 				renderLogin(w, err.Error())
@@ -452,9 +484,24 @@ func entryMatches(e *store.Entry, q string) bool {
 	return false
 }
 
-// handleEntryDetail serves the masked entry-detail page at
-// /entries/{path...}. GET only in this iteration — reveal (POST) is a
-// separate, security-sensitive change layered on top later.
+// handleEntryDetail serves the entry-detail page at /entries/{path...}.
+// GET renders the masked view (App.Inspect — does not count as a read).
+// POST is the reveal action: for any path the caller is actually allowed
+// to read, it requires a FRESH Touch-ID challenge on every single
+// submission, deliberately not relying on the session cookie that
+// already gates access to this page. The session cookie answers "is this
+// browser allowed to browse metadata"; Touch ID answers "does a human
+// want to see this specific value right now" — collapsing the two would
+// mean an open browser tab, or anyone who can reach it within the
+// 30-minute idle window, could reveal every secret without further
+// confirmation. On success it calls the unmodified App.Get, so a web
+// reveal produces the exact same `get` audit row shape as `mys get
+// --reveal` on the CLI.
+//
+// No CSRF token on the reveal form: the session cookie is
+// SameSite=Lax (session.go), which browsers do not attach to a
+// cross-site POST — so a forged form on another origin can't even reach
+// authGate with a valid session, let alone trigger a reveal.
 func handleEntryDetail(a *app.App) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		path := r.PathValue("path")
@@ -462,29 +509,78 @@ func handleEntryDetail(a *app.App) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", "GET")
+		switch r.Method {
+		case http.MethodGet:
+			renderMaskedEntry(w, r, a, path, "")
+		case http.MethodPost:
+			handleReveal(w, r, a, path)
+		default:
+			w.Header().Set("Allow", "GET, POST")
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		e, err := a.Inspect(r.Context(), path)
-		if err != nil {
-			var denied *app.ErrDenied
-			if errors.As(err, &denied) {
-				http.Error(w, denied.Error(), http.StatusForbidden)
-				return
-			}
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		data := map[string]any{
-			"Page":  "entries",
-			"Entry": e,
-		}
-		if err := templates.ExecuteTemplate(w, "entry.html", data); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
+}
+
+// handleReveal checks accessibility via App.Inspect FIRST — before ever
+// running the Touch-ID challenge. This matters for two reasons: a caller
+// who is policy-denied from a path gets a correctly audited denial
+// (Inspect writes it) and never sees the biometric prompt at all for
+// something they could never read anyway; and it means a bare POST to a
+// denied path (no prior page load) can't be used to spam Touch-ID
+// prompts. Only once Inspect confirms the path is both real and allowed
+// does the fresh Touch-ID challenge run, followed by the unmodified
+// App.Get, so a web reveal produces the exact same `get` audit row shape
+// as `mys get --reveal` on the CLI.
+func handleReveal(w http.ResponseWriter, r *http.Request, a *app.App, path string) {
+	masked, err := a.Inspect(r.Context(), path)
+	if err != nil {
+		writeEntryError(w, err)
+		return
+	}
+	extendWriteDeadlineForTouchID(w)
+	if err := requireTouchID(r.Context()); err != nil {
+		renderEntry(w, masked, false, "Touch ID erforderlich: "+err.Error())
+		return
+	}
+	e, err := a.Get(r.Context(), path)
+	if err != nil {
+		writeEntryError(w, err)
+		return
+	}
+	renderEntry(w, e, true, "")
+}
+
+// renderMaskedEntry re-fetches metadata via App.Inspect (never a `get`
+// row) and renders the masked view, optionally with an error message
+// (e.g. a failed Touch-ID challenge from a reveal attempt).
+func renderMaskedEntry(w http.ResponseWriter, r *http.Request, a *app.App, path, errMsg string) {
+	e, err := a.Inspect(r.Context(), path)
+	if err != nil {
+		writeEntryError(w, err)
+		return
+	}
+	renderEntry(w, e, false, errMsg)
+}
+
+func renderEntry(w http.ResponseWriter, e *store.Entry, revealed bool, errMsg string) {
+	data := map[string]any{
+		"Page":     "entries",
+		"Entry":    e,
+		"Revealed": revealed,
+		"Error":    errMsg,
+	}
+	if err := templates.ExecuteTemplate(w, "entry.html", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func writeEntryError(w http.ResponseWriter, err error) {
+	var denied *app.ErrDenied
+	if errors.As(err, &denied) {
+		http.Error(w, denied.Error(), http.StatusForbidden)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusInternalServerError)
 }
 
 func actorBadge(kind string) template.HTML {
