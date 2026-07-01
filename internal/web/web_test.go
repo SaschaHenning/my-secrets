@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -226,7 +227,7 @@ func TestLoginPOSTFailureReturns401(t *testing.T) {
 // for a review finding: the server's default WriteTimeout (10s) is
 // shorter than defaultRequireTouchID's own timeout (30s, and it
 // explicitly supports a slow password-fallback path) — without
-// extendWriteDeadlineForTouchID overriding the deadline for this
+// extendWriteDeadline overriding the deadline for this
 // request, a legitimate but slow Touch-ID confirmation would have its
 // response cut off even though authentication succeeded. This runs a
 // real net/http server (httptest.ResponseRecorder does not support
@@ -937,6 +938,36 @@ func TestAuthGate_SetsNoStoreHeader(t *testing.T) {
 	}
 }
 
+func TestRelativeTime(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name string
+		t    time.Time
+		want string
+	}{
+		{"zero", time.Time{}, "nie"},
+		{"just now", now.Add(-10 * time.Second), "gerade eben"},
+		{"one minute", now.Add(-70 * time.Second), "vor 1 Minute"},
+		{"three minutes", now.Add(-3 * time.Minute), "vor 3 Minuten"},
+		{"today, two hours ago", now.Add(-2 * time.Hour), "heute, " + now.Add(-2*time.Hour).Local().Format("15:04")},
+		{"yesterday", now.AddDate(0, 0, -1), "gestern, " + now.AddDate(0, 0, -1).Local().Format("15:04")},
+		{"a week ago", now.AddDate(0, 0, -7), now.AddDate(0, 0, -7).Local().Format("2006-01-02 15:04:05")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// "today, two hours ago" is flaky right around midnight (the
+			// 2-hour-ago timestamp could fall on the previous calendar
+			// day) — skip that one edge case rather than special-case it.
+			if tc.name == "today, two hours ago" && now.Add(-2*time.Hour).Day() != now.Day() {
+				t.Skip("would cross midnight in this run — flaky by construction, not a real bug")
+			}
+			if got := relativeTime(tc.t); got != tc.want {
+				t.Errorf("relativeTime(%v) = %q, want %q", tc.t, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSearchableText(t *testing.T) {
 	e := &store.Entry{
 		Path: "jasp/aws", Username: "bob", URL: "https://aws.amazon.com",
@@ -1249,6 +1280,82 @@ func TestServe_PWAAssetsAreServed(t *testing.T) {
 		}
 		if tc.wantContain != "" && !strings.Contains(string(body), tc.wantContain) {
 			t.Errorf("%s: body missing %q", tc.path, tc.wantContain)
+		}
+	}
+}
+
+// TestHandleEntries_SlowDecryptDoesNotHitWriteTimeout is a regression
+// test for a real-world bug found on a real store: with enough entries
+// and real decrypt latency, /entries used to take longer than the
+// server's default 10s WriteTimeout. The request's context got cancelled
+// mid-decrypt (surfacing as a wall of "context canceled" errors from the
+// remaining Store.Get calls) and the connection was torn down before any
+// response reached the browser — the page silently "loaded nothing".
+// Simulates 3 entries at 4s of decrypt latency each (12s total, past the
+// old 10s window, comfortably inside entriesWriteBudget) through a real
+// net/http server — httptest.ResponseRecorder doesn't support write
+// deadlines at all, so this can't be a table test against the handler
+// directly.
+func TestHandleEntries_SlowDecryptDoesNotHitWriteTimeout(t *testing.T) {
+	withStubTouchID(t, func(context.Context) error { return nil })
+	entries := []*store.Entry{
+		{Path: "jasp/a", Org: "jasp", Username: "a"},
+		{Path: "jasp/b", Org: "jasp", Username: "b"},
+		{Path: "jasp/c", Org: "jasp", Username: "c"},
+	}
+	a, f := newFakeApp(t, "human", entries...)
+	f.GetDelay = 4 * time.Second
+
+	port := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- serveWith(ctx, a, port, &stdout, time.Minute, time.Second) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+		Jar:     jar,
+		// Without this, the client follows the login POST's 303 redirect
+		// straight into GET /entries, running the slow decrypt path once
+		// there and again for the explicit GET below — doubling the
+		// test's cost and moving the failure (without the fix) to the
+		// login call instead of the intended assertion.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, err := client.Get(base + "/healthz"); err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	loginResp, err := client.Post(base+"/login", "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	loginResp.Body.Close()
+
+	resp, err := client.Get(base + "/entries")
+	if err != nil {
+		t.Fatalf("GET /entries failed, likely truncated by the server's WriteTimeout: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", resp.StatusCode, body)
+	}
+	for _, want := range []string{"jasp/a", "jasp/b", "jasp/c"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("entries page missing %q despite slow decrypts: %s", want, body)
 		}
 	}
 }

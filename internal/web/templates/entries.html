@@ -40,7 +40,7 @@
           {{range .Tags}}<span class="tag">{{.}}</span>{{end}}
         </div>
         {{end}}
-        <div class="last-read">zuletzt gelesen: {{lastReadText (index $.LastReads .Path)}}</div>
+        <div class="last-read">zuletzt gelesen: {{relativeTime (index $.LastReads .Path)}}</div>
       </a>
     {{end}}
     </div>

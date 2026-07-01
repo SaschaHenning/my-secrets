@@ -197,6 +197,19 @@ already writes exactly one aggregated audit row per call regardless of
 entry count — for a personal store this size, that's fast enough that
 hiding entries behind an extra click was pure friction.
 
+Decrypting every entry on one page load is slower than the server's
+default 10s `WriteTimeout`, once the store has enough entries — a real
+bug found via a real store, not a hypothetical: the request's context
+got cancelled mid-decrypt (a wall of "context canceled" errors from the
+remaining `Store.Get` calls) and the connection was torn down before any
+response reached the browser, so the page silently "loaded nothing".
+`handleEntries` calls `extendWriteDeadline(w, entriesWriteBudget)` (2
+minutes) before decrypting, the same `http.ResponseController`-based
+override already used for the Touch-ID write budget. "Zuletzt gelesen"/
+"zuletzt gesynct" render via `relativeTime` (recency-first: "gerade
+eben"/"vor N Minuten" within the last hour, "heute"/"gestern" for the
+last two calendar days, the absolute date only once it's older).
+
 The page decrypts entries to render metadata (gopass has no
 metadata-only decrypt) but does so through `App.BrowseDetailed`/`App.Inspect`,
 which write a single aggregated `list_detail` audit row per call instead of

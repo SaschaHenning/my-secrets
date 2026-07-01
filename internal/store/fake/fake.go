@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/store"
 )
@@ -35,6 +36,13 @@ type Store struct {
 	RemoveErr error
 	OrgsErr   error
 	CloseErr  error
+	// GetDelay simulates real decrypt latency — zero (the default) means
+	// no delay, which is what every existing test relies on for instant
+	// fake-store behavior. Set this only in tests that specifically need
+	// to exercise timeout/deadline handling around code that calls Get
+	// once per entry (e.g. App.BrowseDetailed decrypting a whole store).
+	// Respects ctx cancellation, same as the real store would.
+	GetDelay time.Duration
 }
 
 // Compile-time assertion: *Store satisfies store.Interface.
@@ -176,9 +184,16 @@ func entryMatches(path string, e *store.Entry, q string) bool {
 	return false
 }
 
-func (s *Store) Get(_ context.Context, path string) (*store.Entry, error) {
+func (s *Store) Get(ctx context.Context, path string) (*store.Entry, error) {
 	if s.GetErr != nil {
 		return nil, s.GetErr
+	}
+	if s.GetDelay > 0 {
+		select {
+		case <-time.After(s.GetDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()

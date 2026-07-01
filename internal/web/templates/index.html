@@ -32,7 +32,7 @@
       <tr>
         <td>{{.Mount}}</td>
         <td><code>{{.URL}}</code></td>
-        <td>{{if .LastSync.IsZero}}nie{{else}}{{shortTime .LastSync}}{{end}}</td>
+        <td>{{relativeTime .LastSync}}</td>
       </tr>
     {{end}}
     </tbody>

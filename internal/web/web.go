@@ -55,6 +55,19 @@ const idleTickInterval = 30 * time.Second
 // actually received.
 const touchIDWriteBudget = 45 * time.Second
 
+// entriesWriteBudget is how long /entries gets to decrypt and render.
+// handleEntries calls App.BrowseDetailed(ctx, ""), which decrypts EVERY
+// policy-visible entry one at a time — for a real store (as opposed to
+// the handful of fixture entries in tests), this routinely exceeds the
+// server's normal 10s WriteTimeout. Without this override the request's
+// context is cancelled mid-decrypt (surfacing as a wall of "context
+// canceled" errors from the remaining Store.Get calls) and the
+// connection is torn down before any response reaches the browser — the
+// page silently "loads nothing". 2 minutes is a generous ceiling for a
+// personal store; if this genuinely isn't enough, the fix is caching
+// decrypted metadata between loads, not raising this further.
+const entriesWriteBudget = 2 * time.Minute
+
 func init() {
 	funcs := template.FuncMap{
 		"actorBadge":  actorBadge,
@@ -62,16 +75,8 @@ func init() {
 		"shortTime": func(t time.Time) string {
 			return t.Local().Format("2006-01-02 15:04:05")
 		},
-		// lastReadText renders "never" for the zero Time (never read via
-		// App.Get) rather than the misleading "0001-01-01" a bare
-		// shortTime would produce.
-		"lastReadText": func(t time.Time) string {
-			if t.IsZero() {
-				return "nie"
-			}
-			return t.Local().Format("2006-01-02 15:04:05")
-		},
-		"mask": store.MaskedPassword,
+		"relativeTime": relativeTime,
+		"mask":         store.MaskedPassword,
 		// maskField masks a custom Fields value the same way Password is
 		// always masked, when its key looks secret-like (contains
 		// "password" or "secret" — same rule the store's own search uses
@@ -234,17 +239,17 @@ func safeNextPath(next, defaultPath string) string {
 	return next
 }
 
-// extendWriteDeadlineForTouchID pushes the current request's write
-// deadline out to touchIDWriteBudget, overriding the server-wide
-// WriteTimeout for handlers that are about to block on requireTouchID.
-// Best-effort: SetWriteDeadline returns http.ErrNotSupported for a
-// ResponseWriter that doesn't implement the deadline-setting interface
-// (e.g. httptest.ResponseRecorder in unit tests) — that's fine, tests
-// stub requireTouchIDFunc to return instantly so the real timeout window
-// never matters there, and production always runs behind the real
-// net/http server, which does support it.
-func extendWriteDeadlineForTouchID(w http.ResponseWriter) {
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(touchIDWriteBudget))
+// extendWriteDeadline pushes the current request's write deadline out to
+// budget, overriding the server-wide WriteTimeout for a handler that's
+// about to do something slower than the default 10s allows (a Touch-ID
+// challenge, or decrypting an entire store). Best-effort: SetWriteDeadline
+// returns http.ErrNotSupported for a ResponseWriter that doesn't
+// implement the deadline-setting interface (e.g. httptest.ResponseRecorder
+// in unit tests) — that's fine, tests use fixtures/stubs fast enough that
+// the real timeout window never matters there, and production always
+// runs behind the real net/http server, which does support it.
+func extendWriteDeadline(w http.ResponseWriter, budget time.Duration) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(budget))
 }
 
 // --- login handler ---------------------------------------------------------
@@ -259,7 +264,7 @@ func handleLogin(store *sessionStore, ttl time.Duration) http.HandlerFunc {
 			renderLogin(w, "", r.URL.Query().Get("next"))
 		case http.MethodPost:
 			next := safeNextPath(r.FormValue("next"), defaultLandingPath)
-			extendWriteDeadlineForTouchID(w)
+			extendWriteDeadline(w, touchIDWriteBudget)
 			if err := requireTouchID(r.Context()); err != nil {
 				w.WriteHeader(http.StatusUnauthorized)
 				renderLogin(w, err.Error(), next)
@@ -502,6 +507,7 @@ func handleEntries(a *app.App) http.HandlerFunc {
 		ctx := r.Context()
 		initial := strings.TrimSpace(r.URL.Query().Get("q"))
 
+		extendWriteDeadline(w, entriesWriteBudget)
 		entries, err := a.BrowseDetailed(ctx, "")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -577,7 +583,7 @@ func handleReveal(w http.ResponseWriter, r *http.Request, a *app.App, path strin
 		writeEntryError(w, err)
 		return
 	}
-	extendWriteDeadlineForTouchID(w)
+	extendWriteDeadline(w, touchIDWriteBudget)
 	if err := requireTouchID(r.Context()); err != nil {
 		renderEntry(w, r, a, masked, false, "Touch ID erforderlich: "+err.Error())
 		return
@@ -640,6 +646,48 @@ func writeEntryError(w http.ResponseWriter, err error) {
 		return
 	}
 	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// relativeTime renders "wann zuletzt" recency-first rather than forcing
+// a mental subtraction from an absolute date every time: "nie" for the
+// zero Time (never happened), "gerade eben"/"vor N Minuten" within the
+// last hour, "heute, HH:MM"/"gestern, HH:MM" for the last two calendar
+// days, and the full absolute date only once it's older than that. Used
+// for both "zuletzt gelesen" (entries/entry pages) and "zuletzt gesynct"
+// (index page) — same kind of timestamp, same recency-first framing.
+func relativeTime(t time.Time) string {
+	if t.IsZero() {
+		return "nie"
+	}
+	now := time.Now()
+	d := now.Sub(t)
+	switch {
+	case d < 45*time.Second:
+		return "gerade eben"
+	case d < time.Hour:
+		mins := int(d.Minutes())
+		if mins < 1 {
+			mins = 1
+		}
+		if mins == 1 {
+			return "vor 1 Minute"
+		}
+		return fmt.Sprintf("vor %d Minuten", mins)
+	}
+	local, nowLocal := t.Local(), now.Local()
+	if isSameDay(local, nowLocal) {
+		return "heute, " + local.Format("15:04")
+	}
+	if isSameDay(local, nowLocal.AddDate(0, 0, -1)) {
+		return "gestern, " + local.Format("15:04")
+	}
+	return local.Format("2006-01-02 15:04:05")
+}
+
+func isSameDay(a, b time.Time) bool {
+	ya, ma, da := a.Date()
+	yb, mb, db := b.Date()
+	return ya == yb && ma == mb && da == db
 }
 
 func actorBadge(kind string) template.HTML {

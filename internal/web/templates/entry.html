@@ -45,7 +45,7 @@
       </tr>
       {{if .Entry.RotateAfter}}<tr><td>Rotate after</td><td>{{.Entry.RotateAfter}}</td></tr>{{end}}
       {{if not .Entry.RotatedAt.IsZero}}<tr><td>Last rotated</td><td>{{shortTime .Entry.RotatedAt}}</td></tr>{{end}}
-      <tr><td>Zuletzt gelesen</td><td>{{lastReadText .LastRead}}</td></tr>
+      <tr><td>Zuletzt gelesen</td><td>{{relativeTime .LastRead}}</td></tr>
       {{if .Entry.Notes}}<tr><td>Notes</td><td>{{.Entry.Notes}}</td></tr>{{end}}
       {{range $k, $v := .Entry.Fields}}<tr><td>{{$k}}</td><td><code>{{maskField $k $v}}</code></td></tr>{{end}}
     </tbody>
