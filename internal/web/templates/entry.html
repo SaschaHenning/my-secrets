@@ -16,7 +16,7 @@
 <main>
 
 <section>
-  <p><a href="/entries?org={{.Entry.Org}}" class="btn-link">&larr; {{.Entry.Org}}</a></p>
+  <p><a href="/entries?q={{.Entry.Org}}" class="btn-link">&larr; {{.Entry.Org}}</a></p>
   <h2><code>{{.Entry.Path}}</code></h2>
 
   {{if .Error}}<p class="empty" style="color:#f87171">{{.Error}}</p>{{end}}

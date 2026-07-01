@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -419,16 +420,28 @@ func newFakeApp(t *testing.T, override string, entries ...*store.Entry) (*app.Ap
 	return &app.App{Store: f, Audit: l, Policy: pol, Override: override}, f
 }
 
+// sampleWebEntries sets Org explicitly on every fixture — unlike the real
+// store (store.entryFromSecret derives Org from Path automatically),
+// fake.Store.NewWithEntries stores a plain struct copy and does not, so
+// a test relying on grouping/org-scoped behavior would silently see
+// every entry bucketed under Org="" if this were left unset.
 func sampleWebEntries() []*store.Entry {
 	return []*store.Entry{
-		{Path: "jasp/github", Username: "alice", Password: "p1", Kind: store.KindToken, Tags: []string{"ci"}},
-		{Path: "jasp/aws", Username: "bob", Password: "p2", Notes: "prod", Domain: "aws.amazon.com"},
-		{Path: "zuhause/router", Username: "admin", Password: "p3"},
-		{Path: "private/bank", Username: "me", Password: "p4"},
+		{Path: "jasp/github", Org: "jasp", Username: "alice", Password: "p1", Kind: store.KindToken, Tags: []string{"ci"}},
+		{Path: "jasp/aws", Org: "jasp", Username: "bob", Password: "p2", Notes: "prod", Domain: "aws.amazon.com"},
+		{Path: "zuhause/router", Org: "zuhause", Username: "admin", Password: "p3"},
+		{Path: "private/bank", Org: "private", Username: "me", Password: "p4"},
 	}
 }
 
-func TestHandleEntries_OrgListIsCheapAndDoesNotDecrypt(t *testing.T) {
+// TestHandleEntries_AlwaysShowsAllEntriesGrouped covers the current
+// design: /entries decrypts and shows every policy-visible entry, on one
+// page, grouped by org — no click-through, no separate "browse this org"
+// step. Filtering then happens entirely client-side (see entries.html's
+// inline script), which is also why the server-rendered body always
+// contains every entry regardless of any "q" — the data-search attribute
+// is what the browser filters on, not the server response.
+func TestHandleEntries_AlwaysShowsAllEntriesGrouped(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
@@ -438,21 +451,30 @@ func TestHandleEntries_OrgListIsCheapAndDoesNotDecrypt(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	for _, want := range []string{"jasp", "zuhause", "private"} {
+	for _, want := range []string{"jasp/github", "jasp/aws", "zuhause/router", "alice", "aws.amazon.com"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("org list missing %q", want)
+			t.Errorf("entries page missing %q: %s", want, body)
 		}
 	}
-	// No ActionListDetail row: the landing view must not decrypt anything.
+	// Actual per-org headers, not just a substring match against entry
+	// paths (which would pass even if grouping were completely broken,
+	// since "jasp"/"zuhause" already appear inside "jasp/github" etc.).
+	for _, want := range []string{"<h2>jasp", "<h2>zuhause"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("entries page missing org group header %q: %s", want, body)
+		}
+	}
+	// Exactly one aggregated audit row for the whole page, regardless of
+	// how many entries it decrypted.
 	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionListDetail, Limit: 5})
-	if len(rows) != 0 {
-		t.Errorf("org landing view must not decrypt entries, got %d list_detail rows", len(rows))
+	if len(rows) != 1 {
+		t.Errorf("want exactly 1 list_detail row for the page load, got %d", len(rows))
 	}
 }
 
-func TestHandleEntries_OrgBrowseFiltersByPolicy(t *testing.T) {
+func TestHandleEntries_FiltersByPolicy(t *testing.T) {
 	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
-	r := httptest.NewRequest("GET", "/entries?org=private", nil)
+	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
 	handleEntries(a)(w, r)
 
@@ -464,20 +486,42 @@ func TestHandleEntries_OrgBrowseFiltersByPolicy(t *testing.T) {
 	}
 }
 
-func TestHandleEntries_OrgBrowseShowsMetadata(t *testing.T) {
+func TestHandleEntries_PrefillsSearchBoxFromQueryParam(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
-	r := httptest.NewRequest("GET", "/entries?org=jasp", nil)
+	r := httptest.NewRequest("GET", "/entries?q=alice", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a)(w, r)
+
+	if !strings.Contains(w.Body.String(), `id="search" value="alice"`) {
+		t.Errorf("expected ?q= to prefill the search box's value: %s", w.Body.String())
+	}
+}
+
+// TestHandleEntries_DataSearchAttributeDrivesClientFilter checks that
+// each entry card carries a data-search blob the inline JS filter
+// matches against (path/username/domain/etc.) — never the password
+// value; see TestHandleEntries_NeverRendersPassword for the authoritative
+// assertion that no secret value appears anywhere on the page.
+func TestHandleEntries_DataSearchAttributeDrivesClientFilter(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
 	handleEntries(a)(w, r)
 
 	body := w.Body.String()
-	for _, want := range []string{"jasp/github", "jasp/aws", "alice", "aws.amazon.com"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("org browse missing %q: %s", want, body)
+	re := regexp.MustCompile(`href="/entries/jasp/aws" data-search="([^"]*)"`)
+	m := re.FindStringSubmatch(body)
+	if m == nil {
+		t.Fatalf("could not find jasp/aws's data-search attribute in body: %s", body)
+	}
+	blob := m[1]
+	for _, want := range []string{"jasp/aws", "bob", "aws.amazon.com", "prod"} {
+		if !strings.Contains(blob, want) {
+			t.Errorf("data-search blob %q missing %q", blob, want)
 		}
 	}
-	if strings.Contains(body, "zuhause/router") {
-		t.Error("org=jasp should not include zuhause entries")
+	if strings.Contains(blob, "p2") {
+		t.Error("data-search blob must never contain the password value")
 	}
 }
 
@@ -492,7 +536,7 @@ func TestHandleEntries_ShowsLastRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := httptest.NewRequest("GET", "/entries?org=jasp", nil)
+	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
 	handleEntries(a)(w, r)
 
@@ -632,10 +676,10 @@ func TestHandleReveal_UpdatesLastRead(t *testing.T) {
 func TestHandleEntries_BrowsingNeverCountsAsLastRead(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 
-	// Browse the org list and the detail page repeatedly — none of this
-	// is a "read".
+	// Browse the (always-full) list and the detail page repeatedly —
+	// none of this is a "read".
 	for i := 0; i < 3; i++ {
-		r := httptest.NewRequest("GET", "/entries?org=jasp", nil)
+		r := httptest.NewRequest("GET", "/entries", nil)
 		w := httptest.NewRecorder()
 		handleEntries(a)(w, r)
 
@@ -654,46 +698,13 @@ func TestHandleEntries_BrowsingNeverCountsAsLastRead(t *testing.T) {
 	}
 }
 
-func TestHandleEntries_CrossOrgSearch(t *testing.T) {
-	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
-	r := httptest.NewRequest("GET", "/entries?q=aws.amazon.com", nil)
-	w := httptest.NewRecorder()
-	handleEntries(a)(w, r)
-
-	body := w.Body.String()
-	if !strings.Contains(body, "jasp/aws") {
-		t.Errorf("cross-org search for domain should find jasp/aws: %s", body)
-	}
-	if strings.Contains(body, "jasp/github") {
-		t.Error("cross-org search should not return non-matching entries")
-	}
-	if !strings.Contains(body, "Cross-org search") && !strings.Contains(body, "across all orgs") {
-		t.Error("cross-org search should be labelled as such")
-	}
-}
-
-func TestHandleEntries_OrgScopedSearch(t *testing.T) {
-	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
-	r := httptest.NewRequest("GET", "/entries?org=jasp&q=alice", nil)
-	w := httptest.NewRecorder()
-	handleEntries(a)(w, r)
-
-	body := w.Body.String()
-	if !strings.Contains(body, "jasp/github") {
-		t.Errorf("org-scoped search should find jasp/github via username: %s", body)
-	}
-	if strings.Contains(body, "jasp/aws") {
-		t.Error("org-scoped search should exclude non-matching entries")
-	}
-}
-
 func TestHandleEntries_NeverRendersPassword(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
-	r := httptest.NewRequest("GET", "/entries?org=jasp", nil)
+	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
 	handleEntries(a)(w, r)
 
-	for _, secret := range []string{"p1", "p2"} {
+	for _, secret := range []string{"p1", "p2", "p3", "p4"} {
 		if strings.Contains(w.Body.String(), secret) {
 			t.Errorf("entries list must never render a password value, found %q", secret)
 		}
@@ -926,24 +937,41 @@ func TestAuthGate_SetsNoStoreHeader(t *testing.T) {
 	}
 }
 
-func TestEntryMatches(t *testing.T) {
+func TestSearchableText(t *testing.T) {
 	e := &store.Entry{
 		Path: "jasp/aws", Username: "bob", URL: "https://aws.amazon.com",
 		Domain: "aws.amazon.com", Notes: "prod account", Kind: store.KindAPIKey,
-		Tags: []string{"infra", "billing"},
+		Tags: []string{"infra", "billing"}, Password: "super-secret-value",
 	}
-	cases := map[string]bool{
-		"aws":      true,
-		"BOB":      true,
-		"prod":     true,
-		"billing":  true,
-		"api_key":  true,
-		"notfound": false,
-	}
-	for q, want := range cases {
-		if got := entryMatches(e, strings.ToLower(q)); got != want {
-			t.Errorf("entryMatches(q=%q) = %v, want %v", q, got, want)
+	blob := searchableText(e)
+	for _, want := range []string{"jasp/aws", "bob", "aws.amazon.com", "prod account", "api_key", "infra", "billing"} {
+		if !strings.Contains(blob, want) {
+			t.Errorf("searchableText missing %q: %q", want, blob)
 		}
+	}
+	if strings.Contains(blob, "super-secret-value") {
+		t.Error("searchableText must never include the password value")
+	}
+	if blob != strings.ToLower(blob) {
+		t.Error("searchableText must be lowercase (client-side filter lowercases the query to match)")
+	}
+}
+
+func TestGroupByOrg(t *testing.T) {
+	entries := []*store.Entry{
+		{Path: "jasp/bbb", Org: "jasp"},
+		{Path: "jasp/aaa", Org: "jasp"},
+		{Path: "zuhause/router", Org: "zuhause"},
+	}
+	groups := groupByOrg(entries)
+	if len(groups) != 2 {
+		t.Fatalf("want 2 groups, got %d", len(groups))
+	}
+	if groups[0].Org != "jasp" || groups[1].Org != "zuhause" {
+		t.Errorf("groups not sorted by org name: %+v", groups)
+	}
+	if len(groups[0].Entries) != 2 || groups[0].Entries[0].Path != "jasp/aaa" {
+		t.Errorf("entries within a group not sorted by path: %+v", groups[0].Entries)
 	}
 }
 

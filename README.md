@@ -357,9 +357,11 @@ mys web --port 7823
 ```
 
 Hinter Touch-ID-Login. Neben Statistiken und Audit-Log gibt es unter
-`/entries` einen durchsuchbaren Secrets-Browser — gruppiert nach Org, mit
-Metadaten (Kind, Tags, Domain, Username) und „zuletzt gelesen" je
-Eintrag. Werte bleiben dabei **immer maskiert**.
+`/entries` einen Secrets-Browser: alle sichtbaren Einträge laden sofort,
+gruppiert nach Org, mit Metadaten (Kind, Tags, Domain, Username) und
+„zuletzt gelesen" je Eintrag. Das Suchfeld filtert **live im Browser**,
+ohne Seiten-Reload — kein Klick, kein Formular-Submit. Werte bleiben
+dabei **immer maskiert**.
 
 „Zuletzt gelesen" stammt ausschließlich aus echten `get`-Audit-Zeilen —
 reines Browsen der Liste zählt nicht als Lesen, sonst würde jeder
