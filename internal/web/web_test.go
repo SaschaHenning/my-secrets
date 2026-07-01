@@ -16,6 +16,8 @@ import (
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/policy"
+	"github.com/SaschaHenning/my-secrets/internal/store"
+	"github.com/SaschaHenning/my-secrets/internal/store/fake"
 )
 
 // Verify that the loopback middleware rejects non-loopback addresses.
@@ -248,6 +250,235 @@ func newAuditApp(t *testing.T) *app.App {
 		}
 	}
 	return &app.App{Audit: l, Policy: policy.Default(), Override: "human"}
+}
+
+// newFakeApp wires an App to the in-memory fake store for tests that need
+// entry decrypts, not just audit rows. Mirrors internal/app's appWithFake
+// test helper: "human"/"fullaccess" expand the policy to grant every
+// actor kind full access, working around the fact that caller.Identify
+// often classifies a `go test` process as AI (CLAUDECODE=1 in the dev/CI
+// environment) — the anti-bypass guard means Override alone cannot force
+// it back to human, so the test grants access to whichever kind the
+// classifier actually picks.
+func newFakeApp(t *testing.T, override string, entries ...*store.Entry) (*app.App, *fake.Store) {
+	t.Helper()
+	l, err := audit.Open(filepath.Join(t.TempDir(), "audit.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	f := fake.NewWithEntries(entries...)
+	pol := policy.Default()
+	if override == "human" || override == "fullaccess" {
+		pol = &policy.Policy{Actors: map[string]policy.Rules{
+			"human":       {Allow: []string{"**"}},
+			"script":      {Allow: []string{"**"}},
+			"ai":          {Allow: []string{"**"}},
+			"claude-code": {Allow: []string{"**"}},
+		}}
+		override = "claude-code"
+	}
+	return &app.App{Store: f, Audit: l, Policy: pol, Override: override}, f
+}
+
+func sampleWebEntries() []*store.Entry {
+	return []*store.Entry{
+		{Path: "jasp/github", Username: "alice", Password: "p1", Kind: store.KindToken, Tags: []string{"ci"}},
+		{Path: "jasp/aws", Username: "bob", Password: "p2", Notes: "prod", Domain: "aws.amazon.com"},
+		{Path: "zuhause/router", Username: "admin", Password: "p3"},
+		{Path: "private/bank", Username: "me", Password: "p4"},
+	}
+}
+
+func TestHandleEntries_OrgListIsCheapAndDoesNotDecrypt(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{"jasp", "zuhause", "private"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("org list missing %q", want)
+		}
+	}
+	// No ActionListDetail row: the landing view must not decrypt anything.
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionListDetail, Limit: 5})
+	if len(rows) != 0 {
+		t.Errorf("org landing view must not decrypt entries, got %d list_detail rows", len(rows))
+	}
+}
+
+func TestHandleEntries_OrgBrowseFiltersByPolicy(t *testing.T) {
+	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries?org=private", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "private/bank") {
+		t.Error("AI actor should not see private/bank")
+	}
+}
+
+func TestHandleEntries_OrgBrowseShowsMetadata(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries?org=jasp", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a)(w, r)
+
+	body := w.Body.String()
+	for _, want := range []string{"jasp/github", "jasp/aws", "alice", "aws.amazon.com"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("org browse missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "zuhause/router") {
+		t.Error("org=jasp should not include zuhause entries")
+	}
+}
+
+func TestHandleEntries_CrossOrgSearch(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries?q=aws.amazon.com", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a)(w, r)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "jasp/aws") {
+		t.Errorf("cross-org search for domain should find jasp/aws: %s", body)
+	}
+	if strings.Contains(body, "jasp/github") {
+		t.Error("cross-org search should not return non-matching entries")
+	}
+	if !strings.Contains(body, "Cross-org search") && !strings.Contains(body, "across all orgs") {
+		t.Error("cross-org search should be labelled as such")
+	}
+}
+
+func TestHandleEntries_OrgScopedSearch(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries?org=jasp&q=alice", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a)(w, r)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "jasp/github") {
+		t.Errorf("org-scoped search should find jasp/github via username: %s", body)
+	}
+	if strings.Contains(body, "jasp/aws") {
+		t.Error("org-scoped search should exclude non-matching entries")
+	}
+}
+
+func TestHandleEntries_NeverRendersPassword(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries?org=jasp", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a)(w, r)
+
+	for _, secret := range []string{"p1", "p2"} {
+		if strings.Contains(w.Body.String(), secret) {
+			t.Errorf("entries list must never render a password value, found %q", secret)
+		}
+	}
+}
+
+func TestHandleEntryDetail_OK(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "alice") {
+		t.Errorf("detail page missing metadata: %s", body)
+	}
+	if strings.Contains(body, "p1") {
+		t.Error("detail page must not render the raw password")
+	}
+}
+
+// TestHandleEntryDetail_MasksSecretLikeFields guards against rendering
+// custom Fields values raw. Field keys are user-defined and can legally
+// be named "api_secret"/"db_password" etc. — those must be masked exactly
+// like Password, not treated as safe just because they live in the Fields
+// map instead of the well-known Password field.
+func TestHandleEntryDetail_MasksSecretLikeFields(t *testing.T) {
+	e := &store.Entry{
+		Path: "jasp/aws", Username: "bob", Password: "p2",
+		Fields: map[string]string{
+			"api_secret": "sk-super-secret-value",
+			"account_id": "123456",
+		},
+	}
+	a, _ := newFakeApp(t, "human", e)
+	r := httptest.NewRequest("GET", "/entries/jasp/aws", nil)
+	r.SetPathValue("path", "jasp/aws")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	body := w.Body.String()
+	if strings.Contains(body, "sk-super-secret-value") {
+		t.Error("secret-like field value must be masked, found raw value in body")
+	}
+	if !strings.Contains(body, "123456") {
+		t.Error("non-secret field value (account_id) should render unmasked")
+	}
+}
+
+func TestHandleEntryDetail_Denied(t *testing.T) {
+	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries/private/bank", nil)
+	r.SetPathValue("path", "private/bank")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+}
+
+func TestHandleEntryDetail_MethodNotAllowed(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("DELETE", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", w.Code)
+	}
+}
+
+func TestEntryMatches(t *testing.T) {
+	e := &store.Entry{
+		Path: "jasp/aws", Username: "bob", URL: "https://aws.amazon.com",
+		Domain: "aws.amazon.com", Notes: "prod account", Kind: store.KindAPIKey,
+		Tags: []string{"infra", "billing"},
+	}
+	cases := map[string]bool{
+		"aws":      true,
+		"BOB":      true,
+		"prod":     true,
+		"billing":  true,
+		"api_key":  true,
+		"notfound": false,
+	}
+	for q, want := range cases {
+		if got := entryMatches(e, strings.ToLower(q)); got != want {
+			t.Errorf("entryMatches(q=%q) = %v, want %v", q, got, want)
+		}
+	}
 }
 
 func TestHandleIndex(t *testing.T) {

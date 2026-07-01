@@ -37,6 +37,12 @@ const (
 	ActionSyncPull        = "sync_pull"
 	ActionTOTPGenerate    = "totp_generate"
 	ActionSkillInstall    = "skill_install"
+	// ActionListDetail is written by App.BrowseDetailed — a metadata
+	// listing that decrypts every visible entry but is NOT a read of any
+	// single secret. Kept distinct from ActionGet so that "last read"
+	// queries (LastAccessByPath) stay meaningful: browsing the web UI's
+	// entries list must never look like reading every secret in it.
+	ActionListDetail = "list_detail"
 )
 
 // Results recorded against each action.

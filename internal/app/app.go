@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -112,9 +113,45 @@ func (e *ErrDenied) Error() string {
 	return fmt.Sprintf("denied: %s (%s)", e.Path, e.Reason)
 }
 
+// errInvalidPath is returned by cleanSecretPath for any path App refuses
+// to evaluate at all.
+var errInvalidPath = errors.New("invalid secret path")
+
+// cleanSecretPath rejects any path containing a ".", "..", or empty
+// segment, or a leading slash. Policy.Evaluate and the store's own path
+// resolution (gopass cleans the path with filepath.Join/filepath.Clean
+// before touching disk) MUST agree on the exact same bytes — otherwise a
+// caller can craft a path like "jasp/../private/bank" that a prefix-based
+// policy rule ("allow jasp/**") judges as allowed while the store
+// resolves and returns "private/bank". This is checked before every
+// Policy.Evaluate call in this file that is followed by a Store
+// operation on the same path, so policy always judges exactly the bytes
+// the store will act on.
+//
+// Rejecting outright (rather than cleaning the path and continuing) is
+// deliberate: silently rewriting a caller's input could itself surprise a
+// caller expecting their literal path to be evaluated, and every
+// legitimate path this tool ever writes (mys add/rotate) is already
+// canonical, so a non-canonical path is never a legitimate access.
+func cleanSecretPath(p string) error {
+	if p == "" || strings.HasPrefix(p, "/") {
+		return errInvalidPath
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return errInvalidPath
+		}
+	}
+	return nil
+}
+
 // Get fetches a decrypted entry, respecting policy + writing audit.
 func (a *App) Get(ctx context.Context, path string) (*store.Entry, error) {
 	d := caller.Identify(a.Override)
+	if err := cleanSecretPath(path); err != nil {
+		a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultDenied, err.Error())
+		return nil, &ErrDenied{Path: path, Reason: err.Error()}
+	}
 	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultDenied, decision.Reason)
@@ -137,6 +174,10 @@ func (a *App) Get(ctx context.Context, path string) (*store.Entry, error) {
 // error-result audit row.
 func (a *App) GenerateTOTP(ctx context.Context, path string, now time.Time) (string, int, error) {
 	d := caller.Identify(a.Override)
+	if err := cleanSecretPath(path); err != nil {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultDenied, err.Error())
+		return "", 0, &ErrDenied{Path: path, Reason: err.Error()}
+	}
 	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultDenied, decision.Reason)
@@ -206,6 +247,91 @@ func (a *App) List(ctx context.Context, org string) ([]string, error) {
 	return filtered, nil
 }
 
+// Orgs returns the distinct top-level orgs visible to the caller, derived
+// from the already policy-filtered List() output. Deliberately does not
+// call a.Store.Orgs() directly — that would bypass policy filtering and
+// could leak org names for orgs the caller has zero access to. Piggybacks
+// on List()'s existing audit row rather than writing a second one for what
+// is, from the caller's point of view, a single logical browse.
+func (a *App) Orgs(ctx context.Context) ([]string, error) {
+	paths, err := a.List(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	orgs := make([]string, 0)
+	for _, p := range paths {
+		o := store.OrgOf(p)
+		if o == "" {
+			continue
+		}
+		if _, ok := seen[o]; !ok {
+			seen[o] = struct{}{}
+			orgs = append(orgs, o)
+		}
+	}
+	sort.Strings(orgs)
+	return orgs, nil
+}
+
+// BrowseDetailed decrypts every entry visible to the caller within org
+// (all orgs if org is "") and returns the full metadata — everything on
+// store.Entry except the caller is expected to render Password/TOTP seed
+// material. Unlike Get, this writes exactly ONE aggregated audit row per
+// call under ActionListDetail, not one ActionGet row per path: browsing a
+// list of entries in the web UI must not look, in the audit log, like the
+// caller read every single one of them. That distinction is what keeps
+// "last read" (audit.LastAccessByPath, filtered to ActionGet) meaningful.
+// This mirrors the existing SearchByDomain, which has the same
+// one-row-per-call shape for the same reason.
+func (a *App) BrowseDetailed(ctx context.Context, org string) ([]*store.Entry, error) {
+	d := caller.Identify(a.Override)
+	paths, err := a.Store.List(ctx, org)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	entries := make([]*store.Entry, 0, len(paths))
+	for _, p := range paths {
+		if !a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p).Allowed {
+			continue
+		}
+		e, gerr := a.Store.Get(ctx, p)
+		if gerr != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultOK,
+		fmt.Sprintf("%d entries", len(entries)))
+	return entries, nil
+}
+
+// Inspect decrypts a single entry for metadata display — Kind, Tags,
+// Domain, etc. Like BrowseDetailed, this writes an ActionListDetail row,
+// NOT ActionGet: the web UI's masked entry-detail page uses Inspect, so
+// simply viewing an entry's metadata does not count as reading it. Only
+// the explicit reveal action (App.Get) does.
+func (a *App) Inspect(ctx context.Context, path string) (*store.Entry, error) {
+	d := caller.Identify(a.Override)
+	if err := cleanSecretPath(path); err != nil {
+		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultDenied, err.Error())
+		return nil, &ErrDenied{Path: path, Reason: err.Error()}
+	}
+	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
+	if !decision.Allowed {
+		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultDenied, decision.Reason)
+		return nil, &ErrDenied{Path: path, Reason: decision.Reason}
+	}
+	e, err := a.Store.Get(ctx, path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultOK, decision.MatchedRule)
+	return e, nil
+}
+
 // storeSearcher is the minimal interface App.Search needs from the store.
 // Extracted so tests can exercise the audit + policy wiring without
 // requiring a real gopass store.
@@ -263,6 +389,10 @@ func (a *App) searchWith(ctx context.Context, query string, ss storeSearcher) ([
 // user input.
 func (a *App) Add(ctx context.Context, e *store.Entry) error {
 	d := caller.Identify(a.Override)
+	if err := cleanSecretPath(e.Path); err != nil {
+		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultDenied, err.Error())
+		return &ErrDenied{Path: e.Path, Reason: err.Error()}
+	}
 	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, e.Path)
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultDenied, decision.Reason)
@@ -289,6 +419,10 @@ func (a *App) Add(ctx context.Context, e *store.Entry) error {
 // UTC time so that --stale filters and doctor checks reset.
 func (a *App) Rotate(ctx context.Context, path, newPassword string) error {
 	d := caller.Identify(a.Override)
+	if err := cleanSecretPath(path); err != nil {
+		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultDenied, err.Error())
+		return &ErrDenied{Path: path, Reason: err.Error()}
+	}
 	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultDenied, decision.Reason)
@@ -317,6 +451,10 @@ func (a *App) Rotate(ctx context.Context, path, newPassword string) error {
 // Remove deletes an entry after policy check.
 func (a *App) Remove(ctx context.Context, path string) error {
 	d := caller.Identify(a.Override)
+	if err := cleanSecretPath(path); err != nil {
+		a.writeAudit(ctx, audit.ActionRemove, path, d, audit.ResultDenied, err.Error())
+		return &ErrDenied{Path: path, Reason: err.Error()}
+	}
 	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionRemove, path, d, audit.ResultDenied, decision.Reason)

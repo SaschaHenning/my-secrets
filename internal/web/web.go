@@ -12,11 +12,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
+	"github.com/SaschaHenning/my-secrets/internal/store"
 )
 
 //go:embed templates/*.html static/*
@@ -43,6 +46,20 @@ func init() {
 		"resultBadge": resultBadge,
 		"shortTime": func(t time.Time) string {
 			return t.Local().Format("2006-01-02 15:04:05")
+		},
+		"mask": store.MaskedPassword,
+		// maskField masks a custom Fields value the same way Password is
+		// always masked, when its key looks secret-like (contains
+		// "password" or "secret" — same rule the store's own search uses
+		// to keep such values out of free-text matches). Custom fields are
+		// user-defined and can legally be named "api_secret", "db_password",
+		// etc., so this page must not render them raw just because they
+		// aren't the well-known Password field.
+		"maskField": func(key, value string) string {
+			if store.IsSecretLikeFieldKey(key) {
+				return store.MaskedPassword(value)
+			}
+			return value
 		},
 	}
 	templates = template.Must(template.New("").Funcs(funcs).ParseFS(assets, "templates/*.html"))
@@ -81,6 +98,8 @@ func serveWith(ctx context.Context, a *app.App, port int, stdout io.Writer, ttl,
 	// redirects to /login on a missing / stale cookie.
 	mux.Handle("/", authGate(store, handleIndex(a)))
 	mux.Handle("/audit", authGate(store, handleAudit(a)))
+	mux.Handle("/entries", authGate(store, handleEntries(a)))
+	mux.Handle("/entries/{path...}", authGate(store, handleEntryDetail(a)))
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf("127.0.0.1:%d", port),
@@ -318,6 +337,151 @@ func handleAudit(a *app.App) http.HandlerFunc {
 			"Page":    "audit",
 		}
 		if err := templates.ExecuteTemplate(w, "audit.html", data); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}
+}
+
+// handleEntries serves the secrets browser at /entries.
+//
+// Three shapes, in increasing cost:
+//   - no "org", no "q": the cheap landing view — org names + per-org
+//     counts, derived from a single App.List(ctx, "") call, no decrypts.
+//   - "org" set: App.BrowseDetailed(ctx, org) — decrypts that org's
+//     entries so metadata can be shown, filtered by "q" if present.
+//   - "q" set without "org": cross-org search, App.BrowseDetailed(ctx,
+//     ""); explicitly the most expensive shape since it decrypts
+//     everything visible to the caller, so the UI labels it distinctly.
+func handleEntries(a *app.App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		q := r.URL.Query()
+		org := strings.TrimSpace(q.Get("org"))
+		query := strings.TrimSpace(q.Get("q"))
+
+		if org == "" && query == "" {
+			renderOrgList(w, r, a, ctx)
+			return
+		}
+
+		entries, err := a.BrowseDetailed(ctx, org)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if query != "" {
+			entries = filterEntries(entries, query)
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+
+		data := map[string]any{
+			"Page":           "entries",
+			"SelectedOrg":    org,
+			"Query":          query,
+			"CrossOrgSearch": org == "" && query != "",
+			"Entries":        entries,
+		}
+		if err := templates.ExecuteTemplate(w, "entries.html", data); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}
+}
+
+// renderOrgList renders the cheap landing view of /entries: org names and
+// counts only, no entry decrypts. A single App.List(ctx, "") call backs
+// both — calling App.Orgs() here too would add N more App.List(ctx, org)
+// calls (one per org, for the counts) and multiply the ActionList audit
+// rows a single page load produces.
+func renderOrgList(w http.ResponseWriter, r *http.Request, a *app.App, ctx context.Context) {
+	paths, err := a.List(ctx, "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	counts := make(map[string]int)
+	var orgs []string
+	for _, p := range paths {
+		o := store.OrgOf(p)
+		if o == "" {
+			continue
+		}
+		if _, ok := counts[o]; !ok {
+			orgs = append(orgs, o)
+		}
+		counts[o]++
+	}
+	sort.Strings(orgs)
+	data := map[string]any{
+		"Page":      "entries",
+		"Orgs":      orgs,
+		"OrgCounts": counts,
+	}
+	if err := templates.ExecuteTemplate(w, "entries.html", data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// filterEntries keeps entries whose Path, Username, URL, Domain, Notes,
+// Kind, or Tags contain query (case-insensitive). Password and TOTP seed
+// material are never matched — this mirrors the store's own search
+// semantics (internal/store/fake package doc: "matches ... NEVER
+// against password values").
+func filterEntries(entries []*store.Entry, query string) []*store.Entry {
+	q := strings.ToLower(query)
+	out := make([]*store.Entry, 0, len(entries))
+	for _, e := range entries {
+		if entryMatches(e, q) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func entryMatches(e *store.Entry, q string) bool {
+	fields := []string{e.Path, e.Username, e.URL, e.Domain, e.Notes, e.Kind}
+	for _, f := range fields {
+		if strings.Contains(strings.ToLower(f), q) {
+			return true
+		}
+	}
+	for _, t := range e.Tags {
+		if strings.Contains(strings.ToLower(t), q) {
+			return true
+		}
+	}
+	return false
+}
+
+// handleEntryDetail serves the masked entry-detail page at
+// /entries/{path...}. GET only in this iteration — reveal (POST) is a
+// separate, security-sensitive change layered on top later.
+func handleEntryDetail(a *app.App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.PathValue("path")
+		if path == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		e, err := a.Inspect(r.Context(), path)
+		if err != nil {
+			var denied *app.ErrDenied
+			if errors.As(err, &denied) {
+				http.Error(w, denied.Error(), http.StatusForbidden)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		data := map[string]any{
+			"Page":  "entries",
+			"Entry": e,
+		}
+		if err := templates.ExecuteTemplate(w, "entry.html", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
