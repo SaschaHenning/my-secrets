@@ -162,12 +162,20 @@ keychain.
 - Binds on `127.0.0.1` only. A middleware rejects any `RemoteAddr` that
   is not loopback as a belt-and-suspenders measure.
 - **Login is the single authentication point.** A successful login
-  (Touch ID via `LocalAuthentication`/`LAContext`, falling back to the
-  macOS account password — see `internal/web/auth_darwin.go`) issues an
-  HttpOnly, `SameSite=Lax` session cookie valid for 30 minutes of
-  activity; the server shuts itself down after 30 minutes of no active
-  session. Everything behind that gate — browsing, revealing, copying —
-  is then frictionless.
+  issues an HttpOnly, `SameSite=Lax` session cookie valid for 30 minutes
+  of activity; the server shuts itself down after 30 minutes of no
+  active session. Everything behind that gate — browsing, revealing,
+  copying — is then frictionless. The prompt is a real Touch ID sheet
+  via `LocalAuthentication`/`LAContext`
+  (`deviceOwnerAuthentication` — biometrics with automatic macOS-password
+  fallback), implemented in `internal/web/auth_touchid_darwin.m` +
+  `auth_touchid_darwin_cgo.go`. Requires cgo (on by default in a macOS
+  `go build`); a `CGO_ENABLED=0` darwin build falls back to a
+  `security authorize` password dialog (`auth_touchid_darwin_nocgo.go`).
+  Caveat: LocalAuthentication needs a code-signed binary to show
+  biometrics — the toolchain's ad-hoc signature is usually enough, but
+  on some setups it can still fall back to the password sheet (graceful,
+  not a failure).
 - **Reveal is session-only, by deliberate design.** Revealing/copying a
   value (`POST /entries/{path}`) does **not** re-authenticate per
   action. This is an owner's decision, not an oversight, and it reverses

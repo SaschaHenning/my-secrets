@@ -333,8 +333,9 @@ func renderLogin(w http.ResponseWriter, errMsg, next string) {
   <div class="stat">
     <div class="label">Anmeldung erforderlich</div>
     <p style="margin-top:0.8rem;color:var(--muted);font-size:0.9rem;">
-      Bestätige per Touch&nbsp;ID, um die Weboberfläche zu öffnen.
-      Die Sitzung läuft nach 30&nbsp;Minuten Inaktivität automatisch ab.
+      Mit Touch&nbsp;ID entsperren (oder deinem macOS-Passwort). Danach
+      bleibt die Sitzung offen — Aufdecken und Kopieren ohne weitere
+      Abfrage. Sie läuft nach 30&nbsp;Minuten Inaktivität automatisch ab.
     </p>
     <form method="post" action="/login" style="margin-top:1rem;">
       %s

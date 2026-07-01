@@ -176,7 +176,10 @@ without retry loops.
 
 ## Web UI
 
-Loopback-only (`127.0.0.1`), behind a Touch-ID login (`internal/web/auth_darwin.go`)
+Loopback-only (`127.0.0.1`), behind a real Touch-ID login
+(`LocalAuthentication`/`LAContext` via cgo — `auth_touchid_darwin.m` +
+`auth_touchid_darwin_cgo.go`, with a `security authorize` password
+fallback under `CGO_ENABLED=0`)
 with a cookie-based session (`internal/web/session.go`, 30 min idle
 timeout). Three page groups: overview + audit filters, and a secrets
 browser (`/entries`, `/entries/{path...}`) for browsing policy-visible
