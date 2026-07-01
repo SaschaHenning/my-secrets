@@ -563,6 +563,40 @@ func TestEntriesCache_TransientErrorIsRetriedNotFrozen(t *testing.T) {
 	}
 }
 
+// TestHandleEntries_CancelledLoadDoesNotPoisonCache is the web-level
+// regression test for #73: a /entries request the browser aborts
+// mid-decrypt must not leave a truncated result in the cache. The next
+// (uncancelled) load must return every entry.
+func TestHandleEntries_CancelledLoadDoesNotPoisonCache(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	cache := newEntriesCache()
+
+	// First load with an already-cancelled context — BrowseDetailed's
+	// cancellation guard fires, returns an error, and the cache must NOT
+	// store a (truncated/empty) partial.
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r1 := httptest.NewRequest("GET", "/entries", nil).WithContext(cancelledCtx)
+	w1 := httptest.NewRecorder()
+	handleEntries(a, cache)(w1, r1)
+	// (The browser already navigated away; the 500 goes to no one. What
+	//  matters is only that nothing partial got cached.)
+
+	// Second load, fresh context: must see the full set.
+	r2 := httptest.NewRequest("GET", "/entries", nil)
+	w2 := httptest.NewRecorder()
+	handleEntries(a, cache)(w2, r2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second load status = %d, want 200; body=%q", w2.Code, w2.Body.String())
+	}
+	body := w2.Body.String()
+	for _, want := range []string{"jasp/github", "jasp/aws", "zuhause/router"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("second load missing %q — cache was poisoned by the cancelled load: %s", want, body)
+		}
+	}
+}
+
 func TestHandleEntries_FiltersByPolicy(t *testing.T) {
 	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
 	r := httptest.NewRequest("GET", "/entries", nil)

@@ -202,6 +202,14 @@ func (s *Store) Get(ctx context.Context, path string) (*store.Entry, error) {
 	if s.GetErr != nil {
 		return nil, s.GetErr
 	}
+	// Honour an already-cancelled context, same as the real gopass store
+	// (its GPG decrypt fails with a context error). Without this the fake
+	// would happily "decrypt" under a dead context, hiding the exact
+	// cancellation-handling bugs a test wants to exercise. No-op for the
+	// overwhelming majority of tests, which pass context.Background().
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.GetDelay > 0 {
 		select {
 		case <-time.After(s.GetDelay):
