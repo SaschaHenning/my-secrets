@@ -59,6 +59,7 @@
         {{range .Tags}}<span class="tag">{{.}}</span>{{end}}
       </div>
       {{end}}
+      <div class="last-read">zuletzt gelesen: {{lastReadText (index $.LastReads .Path)}}</div>
     </a>
   {{else}}
     <p class="empty">no entries match this search</p>

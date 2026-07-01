@@ -142,6 +142,7 @@ table.audit code { font-family: 'SF Mono', Menlo, monospace; font-size: 0.8rem; 
 .kind-badge { background: var(--surface2); color: var(--text); }
 
 .tag-row { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; }
+.last-read { color: var(--muted); font-size: 0.75rem; margin-top: 0.5rem; }
 .tag {
   background: var(--surface2);
   color: var(--muted);
