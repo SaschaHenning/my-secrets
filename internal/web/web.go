@@ -128,9 +128,18 @@ func serveWith(ctx context.Context, a *app.App, port int, stdout io.Writer, ttl,
 
 	// Gated routes. Every handler here goes through authGate, which
 	// redirects to /login on a missing / stale cookie.
+	entries := newEntriesCache()
+	// Pre-warm the full-store decrypt in the background so the first
+	// /entries load or search is instant rather than a tens-of-seconds
+	// wait. Only started when the app has a store (mys web does; audit-
+	// only openings don't). Uses context.Background internally, so it is
+	// independent of any request and is not tied to cancelCtx's lifetime.
+	if a.Store != nil {
+		go entries.warm(a)
+	}
 	mux.Handle("/", authGate(store, handleIndex(a)))
 	mux.Handle("/audit", authGate(store, handleAudit(a)))
-	mux.Handle("/entries", authGate(store, handleEntries(a, newEntriesCache())))
+	mux.Handle("/entries", authGate(store, handleEntries(a, entries)))
 	mux.Handle("/entries/{path...}", authGate(store, handleEntryDetail(a)))
 
 	srv := &http.Server{
@@ -219,9 +228,11 @@ func authGate(store *sessionStore, next http.Handler) http.Handler {
 }
 
 // defaultLandingPath is where a successful login goes when there's no
-// (valid) next= target — the search-first entries browser, per the PWA's
-// start_url, not the stats overview.
-const defaultLandingPath = "/entries"
+// (valid) next= target — the start page (search box + recently-used),
+// which renders instantly because it decrypts nothing. Deliberately NOT
+// /entries: that decrypts the entire store (tens of seconds on a large
+// store), which right after login looked like the app hanging.
+const defaultLandingPath = "/"
 
 // safeNextPath validates a caller-supplied redirect target, returning
 // defaultPath unless next is unambiguously a same-origin path. Guards
@@ -525,8 +536,9 @@ func searchableText(e *store.Entry) string {
 	return strings.ToLower(strings.Join(parts, " "))
 }
 
-// handleEntries serves the secrets browser at /entries. Always decrypts
-// and shows every policy-visible entry, grouped by org, in one page —
+// handleEntries serves the secrets browser at /entries. Shows every
+// policy-visible entry (served via entriesCache; a decrypt only happens
+// on a cold or stale cache), grouped by org, in one page —
 // filtering then happens entirely client-side (see entries.html's inline
 // script) against each card's data-search attribute, so typing narrows
 // the view instantly with no server round trip. This trades the previous
@@ -539,35 +551,37 @@ func searchableText(e *store.Entry) string {
 // "q" only pre-fills the search box's initial value — the inline script
 // applies the same client-side filter to it on load, so a bookmarked/
 // shared link (e.g. entry.html's "back to org") still narrows the view.
-// entriesCacheTTL bounds how stale the cached decrypt can be. Short
-// enough that a write from another `mys` CLI invocation (the only way
-// the store changes while `mys web` is running — this UI has no write
-// endpoints) or a `mys sync pull` shows up quickly on the next load;
-// long enough that clicking around the entries page during normal use
-// (the "back to org" link, revisiting after glancing at one entry's
-// detail page) doesn't pay the full-store decrypt cost every time.
-const entriesCacheTTL = 30 * time.Second
+// entriesCacheTTL is when a cached decrypt is considered stale. With
+// stale-while-revalidate (see entriesCache.get) a stale result is still
+// served instantly and refreshed in the background, so this only controls
+// how often that background refresh fires on access — not how long a user
+// ever waits. Kept generous because the store only changes out-of-band
+// (a `mys` CLI write or `mys sync pull`; the web UI has no write
+// endpoints), and each refresh re-decrypts the whole store.
+const entriesCacheTTL = 2 * time.Minute
 
-// entriesCache holds the last App.BrowseDetailed(ctx, "") result so
-// repeated /entries loads within entriesCacheTTL don't repeat the full
-// decrypt — found necessary in practice: on a real store, decrypting
-// every entry took long enough (tens of seconds) that "click a link,
-// wait, nothing happens" was the actual user experience even after
-// extendWriteDeadline stopped the request from being cut off outright.
-// A cache hit skips App.BrowseDetailed entirely, so it also skips that
-// call's ActionListDetail audit row — no decrypt happened on a hit, so
-// logging one would misrepresent what actually occurred.
+// entriesCache memoises App.BrowseDetailed(ctx, "") — decrypting a real
+// store's every entry takes tens of seconds (0.19s × 156 entries in the
+// wild), far too slow to repeat on every /entries load or search.
 //
-// Only successful decrypts are ever cached: an error is returned as-is
-// and neither stored nor timestamped, so a transient failure (e.g. a
-// denied/unreachable store during a refresh) is retried on the very
-// next request instead of wedging /entries into repeat errors — served
-// alongside stale-but-otherwise-good cached entries — for the rest of
-// the TTL.
+// Serving strategy is stale-while-revalidate:
+//   - cache present (fresh or stale) → returned immediately; a stale
+//     result additionally kicks off one background refresh.
+//   - cache absent (cold) → the caller blocks once on a synchronous
+//     decrypt (bounded by entriesWriteBudget).
+//
+// warm() pre-populates it at server startup so even that first cold load
+// is usually already done by the time the user navigates.
+//
+// Background refresh/warm use context.Background so they can't be
+// cancelled by (or leak) any single request. Only successful decrypts
+// are cached; an error leaves the previous good result in place (a
+// transient failure never wedges /entries).
 type entriesCache struct {
-	mu      sync.Mutex
-	at      time.Time
-	entries []*store.Entry
+	mu         sync.Mutex
+	at         time.Time
+	entries    []*store.Entry
+	refreshing bool
 }
 
 func newEntriesCache() *entriesCache {
@@ -576,16 +590,62 @@ func newEntriesCache() *entriesCache {
 
 func (c *entriesCache) get(ctx context.Context, a *app.App) ([]*store.Entry, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.entries != nil && time.Since(c.at) < entriesCacheTTL {
-		return c.entries, nil
+	cached := c.entries
+	stale := cached == nil || time.Since(c.at) >= entriesCacheTTL
+	if cached != nil && stale && !c.refreshing {
+		c.refreshing = true
+		go c.refresh(a)
 	}
+	c.mu.Unlock()
+
+	if cached != nil {
+		return cached, nil // fresh or stale — served immediately
+	}
+	// Cold cache: block this one request on a full decrypt. (A concurrent
+	// startup warm may briefly race this into a second decrypt — correct,
+	// just transiently wasteful, and only in the ~30s before the first
+	// load completes.)
+	return c.load(ctx, a)
+}
+
+// load decrypts the whole store and, on success, replaces the cache.
+func (c *entriesCache) load(ctx context.Context, a *app.App) ([]*store.Entry, error) {
 	entries, err := a.BrowseDetailed(ctx, "")
 	if err != nil {
 		return nil, err
 	}
+	c.mu.Lock()
 	c.entries, c.at = entries, time.Now()
+	c.mu.Unlock()
 	return entries, nil
+}
+
+// refresh re-decrypts in the background (stale-while-revalidate), keeping
+// the existing result on error. Its refreshing flag is cleared even if
+// load panics/errs so a failed refresh never blocks future ones.
+func (c *entriesCache) refresh(a *app.App) {
+	defer func() {
+		c.mu.Lock()
+		c.refreshing = false
+		c.mu.Unlock()
+	}()
+	_, _ = c.load(context.Background(), a)
+}
+
+// warm pre-populates the cache at server startup so the first /entries
+// load or search doesn't pay the full-store decrypt. No-op if already
+// populated or a load is in flight.
+func (c *entriesCache) warm(a *app.App) {
+	c.mu.Lock()
+	skip := c.entries != nil || c.refreshing
+	if !skip {
+		c.refreshing = true
+	}
+	c.mu.Unlock()
+	if skip {
+		return
+	}
+	c.refresh(a) // reuses refresh's refreshing-flag cleanup
 }
 
 func handleEntries(a *app.App, cache *entriesCache) http.HandlerFunc {

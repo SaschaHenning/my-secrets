@@ -208,17 +208,27 @@ remaining `Store.Get` calls) and the connection was torn down before any
 response reached the browser, so the page silently "loaded nothing".
 `handleEntries` calls `extendWriteDeadline(w, entriesWriteBudget)` (2
 minutes) before decrypting, the same `http.ResponseController`-based
-override already used for the Touch-ID write budget. That alone still
-meant every load re-paid the full decrypt cost, though (found via the
-same real store — clicking a link and waiting tens of seconds for
-nothing to visibly change is still a broken experience even once it no
-longer times out), so `handleEntries` also wraps `App.BrowseDetailed` in
-an `entriesCache` (30s TTL, shared for the server's lifetime): a cache
-hit skips the decrypt AND the `list_detail` audit row it would have
-written, since no access actually happened on a hit. "Zuletzt gelesen"/
-"zuletzt gesynct" render via `relativeTime` (recency-first: "gerade
-eben"/"vor N Minuten" within the last hour, "heute"/"gestern" for the
-last two calendar days, the absolute date only once it's older).
+override already used for the Touch-ID write budget.
+
+Even so, on a real store (156 entries × ~0.19s ≈ 30s) a synchronous
+full-store decrypt is too slow to sit in front of the user, so
+`handleEntries` wraps `App.BrowseDetailed` in an `entriesCache` (shared
+for the server's lifetime) that serves **stale-while-revalidate**: any
+cached result — fresh or stale — is returned immediately, and a stale
+one additionally fires a single background refresh
+(`context.Background`, so it can't be cancelled by any request). Only a
+completely cold cache blocks one caller on a full decrypt. `serveWith`
+also `go`-warms the cache at startup, so that first cold load is usually
+already done by the time the user navigates. A hit skips the decrypt
+AND its `list_detail` audit row; only successful decrypts are cached, so
+a failed refresh keeps serving the last good result rather than wedging.
+This is also why login lands on `/` (the start page decrypts nothing —
+instant) rather than `/entries`: landing on `/entries` meant the whole
+store decrypted right after login, which looked like the app hanging.
+"Zuletzt gelesen"/"zuletzt gesynct" render via `relativeTime`
+(recency-first: "gerade eben"/"vor N Minuten" within the last hour,
+"heute"/"gestern" for the last two calendar days, the absolute date only
+once it's older).
 
 Each row has inline "copy username" (client-side only — Username isn't
 secret) and "copy password" buttons; the start page's "zuletzt benutzt"
@@ -277,7 +287,8 @@ rejects non-loopback `RemoteAddr`.
 ### PWA shell + LaunchAgent autostart
 
 The UI is an installable PWA: `internal/web/static/manifest.webmanifest`
-(`start_url: "/entries"`, colors matching `styles.css`), a minimal
+(`start_url: "/"` — the start page decrypts nothing, so app launch is
+instant; colors matching `styles.css`), a minimal
 `internal/web/static/sw.js` (pure network passthrough — no
 `caches.open`/`cache.put` anywhere, enforced by
 `TestSWJS_NeverCaches`, since a Cache Storage entry for a reveal

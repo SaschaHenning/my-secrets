@@ -2,7 +2,7 @@
   "name": "my-secrets",
   "short_name": "mys",
   "description": "Lokaler Credential-Manager — durchsuchbare Secrets, Audit-Log, Reveal mit Touch ID",
-  "start_url": "/entries",
+  "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#0f1117",
