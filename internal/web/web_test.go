@@ -400,6 +400,112 @@ func TestHandleEntries_OrgBrowseShowsMetadata(t *testing.T) {
 	}
 }
 
+func TestHandleEntries_ShowsLastRead(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	ts := time.Date(2026, 3, 4, 12, 0, 0, 0, time.UTC)
+	_, err := a.Audit.Write(context.Background(), audit.Entry{
+		TS: ts, Action: audit.ActionGet, SecretPath: "jasp/github",
+		ActorKind: audit.ActorHuman, Result: audit.ResultOK,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest("GET", "/entries?org=jasp", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a)(w, r)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "2026-03-04") {
+		t.Errorf("expected last-read date for jasp/github in body: %s", body)
+	}
+	if !strings.Contains(body, "nie") {
+		t.Errorf("jasp/aws was never read and should show \"nie\": %s", body)
+	}
+}
+
+func TestHandleEntryDetail_ShowsLastRead(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	ts := time.Date(2026, 3, 4, 12, 0, 0, 0, time.UTC)
+	_, err := a.Audit.Write(context.Background(), audit.Entry{
+		TS: ts, Action: audit.ActionGet, SecretPath: "jasp/github",
+		ActorKind: audit.ActorHuman, Result: audit.ResultOK,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest("GET", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if !strings.Contains(w.Body.String(), "2026-03-04") {
+		t.Errorf("expected last-read date in detail page: %s", w.Body.String())
+	}
+}
+
+func TestHandleReveal_UpdatesLastRead(t *testing.T) {
+	withStubTouchID(t, func(context.Context) error { return nil })
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	// Before any reveal: "never".
+	r := httptest.NewRequest("GET", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+	if !strings.Contains(w.Body.String(), "nie") {
+		t.Fatalf("expected \"nie\" before any reveal: %s", w.Body.String())
+	}
+
+	// Reveal, then load again: should now show a real timestamp.
+	r = httptest.NewRequest("POST", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w = httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reveal status = %d", w.Code)
+	}
+
+	r = httptest.NewRequest("GET", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w = httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+	if strings.Contains(w.Body.String(), "Zuletzt gelesen</td><td>nie") {
+		t.Error("last-read should no longer be \"nie\" after a successful reveal")
+	}
+}
+
+// TestHandleEntries_BrowsingNeverCountsAsLastRead is the load-bearing
+// regression test for the whole feature: merely browsing the list/detail
+// pages (App.BrowseDetailed/App.Inspect, ActionListDetail) must never
+// make "last read" show a timestamp — only an actual reveal (App.Get)
+// may.
+func TestHandleEntries_BrowsingNeverCountsAsLastRead(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	// Browse the org list and the detail page repeatedly — none of this
+	// is a "read".
+	for i := 0; i < 3; i++ {
+		r := httptest.NewRequest("GET", "/entries?org=jasp", nil)
+		w := httptest.NewRecorder()
+		handleEntries(a)(w, r)
+
+		r2 := httptest.NewRequest("GET", "/entries/jasp/github", nil)
+		r2.SetPathValue("path", "jasp/github")
+		w2 := httptest.NewRecorder()
+		handleEntryDetail(a)(w2, r2)
+	}
+
+	got, err := a.Audit.LastAccessByPath(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("browsing must never populate last-read, got %+v", got)
+	}
+}
+
 func TestHandleEntries_CrossOrgSearch(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 	r := httptest.NewRequest("GET", "/entries?q=aws.amazon.com", nil)

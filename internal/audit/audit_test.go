@@ -265,6 +265,43 @@ func TestHostExplicitNotOverwritten(t *testing.T) {
 	}
 }
 
+func TestLastAccessByPath(t *testing.T) {
+	l := newTestLog(t)
+	ctx := context.Background()
+
+	older := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	// Two get/ok rows for the same path — only the newer one should win.
+	_, _ = l.Write(ctx, Entry{TS: older, Action: ActionGet, SecretPath: "jasp/github", ActorKind: ActorHuman, Result: ResultOK})
+	_, _ = l.Write(ctx, Entry{TS: newer, Action: ActionGet, SecretPath: "jasp/github", ActorKind: ActorHuman, Result: ResultOK})
+	// A denied get must not count as a read.
+	_, _ = l.Write(ctx, Entry{TS: newer, Action: ActionGet, SecretPath: "private/bank", ActorKind: ActorAI, Result: ResultDenied})
+	// Browsing (list_detail) must never count as a read, even though it
+	// decrypts the entry — this is the load-bearing property of the
+	// whole feature.
+	_, _ = l.Write(ctx, Entry{TS: newer, Action: ActionListDetail, SecretPath: "jasp/aws", ActorKind: ActorHuman, Result: ResultOK})
+	// An entry that was only ever browsed, never read, must be absent.
+
+	got, err := l.LastAccessByPath(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !got["jasp/github"].Equal(newer) {
+		t.Errorf("jasp/github last access = %v, want %v (the newer of two get/ok rows)", got["jasp/github"], newer)
+	}
+	if _, ok := got["private/bank"]; ok {
+		t.Error("a denied get must not produce a last-access entry")
+	}
+	if _, ok := got["jasp/aws"]; ok {
+		t.Error("a list_detail (browse) row must not count as a read")
+	}
+	if len(got) != 1 {
+		t.Errorf("want exactly 1 path with a real read, got %d: %+v", len(got), got)
+	}
+}
+
 // TestMigrateOldSchemaAddsHostColumn simulates a pre-existing DB written
 // before the host column existed (schema without it, one row inserted the
 // old way) and verifies Open()/migrate() adds the column without error and

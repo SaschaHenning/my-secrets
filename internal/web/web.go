@@ -60,6 +60,15 @@ func init() {
 		"shortTime": func(t time.Time) string {
 			return t.Local().Format("2006-01-02 15:04:05")
 		},
+		// lastReadText renders "never" for the zero Time (never read via
+		// App.Get) rather than the misleading "0001-01-01" a bare
+		// shortTime would produce.
+		"lastReadText": func(t time.Time) string {
+			if t.IsZero() {
+				return "nie"
+			}
+			return t.Local().Format("2006-01-02 15:04:05")
+		},
 		"mask": store.MaskedPassword,
 		// maskField masks a custom Fields value the same way Password is
 		// always masked, when its key looks secret-like (contains
@@ -406,12 +415,17 @@ func handleEntries(a *app.App) http.HandlerFunc {
 		}
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 
+		// Best-effort: a query error just means "last read" shows as
+		// blank for this render, not a failed page.
+		lastReads, _ := a.Audit.LastAccessByPath(ctx)
+
 		data := map[string]any{
 			"Page":           "entries",
 			"SelectedOrg":    org,
 			"Query":          query,
 			"CrossOrgSearch": org == "" && query != "",
 			"Entries":        entries,
+			"LastReads":      lastReads,
 		}
 		if err := templates.ExecuteTemplate(w, "entries.html", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -539,7 +553,7 @@ func handleReveal(w http.ResponseWriter, r *http.Request, a *app.App, path strin
 	}
 	extendWriteDeadlineForTouchID(w)
 	if err := requireTouchID(r.Context()); err != nil {
-		renderEntry(w, masked, false, "Touch ID erforderlich: "+err.Error())
+		renderEntry(w, r, a, masked, false, "Touch ID erforderlich: "+err.Error())
 		return
 	}
 	e, err := a.Get(r.Context(), path)
@@ -547,7 +561,7 @@ func handleReveal(w http.ResponseWriter, r *http.Request, a *app.App, path strin
 		writeEntryError(w, err)
 		return
 	}
-	renderEntry(w, e, true, "")
+	renderEntry(w, r, a, e, true, "")
 }
 
 // renderMaskedEntry re-fetches metadata via App.Inspect (never a `get`
@@ -559,15 +573,23 @@ func renderMaskedEntry(w http.ResponseWriter, r *http.Request, a *app.App, path,
 		writeEntryError(w, err)
 		return
 	}
-	renderEntry(w, e, false, errMsg)
+	renderEntry(w, r, a, e, false, errMsg)
 }
 
-func renderEntry(w http.ResponseWriter, e *store.Entry, revealed bool, errMsg string) {
+// renderEntry looks up "last read" for e.Path via audit.Log.LastAccess —
+// a best-effort UI enhancement, not a security control, so a query error
+// degrades to "never shown" rather than failing the whole page.
+func renderEntry(w http.ResponseWriter, r *http.Request, a *app.App, e *store.Entry, revealed bool, errMsg string) {
+	var lastRead time.Time
+	if a.Audit != nil {
+		lastRead, _ = a.Audit.LastAccess(r.Context(), e.Path)
+	}
 	data := map[string]any{
 		"Page":     "entries",
 		"Entry":    e,
 		"Revealed": revealed,
 		"Error":    errMsg,
+		"LastRead": lastRead,
 	}
 	if err := templates.ExecuteTemplate(w, "entry.html", data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

@@ -186,7 +186,10 @@ metadata-only decrypt) but does so through `App.BrowseDetailed`/`App.Inspect`,
 which write a single aggregated `list_detail` audit row per call instead of
 one `get` row per path — browsing the list must not look, in the audit
 log, like reading every secret in it. `App.Get` (an actual reveal) stays
-the only path that writes `get` rows.
+the only path that writes `get` rows. This is what makes "zuletzt
+gelesen" (`audit.Log.LastAccessByPath`/`LastAccess`, filtered to
+`action=get, result=ok`) meaningful in the entries list and detail
+page — it reflects real reveals, never page views.
 
 `POST /entries/{path...}` is the one write-shaped-but-actually-read
 endpoint: reveal. It re-runs the policy check via `App.Inspect` first (so

@@ -482,6 +482,63 @@ func (l *Log) Count(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+// LastAccess returns the most recent successful ActionGet timestamp for a
+// single path, or the zero Time if it was never read (or read only via
+// ActionListDetail — see LastAccessByPath's doc). Used by the entry
+// detail page, where fetching the bulk map for one path would be
+// wasteful; LastAccessByPath remains the right call for a list view.
+func (l *Log) LastAccess(ctx context.Context, path string) (time.Time, error) {
+	var ts sql.NullString
+	err := l.db.QueryRowContext(ctx, `
+		SELECT MAX(ts) FROM audit_log
+		WHERE action = ? AND result = ? AND secret_path = ?
+	`, ActionGet, ResultOK, path).Scan(&ts)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("audit last access: %w", err)
+	}
+	if !ts.Valid {
+		return time.Time{}, nil
+	}
+	t, perr := time.Parse(time.RFC3339Nano, ts.String)
+	if perr != nil {
+		return time.Time{}, nil
+	}
+	return t, nil
+}
+
+// LastAccessByPath returns the most recent successful ActionGet
+// timestamp per secret path — the data behind "last read" in the web
+// UI. Deliberately filtered to action=get, result=ok: browsing
+// (ActionListDetail, written by App.BrowseDetailed/App.Inspect) must
+// never count as a read, or opening the entries browser would stamp
+// every visible entry as "just read" and the feature would be
+// meaningless. ts is stored as RFC3339Nano text, which sorts correctly
+// as a string, so MAX(ts) needs no window function.
+func (l *Log) LastAccessByPath(ctx context.Context) (map[string]time.Time, error) {
+	rows, err := l.db.QueryContext(ctx, `
+		SELECT secret_path, MAX(ts) FROM audit_log
+		WHERE action = ? AND result = ? AND secret_path != ''
+		GROUP BY secret_path
+	`, ActionGet, ResultOK)
+	if err != nil {
+		return nil, fmt.Errorf("audit last access: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]time.Time)
+	for rows.Next() {
+		var path, tsStr string
+		if err := rows.Scan(&path, &tsStr); err != nil {
+			return nil, err
+		}
+		t, perr := time.Parse(time.RFC3339Nano, tsStr)
+		if perr != nil {
+			continue
+		}
+		out[path] = t
+	}
+	return out, rows.Err()
+}
+
 func scanEntries(rows *sql.Rows) ([]Entry, error) {
 	var out []Entry
 	for rows.Next() {
