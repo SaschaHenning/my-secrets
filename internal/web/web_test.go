@@ -157,8 +157,8 @@ func TestLoginGETRendersForm(t *testing.T) {
 
 // TestLoginPOSTIssuesCookie runs the happy path: stub Touch-ID, POST
 // /login with no next=, expect a Set-Cookie and a redirect to the
-// default landing page (the search-first entries browser, not the
-// stats overview — matches the PWA's start_url).
+// default landing page (the start page — instant, no decrypt — matching
+// the PWA's start_url).
 func TestLoginPOSTIssuesCookie(t *testing.T) {
 	withStubTouchID(t, func(context.Context) error { return nil })
 
@@ -569,13 +569,11 @@ func TestHandleEntries_CacheAvoidsRepeatDecrypt(t *testing.T) {
 	}
 }
 
-// TestEntriesCache_TransientErrorIsRetriedNotFrozen is a regression test
-// for a review finding: a failed refresh must not get cached alongside
-// (or instead of) good data for the rest of the TTL — the very next call
-// should retry immediately, and once the store recovers it should serve
-// fresh entries right away rather than waiting out the TTL.
-func TestEntriesCache_TransientErrorIsRetriedNotFrozen(t *testing.T) {
-	f := fake.NewWithEntries(&store.Entry{Path: "jasp/github", Org: "jasp"})
+// cacheTestApp builds a fake-store App plus a fresh cache for the
+// cache-level tests below.
+func cacheTestApp(t *testing.T, entries ...*store.Entry) (*app.App, *fake.Store) {
+	t.Helper()
+	f := fake.NewWithEntries(entries...)
 	pol := &policy.Policy{Actors: map[string]policy.Rules{
 		"human": {Allow: []string{"**"}}, "claude-code": {Allow: []string{"**"}},
 	}}
@@ -584,36 +582,121 @@ func TestEntriesCache_TransientErrorIsRetriedNotFrozen(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = l.Close() })
-	a := &app.App{Store: f, Audit: l, Policy: pol, Override: "claude-code"}
+	return &app.App{Store: f, Audit: l, Policy: pol, Override: "claude-code"}, f
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for: %s", what)
+}
+
+func (c *entriesCache) snapshot() (int, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries), c.refreshing
+}
+
+// TestEntriesCache_StaleWhileRevalidate: a stale cache is served
+// immediately (no wait) and refreshed in the background, so a later read
+// reflects the updated store.
+func TestEntriesCache_StaleWhileRevalidate(t *testing.T) {
+	a, f := cacheTestApp(t, &store.Entry{Path: "jasp/a", Org: "jasp"})
 	cache := newEntriesCache()
 
-	// 1. A successful initial load populates the cache with good data.
+	if got, _ := cache.get(context.Background(), a); len(got) != 1 {
+		t.Fatalf("initial load: want 1 entry, got %d", len(got))
+	}
+
+	// Store grows, cache goes stale.
+	if err := f.Set(context.Background(), &store.Entry{Path: "jasp/b", Org: "jasp"}); err != nil {
+		t.Fatal(err)
+	}
+	cache.at = time.Now().Add(-entriesCacheTTL - time.Second)
+
+	// A stale read returns the OLD set immediately (no block) and fires a
+	// background refresh.
+	got, err := cache.get(context.Background(), a)
+	if err != nil {
+		t.Fatalf("stale read should not error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("stale read should serve the old (1-entry) set immediately, got %d", len(got))
+	}
+	// The background refresh converges to the new 2-entry set.
+	waitFor(t, "background refresh to pick up the new entry", func() bool {
+		n, refreshing := cache.snapshot()
+		return n == 2 && !refreshing
+	})
+	if got, _ := cache.get(context.Background(), a); len(got) != 2 {
+		t.Errorf("after refresh want 2 entries, got %d", len(got))
+	}
+}
+
+// TestEntriesCache_FailedRefreshKeepsStale: a background refresh that
+// errors keeps serving the last good result (never an error, never a
+// truncated set), and recovery converges on the next stale read.
+func TestEntriesCache_FailedRefreshKeepsStale(t *testing.T) {
+	a, f := cacheTestApp(t, &store.Entry{Path: "jasp/a", Org: "jasp"})
+	cache := newEntriesCache()
 	if _, err := cache.get(context.Background(), a); err != nil {
 		t.Fatalf("initial load: %v", err)
 	}
 
-	// 2. Force the cache to look stale, then have the refresh fail. The
-	// bug this guards against: a buggy implementation bumps its
-	// "last refreshed" timestamp even on failure while leaving the old
-	// (still-fresh-looking) entries in place, so the *next* call within
-	// the new window would return those stale entries paired with this
-	// error — exactly what step 3 checks does NOT happen.
+	// Make it stale and fail the refresh.
 	cache.at = time.Now().Add(-entriesCacheTTL - time.Second)
 	f.ListErr = errors.New("store unreachable")
-	if _, err := cache.get(context.Background(), a); err == nil {
-		t.Fatal("want error from the failed refresh")
-	}
-
-	// 3. The store recovers immediately after. The very next call must
-	// retry right away — not serve a frozen (stale-entries, cached-error)
-	// pair for the rest of the TTL.
-	f.ListErr = nil
-	entries, err := cache.get(context.Background(), a)
+	got, err := cache.get(context.Background(), a)
 	if err != nil {
-		t.Fatalf("call right after recovery should retry immediately and succeed, got: %v", err)
+		t.Fatalf("stale-while-revalidate must not surface the refresh error, got: %v", err)
 	}
-	if len(entries) != 1 || entries[0].Path != "jasp/github" {
-		t.Errorf("want the real entry after recovery, got %+v", entries)
+	if len(got) != 1 {
+		t.Errorf("want the stale good entry, got %d", len(got))
+	}
+	// The failed refresh clears its flag and leaves the good result intact.
+	waitFor(t, "failed refresh to clear its flag", func() bool {
+		n, refreshing := cache.snapshot()
+		return n == 1 && !refreshing
+	})
+
+	// Recover: store gains an entry, next stale read converges to it.
+	f.ListErr = nil
+	if err := f.Set(context.Background(), &store.Entry{Path: "jasp/b", Org: "jasp"}); err != nil {
+		t.Fatal(err)
+	}
+	cache.at = time.Now().Add(-entriesCacheTTL - time.Second)
+	if _, err := cache.get(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "recovery refresh to converge", func() bool {
+		n, refreshing := cache.snapshot()
+		return n == 2 && !refreshing
+	})
+}
+
+// TestEntriesCache_WarmPrepopulates: warm() does a synchronous decrypt so
+// a subsequent get is a hit with no additional Store.Get calls.
+func TestEntriesCache_WarmPrepopulates(t *testing.T) {
+	a, f := cacheTestApp(t, &store.Entry{Path: "jasp/a", Org: "jasp"}, &store.Entry{Path: "jasp/b", Org: "jasp"})
+	cache := newEntriesCache()
+
+	cache.warm(a)
+	after := f.GetCallCount()
+	if after == 0 {
+		t.Fatal("warm should have decrypted the store")
+	}
+	got, err := cache.get(context.Background(), a)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("warmed get: want 2 entries no error, got %d / %v", len(got), err)
+	}
+	if f.GetCallCount() != after {
+		t.Errorf("get after warm should be a cache hit (no new Get calls): before=%d after=%d", after, f.GetCallCount())
 	}
 }
 
@@ -1517,7 +1600,7 @@ func TestServe_PWAAssetsAreServed(t *testing.T) {
 		path        string
 		wantContain string // empty = just check 200 + non-empty body
 	}{
-		{"/static/manifest.webmanifest", `"start_url": "/entries"`},
+		{"/static/manifest.webmanifest", `"start_url": "/"`},
 		{"/static/sw.js", "addEventListener"},
 		{"/static/icons/icon-192.png", ""},
 		{"/static/icons/icon-512.png", ""},

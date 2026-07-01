@@ -389,9 +389,11 @@ Screenshots siehe [`docs/screenshots/`](docs/screenshots).
 ### Als App aus dem Dock/Launchpad starten
 
 Die Web-UI ist eine installierbare PWA: Chrome/Edge bieten „App
-installieren" an, Safari „Zum Dock hinzufügen". `start_url` ist
-`/entries` — nach dem Touch-ID-Login landest du direkt auf der
-Such-Seite mit Fokus im Suchfeld, nicht auf der Statistik-Übersicht.
+installieren" an, Safari „Zum Dock hinzufügen". `start_url` ist `/` —
+nach dem Touch-ID-Login landest du sofort auf der Startseite mit
+fokussiertem Suchfeld und „Zuletzt benutzt" (lädt instant, entschlüsselt
+nichts; der Entries-Cache wird beim Serverstart im Hintergrund
+vorgewärmt, damit auch die volle Liste und die Suche schnell sind).
 Ein `?next=`-Parameter sorgt dafür, dass ein Tiefenlink (z. B. direkt zu
 einem Eintrag) den Login-Umweg übersteht.
 
