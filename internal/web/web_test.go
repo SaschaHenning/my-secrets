@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,7 +67,8 @@ func withStubTouchID(t *testing.T, stub func(context.Context) error) {
 }
 
 // TestAuthGateRedirectsWithoutCookie asserts that any request without a
-// valid session cookie is bounced to /login with a 303.
+// valid session cookie is bounced to /login?next=<original request>, so
+// a deep link survives the round trip through login.
 func TestAuthGateRedirectsWithoutCookie(t *testing.T) {
 	store := newSessionStore(time.Minute)
 	h := authGate(store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -80,8 +82,8 @@ func TestAuthGateRedirectsWithoutCookie(t *testing.T) {
 	if w.Code != http.StatusSeeOther {
 		t.Fatalf("expected 303, got %d", w.Code)
 	}
-	if got := w.Header().Get("Location"); got != "/login" {
-		t.Fatalf("expected redirect to /login, got %q", got)
+	if got := w.Header().Get("Location"); got != "/login?next=%2Faudit" {
+		t.Fatalf("expected redirect to /login?next=%%2Faudit, got %q", got)
 	}
 }
 
@@ -151,7 +153,9 @@ func TestLoginGETRendersForm(t *testing.T) {
 }
 
 // TestLoginPOSTIssuesCookie runs the happy path: stub Touch-ID, POST
-// /login, expect a Set-Cookie and a redirect to /.
+// /login with no next=, expect a Set-Cookie and a redirect to the
+// default landing page (the search-first entries browser, not the
+// stats overview — matches the PWA's start_url).
 func TestLoginPOSTIssuesCookie(t *testing.T) {
 	withStubTouchID(t, func(context.Context) error { return nil })
 
@@ -165,8 +169,8 @@ func TestLoginPOSTIssuesCookie(t *testing.T) {
 	if w.Code != http.StatusSeeOther {
 		t.Fatalf("expected 303, got %d", w.Code)
 	}
-	if got := w.Header().Get("Location"); got != "/" {
-		t.Fatalf("expected redirect to /, got %q", got)
+	if got := w.Header().Get("Location"); got != defaultLandingPath {
+		t.Fatalf("expected redirect to %q, got %q", defaultLandingPath, got)
 	}
 
 	resp := w.Result()
@@ -270,6 +274,71 @@ func TestLoginPOST_SlowTouchIDDoesNotHitWriteTimeout(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Errorf("status = %d, want 303 (redirect after a successful, slow Touch-ID confirmation)", resp.StatusCode)
+	}
+}
+
+// TestSafeNextPath checks the open-redirect guard: same-origin paths
+// pass through unchanged, anything that could send the post-login
+// redirect off this server falls back to the default.
+func TestSafeNextPath(t *testing.T) {
+	const def = "/entries"
+	cases := map[string]string{
+		"":                      def,
+		"/entries/jasp/github":  "/entries/jasp/github",
+		"/entries?org=jasp":     "/entries?org=jasp",
+		"//evil.com":            def,
+		"http://evil.com":       def,
+		"https://evil.com/path": def,
+		"entries":               def,               // must start with "/"
+		`/\evil.com`:            def,               // backslash trick
+		"/%2F%2Fevil.com":       "/%2F%2Fevil.com", // encoded, not literal // — safe as a path segment
+	}
+	for next, want := range cases {
+		if got := safeNextPath(next, def); got != want {
+			t.Errorf("safeNextPath(%q) = %q, want %q", next, got, want)
+		}
+	}
+}
+
+// TestLogin_NextRoundTrip covers the full deep-link flow: an
+// unauthenticated request to a specific page redirects to
+// /login?next=<page>, the login form echoes it back as a hidden field,
+// and a successful POST redirects to that exact page rather than the
+// default landing path.
+func TestLogin_NextRoundTrip(t *testing.T) {
+	store := newSessionStore(time.Minute)
+
+	gateHandler := authGate(store, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("protected"))
+	}))
+	r := httptest.NewRequest("GET", "/entries/jasp/github", nil)
+	w := httptest.NewRecorder()
+	gateHandler.ServeHTTP(w, r)
+	loc := w.Header().Get("Location")
+	if loc != "/login?next=%2Fentries%2Fjasp%2Fgithub" {
+		t.Fatalf("unexpected redirect from authGate: %q", loc)
+	}
+
+	// Follow the redirect: GET /login?next=... must echo it into a
+	// hidden form field.
+	nextParam := strings.TrimPrefix(loc, "/login?")
+	loginGET := httptest.NewRequest("GET", "/login?"+nextParam, nil)
+	w2 := httptest.NewRecorder()
+	handleLogin(store, time.Minute).ServeHTTP(w2, loginGET)
+	if !strings.Contains(w2.Body.String(), `name="next" value="/entries/jasp/github"`) {
+		t.Fatalf("login form did not echo next=: %s", w2.Body.String())
+	}
+
+	// POST with that hidden field set, as a browser submitting the form
+	// would — must redirect to the original destination, not defaultLandingPath.
+	withStubTouchID(t, func(context.Context) error { return nil })
+	form := strings.NewReader("next=" + url.QueryEscape("/entries/jasp/github"))
+	loginPOST := httptest.NewRequest("POST", "/login", form)
+	loginPOST.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w3 := httptest.NewRecorder()
+	handleLogin(store, time.Minute).ServeHTTP(w3, loginPOST)
+	if got := w3.Header().Get("Location"); got != "/entries/jasp/github" {
+		t.Errorf("post-login redirect = %q, want the original deep link", got)
 	}
 }
 
@@ -1099,6 +1168,77 @@ func TestServe_StartStop(t *testing.T) {
 	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionWebOpen, Limit: 5})
 	if len(rows) == 0 {
 		t.Error("expected web_open audit entry")
+	}
+}
+
+// TestServe_PWAAssetsAreServed confirms the manifest, service worker, and
+// icons the PWA shell depends on are actually reachable through the real
+// static file handler — these are embed.FS entries, not template output,
+// so httptest-direct handler calls elsewhere in this file don't exercise
+// the //go:embed wiring the way a real running server does.
+func TestServe_PWAAssetsAreServed(t *testing.T) {
+	a := newAuditApp(t)
+	port := freePort(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var stdout bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, a, port, &stdout) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/healthz", port)); err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	cases := []struct {
+		path        string
+		wantContain string // empty = just check 200 + non-empty body
+	}{
+		{"/static/manifest.webmanifest", `"start_url": "/entries"`},
+		{"/static/sw.js", "addEventListener"},
+		{"/static/icons/icon-192.png", ""},
+		{"/static/icons/icon-512.png", ""},
+	}
+	for _, tc := range cases {
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d%s", port, tc.path))
+		if err != nil {
+			t.Errorf("%s: %v", tc.path, err)
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200", tc.path, resp.StatusCode)
+		}
+		if len(body) == 0 {
+			t.Errorf("%s: empty body", tc.path)
+		}
+		if tc.wantContain != "" && !strings.Contains(string(body), tc.wantContain) {
+			t.Errorf("%s: body missing %q", tc.path, tc.wantContain)
+		}
+	}
+}
+
+// TestSWJS_NeverCaches guards the security-load-bearing constraint on the
+// service worker: it must never call caches.open/cache.put, or a
+// revealed secret value could persist unencrypted in Cache Storage
+// outside the audit log's visibility (see docs/SECURITY.md).
+func TestSWJS_NeverCaches(t *testing.T) {
+	b, err := assets.ReadFile("static/sw.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	for _, forbidden := range []string{"caches.open", "cache.put", ".put(", ".add("} {
+		if strings.Contains(src, forbidden) {
+			t.Errorf("sw.js must never cache anything, found forbidden call %q", forbidden)
+		}
 	}
 }
 

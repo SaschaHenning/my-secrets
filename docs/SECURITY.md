@@ -215,6 +215,26 @@ keychain.
   still applies remotely, but be aware a tunnel puts the loopback
   restriction on the *remote* end, not yours — only tunnel to machines
   you trust.
+- **Post-login redirect (`?next=`).** `authGate` sends an
+  unauthenticated request to `/login?next=<original request>` so a deep
+  link (or the installed PWA's `start_url`) survives the login round
+  trip. `next` is otherwise fully attacker-controlled — it's reflected
+  into a `Location` header and a hidden form field — so `safeNextPath`
+  restricts it to a same-origin absolute path before it's ever used:
+  rejects `//host` and `http://host` (open-redirect off this server)
+  and a leading backslash (some browsers resolve `\` the same as `/`
+  when following a `Location` header, which plain `url.Parse` would not
+  by itself flag as absolute).
+- **LaunchAgent autostart (`mys web install`).** Installs
+  `~/Library/LaunchAgents/com.jasp.my-secrets.web.plist` with
+  `KeepAlive` unconditional, so the server process restarts immediately
+  after the normal 30-minute idle-shutdown, not just after a crash. This
+  does **not** weaken the login requirement: session state lives only in
+  the process's memory (`internal/web/session.go`), so a relaunched
+  process starts with zero active sessions and the next request always
+  hits Touch ID again — only the *port* stays reachable, never an
+  authenticated session. `mys web uninstall` removes the LaunchAgent;
+  `mys web status` reports whether it's currently active.
 
 ## MCP server
 
