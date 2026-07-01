@@ -294,11 +294,34 @@ func (a *App) BrowseDetailed(ctx context.Context, org string) ([]*store.Entry, e
 	}
 	entries := make([]*store.Entry, 0, len(paths))
 	for _, p := range paths {
+		// Request cancelled mid-decrypt — e.g. the browser aborted the
+		// /entries load because the user navigated away before the
+		// whole store finished decrypting. Returning the entries
+		// decrypted so far as if the list were complete is exactly the
+		// "entries silently vanish on a quick back-click" bug: the web
+		// entriesCache would store that truncated result and serve it as
+		// good. Fail instead, so nothing partial is ever cached. The
+		// error audit row uses a detached context because ctx itself is
+		// already cancelled and would drop the write.
+		if ctx.Err() != nil {
+			a.writeAudit(context.Background(), audit.ActionListDetail, orgPath(org), d, audit.ResultError, ctx.Err().Error())
+			return nil, ctx.Err()
+		}
 		if !a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p).Allowed {
 			continue
 		}
 		e, gerr := a.Store.Get(ctx, p)
 		if gerr != nil {
+			// Distinguish "this one entry is genuinely undecryptable"
+			// (tolerate, skip it) from "the whole request was cancelled"
+			// (fatal — never a partial-as-success). ctx.Err() is the
+			// reliable signal: the store may wrap the cancellation error
+			// as a plain string that errors.Is won't match, but a
+			// cancelled request always makes ctx.Err() non-nil.
+			if ctx.Err() != nil {
+				a.writeAudit(context.Background(), audit.ActionListDetail, orgPath(org), d, audit.ResultError, ctx.Err().Error())
+				return nil, ctx.Err()
+			}
 			continue
 		}
 		entries = append(entries, e)

@@ -1495,3 +1495,72 @@ func TestBrowseDetailed_SkipsUndecryptableEntries(t *testing.T) {
 		t.Errorf("expected zero entries when every Get fails, got %d", len(entries))
 	}
 }
+
+// TestBrowseDetailed_CancelledContextReturnsErrorNotPartial is the
+// regression test for the "entries silently vanish on a quick
+// back-click" bug (#73): when the request context is cancelled
+// mid-decrypt, BrowseDetailed must return an error, NOT the entries
+// decrypted so far as if the list were complete — otherwise the web
+// entriesCache stores a truncated partial and serves it as good.
+func TestBrowseDetailed_CancelledContextReturnsErrorNotPartial(t *testing.T) {
+	// Pre-cancelled context: the top-of-loop guard must fire before any
+	// entry is returned.
+	a, _ := appWithFake(t, "human", sampleEntries()...)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	entries, err := a.BrowseDetailed(ctx, "")
+	if err == nil {
+		t.Fatal("want an error for a cancelled context, got nil (would cache a partial as complete)")
+	}
+	if entries != nil {
+		t.Errorf("want nil entries on cancellation, got %d", len(entries))
+	}
+}
+
+// cancelOnFirstGetStore cancels the shared context the moment the first
+// Get is invoked, so the second loop iteration in BrowseDetailed hits the
+// cancellation guard — exercising the mid-decrypt-cancel path
+// deterministically (no timing dependence).
+type cancelOnFirstGetStore struct {
+	*fake.Store
+	cancel context.CancelFunc
+	fired  bool
+}
+
+func (s *cancelOnFirstGetStore) Get(ctx context.Context, path string) (*store.Entry, error) {
+	if !s.fired {
+		s.fired = true
+		s.cancel()
+	}
+	return s.Store.Get(ctx, path)
+}
+
+func TestBrowseDetailed_MidLoopCancelReturnsErrorNotPartial(t *testing.T) {
+	f := fake.NewWithEntries(
+		&store.Entry{Path: "jasp/a", Org: "jasp", Username: "a"},
+		&store.Entry{Path: "jasp/b", Org: "jasp", Username: "b"},
+		&store.Entry{Path: "jasp/c", Org: "jasp", Username: "c"},
+	)
+	l, err := audit.Open(filepath.Join(t.TempDir(), "audit.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	pol := &policy.Policy{Actors: map[string]policy.Rules{"claude-code": {Allow: []string{"**"}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	a := &App{
+		Store:  &cancelOnFirstGetStore{Store: f, cancel: cancel},
+		Audit:  l,
+		Policy: pol,
+		// caller.Identify classifies a `go test` process as ai/claude-code;
+		// grant that kind full access rather than fighting the classifier.
+		Override: "claude-code",
+	}
+	entries, err := a.BrowseDetailed(ctx, "")
+	if err == nil {
+		t.Fatal("want an error once the context is cancelled mid-decrypt, got nil")
+	}
+	if entries != nil {
+		t.Errorf("want nil entries (never a partial), got %d", len(entries))
+	}
+}
