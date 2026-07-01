@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -446,7 +447,7 @@ func TestHandleEntries_AlwaysShowsAllEntriesGrouped(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
-	handleEntries(a)(w, r)
+	handleEntries(a, newEntriesCache())(w, r)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
@@ -473,11 +474,100 @@ func TestHandleEntries_AlwaysShowsAllEntriesGrouped(t *testing.T) {
 	}
 }
 
+// TestHandleEntries_CacheAvoidsRepeatDecrypt is a regression test for a
+// real-world problem: even after extendWriteDeadline stopped /entries
+// from being cut off outright on a real store, every single page load
+// still paid the full decrypt cost — "click a link, wait tens of
+// seconds, nothing happens" was still the actual experience. A shared
+// entriesCache across requests within its TTL must serve the second
+// load from memory: no second App.BrowseDetailed call, and — since no
+// decrypt happened — no second list_detail audit row either.
+func TestHandleEntries_CacheAvoidsRepeatDecrypt(t *testing.T) {
+	a, f := newFakeApp(t, "human", sampleWebEntries()...)
+	cache := newEntriesCache()
+
+	getCallsBefore := f.GetCallCount()
+	r1 := httptest.NewRequest("GET", "/entries", nil)
+	w1 := httptest.NewRecorder()
+	handleEntries(a, cache)(w1, r1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first load: status = %d", w1.Code)
+	}
+	getCallsAfterFirst := f.GetCallCount()
+	if getCallsAfterFirst == getCallsBefore {
+		t.Fatal("first load should have decrypted at least once (cache miss)")
+	}
+
+	r2 := httptest.NewRequest("GET", "/entries?q=jasp", nil)
+	w2 := httptest.NewRecorder()
+	handleEntries(a, cache)(w2, r2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second load: status = %d", w2.Code)
+	}
+	getCallsAfterSecond := f.GetCallCount()
+	if getCallsAfterSecond != getCallsAfterFirst {
+		t.Errorf("second load within the cache TTL re-decrypted: %d Get calls before, %d after", getCallsAfterFirst, getCallsAfterSecond)
+	}
+
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionListDetail, Limit: 5})
+	if len(rows) != 1 {
+		t.Errorf("want exactly 1 list_detail row (cache hit writes none), got %d", len(rows))
+	}
+}
+
+// TestEntriesCache_TransientErrorIsRetriedNotFrozen is a regression test
+// for a review finding: a failed refresh must not get cached alongside
+// (or instead of) good data for the rest of the TTL — the very next call
+// should retry immediately, and once the store recovers it should serve
+// fresh entries right away rather than waiting out the TTL.
+func TestEntriesCache_TransientErrorIsRetriedNotFrozen(t *testing.T) {
+	f := fake.NewWithEntries(&store.Entry{Path: "jasp/github", Org: "jasp"})
+	pol := &policy.Policy{Actors: map[string]policy.Rules{
+		"human": {Allow: []string{"**"}}, "claude-code": {Allow: []string{"**"}},
+	}}
+	l, err := audit.Open(filepath.Join(t.TempDir(), "audit.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	a := &app.App{Store: f, Audit: l, Policy: pol, Override: "claude-code"}
+	cache := newEntriesCache()
+
+	// 1. A successful initial load populates the cache with good data.
+	if _, err := cache.get(context.Background(), a); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+
+	// 2. Force the cache to look stale, then have the refresh fail. The
+	// bug this guards against: a buggy implementation bumps its
+	// "last refreshed" timestamp even on failure while leaving the old
+	// (still-fresh-looking) entries in place, so the *next* call within
+	// the new window would return those stale entries paired with this
+	// error — exactly what step 3 checks does NOT happen.
+	cache.at = time.Now().Add(-entriesCacheTTL - time.Second)
+	f.ListErr = errors.New("store unreachable")
+	if _, err := cache.get(context.Background(), a); err == nil {
+		t.Fatal("want error from the failed refresh")
+	}
+
+	// 3. The store recovers immediately after. The very next call must
+	// retry right away — not serve a frozen (stale-entries, cached-error)
+	// pair for the rest of the TTL.
+	f.ListErr = nil
+	entries, err := cache.get(context.Background(), a)
+	if err != nil {
+		t.Fatalf("call right after recovery should retry immediately and succeed, got: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Path != "jasp/github" {
+		t.Errorf("want the real entry after recovery, got %+v", entries)
+	}
+}
+
 func TestHandleEntries_FiltersByPolicy(t *testing.T) {
 	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
 	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
-	handleEntries(a)(w, r)
+	handleEntries(a, newEntriesCache())(w, r)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -491,7 +581,7 @@ func TestHandleEntries_PrefillsSearchBoxFromQueryParam(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 	r := httptest.NewRequest("GET", "/entries?q=alice", nil)
 	w := httptest.NewRecorder()
-	handleEntries(a)(w, r)
+	handleEntries(a, newEntriesCache())(w, r)
 
 	if !strings.Contains(w.Body.String(), `id="search" value="alice"`) {
 		t.Errorf("expected ?q= to prefill the search box's value: %s", w.Body.String())
@@ -507,15 +597,24 @@ func TestHandleEntries_DataSearchAttributeDrivesClientFilter(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
-	handleEntries(a)(w, r)
+	handleEntries(a, newEntriesCache())(w, r)
 
 	body := w.Body.String()
-	re := regexp.MustCompile(`href="/entries/jasp/aws" data-search="([^"]*)"`)
-	m := re.FindStringSubmatch(body)
-	if m == nil {
+	// data-search now lives on the <tr>, not co-located with the path's
+	// <a href> (which is in a nested <td>), so match on the blob content
+	// itself — it already includes the path — rather than the two
+	// attributes appearing adjacent in the markup.
+	re := regexp.MustCompile(`data-search="([^"]*)"`)
+	var blob string
+	for _, m := range re.FindAllStringSubmatch(body, -1) {
+		if strings.Contains(m[1], "jasp/aws") {
+			blob = m[1]
+			break
+		}
+	}
+	if blob == "" {
 		t.Fatalf("could not find jasp/aws's data-search attribute in body: %s", body)
 	}
-	blob := m[1]
 	for _, want := range []string{"jasp/aws", "bob", "aws.amazon.com", "prod"} {
 		if !strings.Contains(blob, want) {
 			t.Errorf("data-search blob %q missing %q", blob, want)
@@ -539,7 +638,7 @@ func TestHandleEntries_ShowsLastRead(t *testing.T) {
 
 	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
-	handleEntries(a)(w, r)
+	handleEntries(a, newEntriesCache())(w, r)
 
 	body := w.Body.String()
 	if !strings.Contains(body, "2026-03-04") {
@@ -682,7 +781,7 @@ func TestHandleEntries_BrowsingNeverCountsAsLastRead(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		r := httptest.NewRequest("GET", "/entries", nil)
 		w := httptest.NewRecorder()
-		handleEntries(a)(w, r)
+		handleEntries(a, newEntriesCache())(w, r)
 
 		r2 := httptest.NewRequest("GET", "/entries/jasp/github", nil)
 		r2.SetPathValue("path", "jasp/github")
@@ -703,7 +802,7 @@ func TestHandleEntries_NeverRendersPassword(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 	r := httptest.NewRequest("GET", "/entries", nil)
 	w := httptest.NewRecorder()
-	handleEntries(a)(w, r)
+	handleEntries(a, newEntriesCache())(w, r)
 
 	for _, secret := range []string{"p1", "p2", "p3", "p4"} {
 		if strings.Contains(w.Body.String(), secret) {
@@ -840,6 +939,78 @@ func TestHandleReveal_Success(t *testing.T) {
 	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionGet, Limit: 5})
 	if len(rows) != 1 || rows[0].Result != audit.ResultOK || rows[0].SecretPath != "jasp/github" {
 		t.Fatalf("want 1 ok get row for jasp/github, got %+v", rows)
+	}
+}
+
+// TestHandleReveal_JSONMode covers the entries table's inline "copy
+// password" button: same Inspect→TouchID→Get gate as the full-page
+// reveal, just a JSON {"password": "..."} response instead of rendering
+// entry.html, requested via Accept: application/json.
+func TestHandleReveal_JSONMode(t *testing.T) {
+	withStubTouchID(t, func(context.Context) error { return nil })
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	r.Header.Set("Accept", "application/json")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", w.Code, w.Body.String())
+	}
+	var got struct {
+		Password string `json:"password"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not valid JSON: %v; body=%q", err, w.Body.String())
+	}
+	if got.Password != "p1" {
+		t.Errorf("password = %q, want p1", got.Password)
+	}
+	if strings.Contains(w.Body.String(), "<html") {
+		t.Error("JSON mode must not render the HTML page")
+	}
+
+	// Same audit parity as the HTML-mode reveal.
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionGet, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultOK {
+		t.Fatalf("want 1 ok get row, got %+v", rows)
+	}
+}
+
+func TestHandleReveal_JSONMode_TouchIDFailure(t *testing.T) {
+	withStubTouchID(t, func(context.Context) error { return errors.New("cancelled") })
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+
+	r := httptest.NewRequest("POST", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	r.Header.Set("Accept", "application/json")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "p1") {
+		t.Error("failed Touch ID must not reveal the password in JSON mode either")
+	}
+}
+
+func TestHandleReveal_JSONMode_Denied(t *testing.T) {
+	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
+
+	r := httptest.NewRequest("POST", "/entries/private/bank", nil)
+	r.SetPathValue("path", "private/bank")
+	r.Header.Set("Accept", "application/json")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "p4") {
+		t.Error("denied reveal must not leak the password in JSON mode")
 	}
 }
 

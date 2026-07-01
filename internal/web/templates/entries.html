@@ -26,24 +26,27 @@
   {{range .Groups}}
   <div class="org-group">
     <h2>{{.Org}} <span class="muted-count">({{len .Entries}})</span></h2>
-    <div class="entry-grid">
-    {{range .Entries}}
-      <a class="entry-card" href="/entries/{{.Path}}" data-search="{{searchBlob .}}">
-        <div class="entry-path"><code>{{.Path}}</code></div>
-        <div class="entry-meta">
-          {{if .Kind}}<span class="badge kind-badge">{{.Kind}}</span>{{end}}
-          {{if .Username}}<span class="muted">{{.Username}}</span>{{end}}
-          {{if .Domain}}<span class="muted">{{.Domain}}</span>{{end}}
-        </div>
-        {{if .Tags}}
-        <div class="tag-row">
-          {{range .Tags}}<span class="tag">{{.}}</span>{{end}}
-        </div>
-        {{end}}
-        <div class="last-read">zuletzt gelesen: {{relativeTime (index $.LastReads .Path)}}</div>
-      </a>
-    {{end}}
-    </div>
+    <table class="entries-table">
+      <thead>
+        <tr><th>Path</th><th>Kind</th><th>Username</th><th>Domain</th><th>Tags</th><th>Zuletzt gelesen</th><th></th></tr>
+      </thead>
+      <tbody>
+      {{range .Entries}}
+        <tr class="entry-row" data-search="{{searchBlob .}}">
+          <td><a href="/entries/{{.Path}}"><code>{{.Path}}</code></a></td>
+          <td>{{if .Kind}}<span class="badge kind-badge">{{.Kind}}</span>{{end}}</td>
+          <td>{{if .Username}}{{.Username}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .Domain}}{{.Domain}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{range .Tags}}<span class="tag">{{.}}</span>{{end}}</td>
+          <td class="muted">{{relativeTime (index $.LastReads .Path)}}</td>
+          <td class="entry-actions">
+            <button type="button" class="icon-btn copy-username" data-username="{{.Username}}" title="Nutzername kopieren" {{if not .Username}}disabled{{end}}>👤</button>
+            <button type="button" class="icon-btn copy-password" data-path="{{.Path}}" title="Passwort kopieren (Touch ID)">🔑</button>
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
   </div>
   {{end}}
 
@@ -64,9 +67,9 @@
       var totalVisible = 0;
       groups.forEach(function (group) {
         var visibleInGroup = 0;
-        group.querySelectorAll('.entry-card').forEach(function (card) {
-          var match = q === '' || card.dataset.search.indexOf(q) !== -1;
-          card.style.display = match ? '' : 'none';
+        group.querySelectorAll('.entry-row').forEach(function (row) {
+          var match = q === '' || row.dataset.search.indexOf(q) !== -1;
+          row.style.display = match ? '' : 'none';
           if (match) visibleInGroup++;
         });
         group.style.display = visibleInGroup > 0 ? '' : 'none';
@@ -81,6 +84,49 @@
     var focus = function () { input.focus(); };
     if (!input.value) focus();
     window.addEventListener('pageshow', function (e) { if (e.persisted && !input.value) focus(); });
+
+    // Inline copy actions. Both stop propagation/default since they sit
+    // inside a table row whose Path cell is separately a link — nothing
+    // here should also trigger navigation.
+    function flash(btn, symbol) {
+      var orig = btn.textContent;
+      btn.textContent = symbol;
+      btn.disabled = true;
+      setTimeout(function () { btn.textContent = orig; btn.disabled = false; }, 1200);
+    }
+
+    document.querySelectorAll('.copy-username').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        if (!btn.dataset.username) return;
+        navigator.clipboard.writeText(btn.dataset.username).then(function () {
+          flash(btn, '✅');
+        });
+      });
+    });
+
+    document.querySelectorAll('.copy-password').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        // Every click re-runs the full reveal gate server-side (fresh
+        // Touch ID, policy check, audit row) — this is not a cached or
+        // pre-fetched value, same guarantee as the detail page's reveal
+        // button, just reachable without navigating there first.
+        fetch('/entries/' + btn.dataset.path, {
+          method: 'POST',
+          headers: { 'Accept': 'application/json' },
+        }).then(function (res) {
+          if (!res.ok) throw new Error('denied');
+          return res.json();
+        }).then(function (data) {
+          return navigator.clipboard.writeText(data.password);
+        }).then(function () {
+          flash(btn, '✅');
+        }).catch(function () {
+          flash(btn, '❌');
+        });
+      });
+    });
   })();
 </script>
 </body>

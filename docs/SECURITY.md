@@ -184,6 +184,12 @@ keychain.
   client-side auto-blank-after-30s and copy button are UX, not security
   controls — the no-store header and the Touch-ID gate are the actual
   controls.
+  - The entries table's inline "copy password" button is the same
+    endpoint, same gate — it sends `Accept: application/json` and gets
+    `{"password": "..."}` back instead of the HTML page, so it can copy
+    the value without a page navigation. It does not skip, cache, or
+    weaken any part of the Inspect→Touch-ID→Get sequence; a fresh
+    Touch-ID prompt still fires on every click.
   - Freshness assumption: each reveal spawns a new `security authorize`
     process (a new `AuthorizationRef`), so "every click re-authenticates"
     holds as long as macOS's `system.privilege.admin` right stays

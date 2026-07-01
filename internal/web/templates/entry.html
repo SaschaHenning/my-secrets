@@ -24,7 +24,17 @@
   <table class="audit">
     <tbody>
       {{if .Entry.Kind}}<tr><td>Kind</td><td><span class="badge kind-badge">{{.Entry.Kind}}</span></td></tr>{{end}}
-      {{if .Entry.Username}}<tr><td>Username</td><td>{{.Entry.Username}}</td></tr>{{end}}
+      <tr>
+        <td>Username</td>
+        <td>
+          {{if .Entry.Username}}
+            <span id="username-value">{{.Entry.Username}}</span>
+            <button type="button" class="icon-btn" id="copy-username" title="Nutzername kopieren">👤</button>
+          {{else}}
+            <span class="muted">—</span>
+          {{end}}
+        </td>
+      </tr>
       {{if .Entry.URL}}<tr><td>URL</td><td>{{.Entry.URL}}</td></tr>{{end}}
       {{if .Entry.Domain}}<tr><td>Domain</td><td>{{.Entry.Domain}}</td></tr>{{end}}
       {{if .Entry.GitHubProject}}<tr><td>GitHub project</td><td>{{.Entry.GitHubProject}}</td></tr>{{end}}
@@ -33,12 +43,12 @@
         <td>
           {{if .Revealed}}
             <code id="pw-value">{{.Entry.Password}}</code>
-            <button type="button" class="btn-link" onclick="navigator.clipboard.writeText(document.getElementById('pw-value').textContent)">Copy</button>
+            <button type="button" class="btn-action" onclick="navigator.clipboard.writeText(document.getElementById('pw-value').textContent)">Copy</button>
             <span class="hint" id="pw-hint">wird in 30s wieder maskiert</span>
           {{else}}
             <code>{{mask .Entry.Password}}</code>
             <form method="post" action="/entries/{{.Entry.Path}}" style="display:inline;">
-              <button type="submit" class="btn-link">Reveal (Touch ID)</button>
+              <button type="submit" class="btn-action">Reveal (Touch ID)</button>
             </form>
           {{end}}
         </td>
@@ -91,5 +101,19 @@
   }, 30000);
 </script>
 {{end}}
+<script>
+  (function () {
+    var btn = document.getElementById('copy-username');
+    var val = document.getElementById('username-value');
+    if (!btn || !val) return;
+    btn.addEventListener('click', function () {
+      navigator.clipboard.writeText(val.textContent).then(function () {
+        var orig = btn.textContent;
+        btn.textContent = '✅';
+        setTimeout(function () { btn.textContent = orig; }, 1200);
+      });
+    });
+  })();
+</script>
 </body>
 </html>

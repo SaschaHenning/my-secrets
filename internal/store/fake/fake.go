@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/store"
@@ -43,6 +44,18 @@ type Store struct {
 	// once per entry (e.g. App.BrowseDetailed decrypting a whole store).
 	// Respects ctx cancellation, same as the real store would.
 	GetDelay time.Duration
+	// getCalls counts every Get invocation (including ones that error),
+	// exposed via GetCallCount — used by tests asserting a caching layer
+	// above the store actually avoids repeat decrypts, not just that it
+	// returns the right data. atomic rather than mu-guarded so it can be
+	// incremented at the top of Get without touching that method's own
+	// RWMutex locking.
+	getCalls atomic.Int64
+}
+
+// GetCallCount returns how many times Get has been called so far.
+func (s *Store) GetCallCount() int {
+	return int(s.getCalls.Load())
 }
 
 // Compile-time assertion: *Store satisfies store.Interface.
@@ -185,6 +198,7 @@ func entryMatches(path string, e *store.Entry, q string) bool {
 }
 
 func (s *Store) Get(ctx context.Context, path string) (*store.Entry, error) {
+	s.getCalls.Add(1)
 	if s.GetErr != nil {
 		return nil, s.GetErr
 	}
