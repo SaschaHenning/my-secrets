@@ -16,7 +16,7 @@
 <main>
 
 <section>
-  <p><a href="/entries?q={{.Entry.Org}}" class="btn-link">&larr; {{.Entry.Org}}</a></p>
+  <p><a href="/entries" class="btn-link">&larr; Alle Einträge</a></p>
   <h2><code>{{.Entry.Path}}</code></h2>
 
   {{if .Error}}<p class="empty" style="color:#f87171">{{.Error}}</p>{{end}}
@@ -28,8 +28,8 @@
         <td>Username</td>
         <td>
           {{if .Entry.Username}}
-            <span id="username-value">{{.Entry.Username}}</span>
-            <button type="button" class="icon-btn" id="copy-username" title="Nutzername kopieren">👤</button>
+            <span>{{.Entry.Username}}</span>
+            <button type="button" class="icon-btn" data-copy-username="{{.Entry.Username}}" title="Nutzername kopieren">👤</button>
           {{else}}
             <span class="muted">—</span>
           {{end}}
@@ -48,7 +48,7 @@
           {{else}}
             <code>{{mask .Entry.Password}}</code>
             <form method="post" action="/entries/{{.Entry.Path}}" style="display:inline;">
-              <button type="submit" class="btn-action">Reveal (Touch ID)</button>
+              <button type="submit" class="btn-action">Aufdecken</button>
             </form>
           {{end}}
         </td>
@@ -87,12 +87,12 @@
 </section>
 
 </main>
-<footer>local UI · bound to 127.0.0.1 · revealing a value needs Touch ID every time and is logged like `mys get --reveal`</footer>
+<footer>local UI · bound to 127.0.0.1 · Aufdecken ist an die Login-Sitzung gebunden und wird wie `mys get --reveal` protokolliert</footer>
 {{if .Revealed}}
 <script>
   // Cosmetic only, not a security control — the value already round-tripped
   // over HTTP. The real control is the no-store response header and the
-  // Touch-ID challenge required to get here in the first place.
+  // login session required to get here.
   setTimeout(function () {
     var el = document.getElementById('pw-value');
     var hint = document.getElementById('pw-hint');
@@ -101,19 +101,5 @@
   }, 30000);
 </script>
 {{end}}
-<script>
-  (function () {
-    var btn = document.getElementById('copy-username');
-    var val = document.getElementById('username-value');
-    if (!btn || !val) return;
-    btn.addEventListener('click', function () {
-      navigator.clipboard.writeText(val.textContent).then(function () {
-        var orig = btn.textContent;
-        btn.textContent = '✅';
-        setTimeout(function () { btn.textContent = orig; }, 1200);
-      });
-    });
-  })();
-</script>
 </body>
 </html>

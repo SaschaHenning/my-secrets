@@ -15,6 +15,32 @@
 </header>
 <main>
 
+<section>
+  <form method="get" action="/entries">
+    <label for="home-search" class="sr-only">Secrets durchsuchen</label>
+    <input type="search" id="home-search" name="q" placeholder="Secrets durchsuchen — Enter zum Öffnen…" aria-label="Secrets durchsuchen" autofocus autocomplete="off">
+  </form>
+
+  <h2>Zuletzt benutzt</h2>
+  {{if .Recents}}
+  <table class="entries-table">
+    <tbody>
+    {{range .Recents}}
+      <tr>
+        <td><a href="/entries/{{.Path}}"><code>{{.Path}}</code></a></td>
+        <td class="muted">{{relativeTime .When}}</td>
+        <td class="entry-actions">
+          <button type="button" class="icon-btn" data-copy-password="{{.Path}}" title="Passwort kopieren">🔑</button>
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">noch nichts benutzt — oben suchen oder unter <a href="/entries" class="btn-link">Entries</a> stöbern</p>
+  {{end}}
+</section>
+
 <section class="stats">
   <div class="stat"><div class="label">Total events</div><div class="value">{{.Total}}</div></div>
   <div class="stat"><div class="label">AI</div><div class="value" style="color:#a78bfa">{{.AI}}</div></div>

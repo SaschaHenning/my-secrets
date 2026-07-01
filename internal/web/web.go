@@ -380,12 +380,20 @@ func handleIndex(a *app.App) http.HandlerFunc {
 			syncRemotes = cfg.Remotes
 		}
 
+		// Recently-used quick-access: the most recently *revealed* entries
+		// (audit.LastAccessByPath is get/ok-only, so this is "actually
+		// used", not merely browsed). Rendered as path + relative time +
+		// a one-click copy-password button — no decrypt at render time,
+		// so the start page stays instant and can't be slow/cancelled.
+		recents := recentlyUsed(a, ctx, 10)
+
 		data := map[string]any{
 			"Total":       total,
 			"AI":          aiCount,
 			"Human":       humanCount,
 			"Denied":      deniedCount,
 			"Recent":      last,
+			"Recents":     recents,
 			"Page":        "index",
 			"SyncRemotes": syncRemotes,
 		}
@@ -393,6 +401,32 @@ func handleIndex(a *app.App) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
+}
+
+// recentEntry is one row of the start page's "zuletzt benutzt" list.
+type recentEntry struct {
+	Path string
+	When time.Time
+}
+
+// recentlyUsed returns up to limit entries, most-recently-revealed
+// first, from the audit log's per-path last-access (get/ok) timestamps.
+// Metadata-free by design: it only needs the path (to link/copy) and the
+// timestamp, so it never decrypts — cheap and cancellation-proof.
+func recentlyUsed(a *app.App, ctx context.Context, limit int) []recentEntry {
+	byPath, err := a.Audit.LastAccessByPath(ctx)
+	if err != nil {
+		return nil
+	}
+	out := make([]recentEntry, 0, len(byPath))
+	for p, t := range byPath {
+		out = append(out, recentEntry{Path: p, When: t})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].When.After(out[j].When) })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
 }
 
 func countActor(a *app.App, ctx context.Context, actor string) int64 {
@@ -582,18 +616,9 @@ func handleEntries(a *app.App, cache *entriesCache) http.HandlerFunc {
 }
 
 // handleEntryDetail serves the entry-detail page at /entries/{path...}.
-// GET renders the masked view (App.Inspect — does not count as a read).
-// POST is the reveal action: for any path the caller is actually allowed
-// to read, it requires a FRESH Touch-ID challenge on every single
-// submission, deliberately not relying on the session cookie that
-// already gates access to this page. The session cookie answers "is this
-// browser allowed to browse metadata"; Touch ID answers "does a human
-// want to see this specific value right now" — collapsing the two would
-// mean an open browser tab, or anyone who can reach it within the
-// 30-minute idle window, could reveal every secret without further
-// confirmation. On success it calls the unmodified App.Get, so a web
-// reveal produces the exact same `get` audit row shape as `mys get
-// --reveal` on the CLI.
+// GET renders the masked view (App.Inspect — writes a list_detail row,
+// does not count as a read). POST is the reveal action (handleReveal),
+// gated by the login session, not a per-reveal prompt.
 //
 // No CSRF token on the reveal form: the session cookie is
 // SameSite=Lax (session.go), which browsers do not attach to a
@@ -618,38 +643,36 @@ func handleEntryDetail(a *app.App) http.HandlerFunc {
 	}
 }
 
-// handleReveal checks accessibility via App.Inspect FIRST — before ever
-// running the Touch-ID challenge. This matters for two reasons: a caller
-// who is policy-denied from a path gets a correctly audited denial
-// (Inspect writes it) and never sees the biometric prompt at all for
-// something they could never read anyway; and it means a bare POST to a
-// denied path (no prior page load) can't be used to spam Touch-ID
-// prompts. Only once Inspect confirms the path is both real and allowed
-// does the fresh Touch-ID challenge run, followed by the unmodified
-// App.Get, so a web reveal produces the exact same `get` audit row shape
-// as `mys get --reveal` on the CLI.
+// handleReveal reveals a secret's actual value. The session cookie
+// obtained at login IS the gate: once authenticated, revealing is a
+// single action with no per-reveal re-prompt. This deliberately does not
+// re-authenticate — it matches the CLI, where `mys get --reveal`
+// re-decrypts freely within the GPG agent's cache and is strictly more
+// powerful than this loopback UI, so a per-reveal biometric here would
+// add friction without adding real security (the owner's explicit call;
+// see docs/SECURITY.md). App.Get still re-checks policy and writes the
+// `get` audit row, so a denied path is refused (403) and every reveal
+// remains logged, exactly like `mys get --reveal`. JSON mode returns
+// {"password": "..."} for the entries table's inline copy button;
+// otherwise the detail page is re-rendered with the value shown.
 func handleReveal(w http.ResponseWriter, r *http.Request, a *app.App, path string) {
-	jsonMode := wantsJSON(r)
-	masked, err := a.Inspect(r.Context(), path)
-	if err != nil {
-		writeEntryError(w, err)
-		return
-	}
+	// App.Get performs an in-process gopass/GPG decrypt that, on a cold
+	// agent, blocks on a pinentry prompt (with a typed-passphrase
+	// fallback) — longer than the server's default 10s WriteTimeout.
+	// Without extending the deadline, App.Get would still run to
+	// completion and write its `get`/`ok` audit row (WriteTimeout
+	// doesn't cancel the request context), but the subsequent response
+	// write would be truncated — an audit row for a value the browser
+	// never received. The start page's inline copy-password button makes
+	// this reachable directly from `/` (which itself decrypts nothing),
+	// so the cushion is not merely theoretical. Same budget as login.
 	extendWriteDeadline(w, touchIDWriteBudget)
-	if err := requireTouchID(r.Context()); err != nil {
-		if jsonMode {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-		renderEntry(w, r, a, masked, false, "Touch ID erforderlich: "+err.Error())
-		return
-	}
 	e, err := a.Get(r.Context(), path)
 	if err != nil {
 		writeEntryError(w, err)
 		return
 	}
-	if jsonMode {
+	if wantsJSON(r) {
 		writeRevealJSON(w, e)
 		return
 	}
@@ -658,8 +681,8 @@ func handleReveal(w http.ResponseWriter, r *http.Request, a *app.App, path strin
 
 // wantsJSON reports whether the caller asked for a JSON reveal response
 // (the entries table's inline "copy password" button) instead of the
-// full HTML page. Same handler, same Inspect→TouchID→Get gate either
-// way — only the response format branches, at the very end.
+// full HTML page. Same App.Get gate either way — only the response
+// format branches.
 func wantsJSON(r *http.Request) bool {
 	return strings.Contains(r.Header.Get("Accept"), "application/json")
 }

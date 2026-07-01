@@ -217,15 +217,16 @@ written, since no access actually happened on a hit. "Zuletzt gelesen"/
 eben"/"vor N Minuten" within the last hour, "heute"/"gestern" for the
 last two calendar days, the absolute date only once it's older).
 
-Each row also has an inline "copy username" button (client-side only —
-Username isn't secret, already rendered in the row) and "copy password"
-button. The latter is not a shortcut around the reveal gate: it POSTs to
-the same `/entries/{path...}` endpoint as the detail page's Reveal
-button — same `App.Inspect`→Touch-ID→`App.Get` sequence, same audit row
-— just with `Accept: application/json` (`wantsJSON`/`writeRevealJSON`
-in `handleReveal`), returning `{"password": "..."}` instead of the full
-HTML page, so the button can copy it directly without a page
-navigation. A fresh Touch-ID prompt still fires on every click.
+Each row has inline "copy username" (client-side only — Username isn't
+secret) and "copy password" buttons; the start page's "zuletzt benutzt"
+list has the same copy-password button. Both are wired globally by
+`/static/app.js` via `data-copy-username`/`data-copy-password`
+attributes (event delegation, one listener for every page). The
+copy-password button POSTs to `/entries/{path...}` with
+`Accept: application/json` (`wantsJSON`/`writeRevealJSON`), getting
+`{"password": "..."}` back — same `App.Get` gate and audit row as the
+detail page's Reveal button, no page navigation. It does not
+re-authenticate: reveal is session-only (see below).
 
 The page decrypts entries to render metadata (gopass has no
 metadata-only decrypt) but does so through `App.BrowseDetailed`/`App.Inspect`,
@@ -238,14 +239,21 @@ gelesen" (`audit.Log.LastAccessByPath`/`LastAccess`, filtered to
 page — it reflects real reveals, never page views.
 
 `POST /entries/{path...}` is the one write-shaped-but-actually-read
-endpoint: reveal. It re-runs the policy check via `App.Inspect` first (so
-a denied path never even triggers the next step), then a *fresh*
-Touch-ID challenge — independent of the session cookie — then
-`App.Get`. This is the one place the UI renders an actual password
-value; every other view stays masked (`store.MaskedPassword`,
-`store.IsSecretLikeFieldKey` for custom `Fields` values). `authGate` sets
-`Cache-Control: no-store` on every gated response so a revealed value is
-never cached.
+endpoint: reveal. `handleReveal` just calls `App.Get` (which re-checks
+scope policy and writes the `get` audit row) and renders/returns the
+value. Reveal is **session-only**: the login session is the gate, there
+is no per-reveal re-authentication — a deliberate reversal of an earlier
+per-reveal-Touch-ID design, on the grounds that the CLI `mys get
+--reveal` is already unguarded per-call and strictly more powerful (see
+docs/SECURITY.md for the full rationale). Policy denial and audit logging
+are unchanged; only the per-action prompt is gone. This is the one place
+the UI renders an actual password value; every other view stays masked
+(`store.MaskedPassword`, `store.IsSecretLikeFieldKey` for custom
+`Fields`). `authGate` sets `Cache-Control: no-store` on every gated
+response so a revealed value is never cached. The overview/start page
+adds a search box (→ `/entries?q=`) and a "zuletzt benutzt" list built
+from `audit.LastAccessByPath` (get/ok rows) — path + relative time +
+copy button, no decrypt at render time.
 
 The entry detail page also renders a "Historie" section from
 `App.History` → `internal/history.Log`, which shells out to `git log

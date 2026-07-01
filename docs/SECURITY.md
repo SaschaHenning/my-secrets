@@ -161,62 +161,62 @@ keychain.
 
 - Binds on `127.0.0.1` only. A middleware rejects any `RemoteAddr` that
   is not loopback as a belt-and-suspenders measure.
-- Login requires a Touch-ID challenge (`internal/web/auth_darwin.go`, via
-  macOS Authorization Services). A successful login issues an HttpOnly,
-  `SameSite=Lax` session cookie valid for 30 minutes of activity; the
-  server shuts itself down after 30 minutes of no active session and a
-  process supervisor (if you set one up) would need to relaunch it.
+- **Login is the single authentication point.** A successful login
+  (Touch ID via `LocalAuthentication`/`LAContext`, falling back to the
+  macOS account password — see `internal/web/auth_darwin.go`) issues an
+  HttpOnly, `SameSite=Lax` session cookie valid for 30 minutes of
+  activity; the server shuts itself down after 30 minutes of no active
+  session. Everything behind that gate — browsing, revealing, copying —
+  is then frictionless.
+- **Reveal is session-only, by deliberate design.** Revealing/copying a
+  value (`POST /entries/{path}`) does **not** re-authenticate per
+  action. This is an owner's decision, not an oversight, and it reverses
+  an earlier per-reveal-Touch-ID design. The rationale: the CLI
+  `mys get --reveal` already re-decrypts freely within the GPG agent's
+  cache and is strictly more powerful than this loopback UI, so a
+  per-reveal biometric in the browser added friction without adding real
+  security under this tool's single-user, local threat model. What is
+  preserved: `App.Get` still re-checks scope policy on every reveal (a
+  denied path is refused `403` and logged), and every reveal still
+  writes a `get` audit row identical to `mys get --reveal`. So the audit
+  trail — "which value was revealed, when" — is unchanged; only the
+  per-action prompt is gone. If you want the stricter posture back, the
+  reveal handler is the single place to re-add an auth call.
 - Browsing entries and metadata (`/entries`, `/entries/{path}` on `GET`)
   never counts as reading a secret — it decrypts entries to render
   metadata but writes an aggregated `list_detail` audit action, not
   `get`. This keeps "last read per entry" (audit log, action=get)
-  meaningful: opening the browser must not look like reading every
-  secret in it.
-- **Revealing a value** (`POST /entries/{path}`) requires a **fresh**
-  Touch-ID challenge on every single click — the session cookie alone is
-  never enough to reveal a value, only to browse masked metadata. Policy
-  is checked *before* the Touch-ID prompt fires, so a caller who could
-  never read a path (denied by scope policy) never even sees the
-  biometric prompt for it. A successful reveal calls the same `App.Get`
-  path as `mys get --reveal`, producing an identical `get` audit row.
-  Every response behind the login gate carries `Cache-Control: no-store`
-  so a revealed value is never written to a disk or proxy cache; the
-  client-side auto-blank-after-30s and copy button are UX, not security
-  controls — the no-store header and the Touch-ID gate are the actual
+  meaningful, and is what the start page's "zuletzt benutzt" list is
+  built from.
+- Every response behind the login gate carries `Cache-Control: no-store`
+  so a revealed value is never written to a disk or proxy cache. The
+  client-side auto-blank-after-30s and copy buttons are UX, not security
   controls.
-  - The entries table's inline "copy password" button is the same
-    endpoint, same gate — it sends `Accept: application/json` and gets
-    `{"password": "..."}` back instead of the HTML page, so it can copy
-    the value without a page navigation. It does not skip, cache, or
-    weaken any part of the Inspect→Touch-ID→Get sequence; a fresh
-    Touch-ID prompt still fires on every click.
-  - Freshness assumption: each reveal spawns a new `security authorize`
-    process (a new `AuthorizationRef`), so "every click re-authenticates"
-    holds as long as macOS's `system.privilege.admin` right stays
-    `shared=false` (the default; check with
-    `security authorizationdb read system.privilege.admin`). If a local
-    MDM/admin profile ever sets that right to `shared=true`, the
-    authorization-DB credential cache could let a second reveal succeed
-    within its `timeout` window without a fresh biometric prompt. This
-    tool does not verify or pin that policy at runtime.
+  - The entries table's and start page's inline "copy password" buttons
+    hit the same `POST /entries/{path}` endpoint with
+    `Accept: application/json`, getting `{"password": "..."}` back
+    instead of the HTML page. Same policy check, same `get` audit row —
+    just no page navigation.
 - Custom `Fields` values are masked the same way `Password` is whenever
   the field's key looks credential-shaped (`password`, `secret`, `token`,
   `api_key`, `private_key`, `credential` — see
   `store.IsSecretLikeFieldKey`). This is a heuristic blocklist, not a
   guarantee: a field named something outside that list (e.g. a
-  home-grown `field.pin`) renders unmasked with no Touch-ID gate. Prefer
-  the well-known `Password`/TOTP fields for anything sensitive.
+  home-grown `field.pin`) renders unmasked. Prefer the well-known
+  `Password`/TOTP fields for anything sensitive.
 - No separate CSRF token on the reveal form: the session cookie is
   `SameSite=Lax`, which browsers do not attach to a **cross-site**
   `POST` — a forged form on a different domain cannot reach the auth
-  gate at all. Note the narrower case this does *not* cover: `SameSite`
-  treats different ports on `127.0.0.1`/`localhost` as the *same* site,
-  so another local process listening on a different loopback port could
-  get the cookie attached to a same-site POST. That still cannot reveal
-  or exfiltrate anything — Touch ID still gates the actual value, and
-  the browser's same-origin policy keeps the response unreadable to a
-  different origin — so the residual risk is limited to an unwanted
-  Touch-ID prompt, not a leak.
+  gate at all. Narrower case not covered: `SameSite` treats different
+  ports on `127.0.0.1`/`localhost` as the *same* site, so another local
+  process on a different loopback port could get the cookie attached to
+  a same-site POST. Under session-only reveal this means such a process,
+  *while a login session is active*, could trigger a reveal it can read
+  the response of only if it is same-origin (the browser's same-origin
+  policy still blocks a different origin from reading the body). Residual
+  risk is bounded by the single-user local threat model: anything
+  running as you on your unlocked machine can already run `mys get
+  --reveal` directly.
 - If you want to expose the UI through an SSH tunnel, the Touch-ID gate
   still applies remotely, but be aware a tunnel puts the loopback
   restriction on the *remote* end, not yours — only tunnel to machines
