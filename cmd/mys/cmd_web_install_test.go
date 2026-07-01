@@ -58,6 +58,8 @@ func TestWebInstallCmd_WritesPlistAndCallsLaunchctl(t *testing.T) {
 		"<string>web</string>",
 		"<string>--port</string>",
 		"<string>7823</string>",
+		"<key>EnvironmentVariables</key>",
+		"<key>PATH</key>",
 		"<key>RunAtLoad</key><true/>",
 		"<key>KeepAlive</key><true/>",
 	} {
@@ -81,6 +83,41 @@ func TestWebInstallCmd_WritesPlistAndCallsLaunchctl(t *testing.T) {
 
 	if !strings.Contains(out.String(), plistPath) {
 		t.Errorf("stdout should mention the plist path: %s", out.String())
+	}
+}
+
+// TestWebInstallCmd_CapturesInstallingShellPATH is a regression test:
+// launchd gives a LaunchAgent a bare minimal PATH
+// (/usr/bin:/bin:/usr/sbin:/sbin) with no inheritance from the
+// installing shell. Without baking $PATH into the plist, `mys web`
+// cannot find gpg/gopass/git (typically under /opt/homebrew) and fails
+// on every request that touches the store — this was caught by actually
+// installing and running the LaunchAgent, not by unit tests alone.
+func TestWebInstallCmd_CapturesInstallingShellPATH(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("PATH", "/opt/homebrew/bin:/custom/gpg/location:/usr/bin:/bin")
+	stubLaunchctl(t, nil)
+
+	var out bytes.Buffer
+	cmd := webInstallCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	plistPath := filepath.Join(fakeHome, "Library", "LaunchAgents", launchAgentLabel+".plist")
+	body, _ := os.ReadFile(plistPath)
+	if !strings.Contains(string(body), "/opt/homebrew/bin:/custom/gpg/location:/usr/bin:/bin") {
+		t.Errorf("plist did not capture the installing shell's PATH:\n%s", body)
+	}
+}
+
+func TestRenderLaunchAgentPlist_FallsBackWhenPATHEmpty(t *testing.T) {
+	plist := renderLaunchAgentPlist("/usr/local/bin/mys", 7823, "/tmp/web.log", "")
+	if !strings.Contains(plist, fallbackAgentPATH) {
+		t.Errorf("expected fallback PATH when none given:\n%s", plist)
 	}
 }
 
@@ -111,7 +148,7 @@ func TestWebInstallCmd_CustomPort(t *testing.T) {
 // tool's single-user threat model, but a path containing &, <, or >
 // must not produce malformed or structurally altered XML regardless.
 func TestRenderLaunchAgentPlist_EscapesXMLMetacharacters(t *testing.T) {
-	plist := renderLaunchAgentPlist(`/Users/a&b/<mys>/"x"`, 7823, `/tmp/log&<>"'.log`)
+	plist := renderLaunchAgentPlist(`/Users/a&b/<mys>/"x"`, 7823, `/tmp/log&<>"'.log`, "/usr/bin:/bin")
 	for _, raw := range []string{"a&b", "<mys>", `"x"`, `log&<>"'`} {
 		if strings.Contains(plist, raw) {
 			t.Errorf("plist contains unescaped XML metacharacters %q:\n%s", raw, plist)

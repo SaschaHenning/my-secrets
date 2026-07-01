@@ -61,6 +61,13 @@ func xmlEscape(s string) string {
 	return buf.String()
 }
 
+// fallbackAgentPATH is used when $PATH is empty at install time (should
+// not normally happen — os.Getenv("PATH") is empty only in a stripped
+// environment). Covers Homebrew on both Apple Silicon and Intel plus the
+// standard system dirs, matching where this project's own docs tell
+// users to install gopass/gnupg/git (README "Voraussetzungen").
+const fallbackAgentPATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 // renderLaunchAgentPlist builds the plist body. KeepAlive is
 // unconditional (not the {SuccessfulExit: false} form) — deliberately,
 // so launchd restarts the process even after the existing 30-minute
@@ -69,7 +76,19 @@ func xmlEscape(s string) string {
 // minutes of inactivity (internal/web/session.go), and every relaunch
 // starts with an empty in-memory session store — only the *process*
 // stops sleeping forever, not the login requirement.
-func renderLaunchAgentPlist(binPath string, port int, logPath string) string {
+//
+// EnvironmentVariables/PATH is required, not cosmetic: launchd gives a
+// LaunchAgent a bare minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) with
+// no inheritance from the installing shell, so without this `mys web`
+// cannot find `gpg`/`gopass`/`git` (typically under /opt/homebrew) and
+// fails on every single request that touches the store. path is the
+// installing shell's own $PATH, captured at `mys web install` time —
+// this correctly picks up whatever the user actually has configured
+// (Homebrew, MacGPG2, a custom gopass build, ...) rather than guessing.
+func renderLaunchAgentPlist(binPath string, port int, logPath, path string) string {
+	if path == "" {
+		path = fallbackAgentPATH
+	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -80,12 +99,15 @@ func renderLaunchAgentPlist(binPath string, port int, logPath string) string {
 		<string>--port</string>
 		<string>%d</string>
 	</array>
+	<key>EnvironmentVariables</key><dict>
+		<key>PATH</key><string>%s</string>
+	</dict>
 	<key>RunAtLoad</key><true/>
 	<key>KeepAlive</key><true/>
 	<key>StandardOutPath</key><string>%s</string>
 	<key>StandardErrorPath</key><string>%s</string>
 </dict></plist>
-`, launchAgentLabel, xmlEscape(binPath), port, xmlEscape(logPath), xmlEscape(logPath))
+`, launchAgentLabel, xmlEscape(binPath), port, xmlEscape(path), xmlEscape(logPath), xmlEscape(logPath))
 }
 
 // webInstallCmd builds `mys web install`.
@@ -123,7 +145,7 @@ PWA-Icon trifft danach immer auf einen laufenden Server statt auf
 			if err := os.MkdirAll(filepath.Dir(plistPath), 0o700); err != nil {
 				return fmt.Errorf("LaunchAgents-Verzeichnis anlegen: %w", err)
 			}
-			plist := renderLaunchAgentPlist(bin, port, logPath)
+			plist := renderLaunchAgentPlist(bin, port, logPath, os.Getenv("PATH"))
 			if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
 				return fmt.Errorf("plist schreiben: %w", err)
 			}
