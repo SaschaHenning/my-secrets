@@ -2,7 +2,9 @@ package audit
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -233,5 +235,93 @@ func TestTimestampRoundTrip(t *testing.T) {
 	}
 	if !e[0].TS.Equal(ts) {
 		t.Errorf("ts mismatch: got %v, want %v", e[0].TS, ts)
+	}
+}
+
+func TestHostAutoPopulated(t *testing.T) {
+	l := newTestLog(t)
+	ctx := context.Background()
+	wantHost, err := os.Hostname()
+	if err != nil {
+		t.Skipf("os.Hostname unavailable: %v", err)
+	}
+	_, _ = l.Write(ctx, Entry{Action: ActionGet, ActorKind: ActorHuman, Result: ResultOK})
+	rows, _ := l.Tail(ctx, Filter{Limit: 1})
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row")
+	}
+	if rows[0].Host != wantHost {
+		t.Errorf("host = %q, want %q", rows[0].Host, wantHost)
+	}
+}
+
+func TestHostExplicitNotOverwritten(t *testing.T) {
+	l := newTestLog(t)
+	ctx := context.Background()
+	_, _ = l.Write(ctx, Entry{Action: ActionGet, ActorKind: ActorHuman, Result: ResultOK, Host: "explicit-host"})
+	rows, _ := l.Tail(ctx, Filter{Limit: 1})
+	if len(rows) != 1 || rows[0].Host != "explicit-host" {
+		t.Fatalf("host not preserved: %+v", rows)
+	}
+}
+
+// TestMigrateOldSchemaAddsHostColumn simulates a pre-existing DB written
+// before the host column existed (schema without it, one row inserted the
+// old way) and verifies Open()/migrate() adds the column without error and
+// old rows read back with an empty host rather than failing the scan.
+func TestMigrateOldSchemaAddsHostColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.sqlite")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const oldSchema = `
+	CREATE TABLE audit_log (
+		seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts            TEXT    NOT NULL,
+		action        TEXT    NOT NULL,
+		secret_path   TEXT    NOT NULL DEFAULT '',
+		org           TEXT    NOT NULL DEFAULT '',
+		actor_kind    TEXT    NOT NULL,
+		actor_detail  TEXT    NOT NULL DEFAULT '',
+		result        TEXT    NOT NULL,
+		reason        TEXT    NOT NULL DEFAULT ''
+	);`
+	if _, err := raw.Exec(oldSchema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO audit_log (ts, action, actor_kind, result) VALUES (?, ?, ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339Nano), ActionGet, ActorHuman, ResultOK); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("open pre-host-column db: %v", err)
+	}
+	defer l.Close()
+
+	rows, err := l.Tail(context.Background(), Filter{Limit: 5})
+	if err != nil {
+		t.Fatalf("tail after migration: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want 1 pre-existing row, got %d", len(rows))
+	}
+	if rows[0].Host != "" {
+		t.Errorf("pre-existing row host = %q, want empty", rows[0].Host)
+	}
+
+	// New writes on the migrated DB populate host normally.
+	_, _ = l.Write(context.Background(), Entry{Action: ActionGet, ActorKind: ActorHuman, Result: ResultOK})
+	rows, _ = l.Tail(context.Background(), Filter{Limit: 5})
+	if len(rows) != 2 {
+		t.Fatalf("want 2 rows after new write, got %d", len(rows))
+	}
+	if rows[0].Host == "" {
+		t.Error("new row after migration should have a populated host")
 	}
 }

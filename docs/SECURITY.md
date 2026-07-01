@@ -103,6 +103,15 @@ three additional columns:
 | `row_hash`  | `SHA-256(canonical_bytes(entry) ‖ prev_hash)`.                         |
 | `signature` | Ed25519 signature over `row_hash`.                                     |
 
+`canonical_bytes(entry)` covers `seq, ts, action, secret_path, org,
+actor_kind, actor_detail, result, reason`. The `host` column (the
+hostname that wrote the row, forward-compat for a possible future
+cross-machine audit view) is deliberately **not** part of
+`canonical_bytes` — adding a field retroactively to the signed hash
+would invalidate every signature written before that field existed.
+Treat `host` as informational only, never as tamper-evident: anyone
+with raw write access to the DB in signed mode can set it to anything.
+
 The private signing key is generated on first use and stored in the
 macOS Keychain under service `com.jasp.my-secrets.audit-signing`,
 account `default`. The matching public key is written to

@@ -64,6 +64,14 @@ type Entry struct {
 	ActorDetail json.RawMessage `json:"actor_detail,omitempty"`
 	Result      string          `json:"result"`
 	Reason      string          `json:"reason,omitempty"`
+	// Host is the local hostname of the machine that wrote this row.
+	// Forward-compat only: a future cross-machine audit view needs it to
+	// tell entries apart by origin, but this package does no merging or
+	// syncing of logs across machines itself. Deliberately excluded from
+	// the signed hash chain (see canonicalBytes in signing.go) so that
+	// enabling this column does not invalidate signatures on rows written
+	// before it existed.
+	Host string `json:"host,omitempty"`
 }
 
 // Log wraps the underlying SQLite DB used for audit writes.
@@ -167,6 +175,14 @@ func (l *Log) Write(ctx context.Context, e Entry) (int64, error) {
 	if e.Result == "" {
 		e.Result = ResultOK
 	}
+	if e.Host == "" {
+		// Best-effort: a hostname lookup failure must never block an
+		// audit write, so a blank host is an accepted outcome, not
+		// escalated to an error.
+		if h, err := os.Hostname(); err == nil {
+			e.Host = h
+		}
+	}
 	var detail []byte
 	if len(e.ActorDetail) > 0 {
 		detail = []byte(e.ActorDetail)
@@ -174,10 +190,10 @@ func (l *Log) Write(ctx context.Context, e Entry) (int64, error) {
 
 	if !l.signMode {
 		res, err := l.db.ExecContext(ctx, `
-			INSERT INTO audit_log (ts, action, secret_path, org, actor_kind, actor_detail, result, reason)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO audit_log (ts, action, secret_path, org, actor_kind, actor_detail, result, reason, host)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, e.TS.UTC().Format(time.RFC3339Nano), e.Action, e.SecretPath, e.Org,
-			e.ActorKind, string(detail), e.Result, e.Reason)
+			e.ActorKind, string(detail), e.Result, e.Reason, e.Host)
 		if err != nil {
 			return 0, fmt.Errorf("audit write: %w", err)
 		}
@@ -214,10 +230,10 @@ func (l *Log) Write(ctx context.Context, e Entry) (int64, error) {
 
 	// 2. Insert without chain columns first to obtain the AUTOINCREMENT seq.
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO audit_log (ts, action, secret_path, org, actor_kind, actor_detail, result, reason)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO audit_log (ts, action, secret_path, org, actor_kind, actor_detail, result, reason, host)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, e.TS.UTC().Format(time.RFC3339Nano), e.Action, e.SecretPath, e.Org,
-		e.ActorKind, string(detail), e.Result, e.Reason)
+		e.ActorKind, string(detail), e.Result, e.Reason, e.Host)
 	if err != nil {
 		return 0, fmt.Errorf("audit write signed: %w", err)
 	}
@@ -272,7 +288,7 @@ func (l *Log) Tail(ctx context.Context, f Filter) ([]Entry, error) {
 	if f.Limit <= 0 {
 		f.Limit = 50
 	}
-	q := `SELECT seq, ts, action, secret_path, org, actor_kind, actor_detail, result, reason
+	q := `SELECT seq, ts, action, secret_path, org, actor_kind, actor_detail, result, reason, host
 	      FROM audit_log WHERE 1=1`
 	args := []any{}
 	if f.Actor != "" {
@@ -466,7 +482,7 @@ func scanEntries(rows *sql.Rows) ([]Entry, error) {
 		var e Entry
 		var tsStr, detail string
 		if err := rows.Scan(&e.Seq, &tsStr, &e.Action, &e.SecretPath, &e.Org,
-			&e.ActorKind, &detail, &e.Result, &e.Reason); err != nil {
+			&e.ActorKind, &detail, &e.Result, &e.Reason, &e.Host); err != nil {
 			return nil, err
 		}
 		if t, err := time.Parse(time.RFC3339Nano, tsStr); err == nil {
@@ -493,7 +509,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	reason        TEXT    NOT NULL DEFAULT '',
 	prev_hash     BLOB,
 	row_hash      BLOB,
-	signature     BLOB
+	signature     BLOB,
+	host          TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor_kind);
@@ -536,6 +553,9 @@ func (l *Log) migrate() error {
 		if err != nil && !isDuplicateColumnErr(err) {
 			return fmt.Errorf("audit migrate %s: %w", col, err)
 		}
+	}
+	if _, err := l.db.Exec(`ALTER TABLE audit_log ADD COLUMN host TEXT NOT NULL DEFAULT ''`); err != nil && !isDuplicateColumnErr(err) {
+		return fmt.Errorf("audit migrate host: %w", err)
 	}
 	return nil
 }
