@@ -233,6 +233,14 @@ func isSecretLikeKey(lowerKey string) bool {
 	return strings.Contains(name, "password") || strings.Contains(name, "secret")
 }
 
+// IsSecretLikeFieldKey is the exported form of isSecretLikeKey, for
+// consumers outside this package that need to apply the same
+// value-opaque rule — e.g. the web UI masking custom Fields values the
+// same way it always masks Password, rather than rendering them raw.
+func IsSecretLikeFieldKey(key string) bool {
+	return isSecretLikeKey(strings.ToLower(key))
+}
+
 // Get returns the decrypted entry at path.
 func (s *Store) Get(ctx context.Context, path string) (*Entry, error) {
 	sec, err := s.gp.Get(ctx, path, "latest")

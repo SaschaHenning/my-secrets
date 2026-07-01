@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -1165,5 +1166,264 @@ func TestApp_AutoSync_StoreErrorDoesNotSync(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Errorf("runner must not be invoked after failed write, got %d calls", len(rec.calls))
+	}
+}
+
+func TestOrgs_FiltersByPolicyAndDedupes(t *testing.T) {
+	a, _ := appWithFake(t, "claude-code", sampleEntries()...)
+	ctx := context.Background()
+	orgs, err := a.Orgs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// AI actor: private/** is denied, so "private" must not appear even
+	// though sampleEntries() contains a private/bank entry.
+	for _, o := range orgs {
+		if o == "private" {
+			t.Errorf("AI should not see org %q", o)
+		}
+	}
+	want := []string{"jasp", "zuhause"}
+	if !reflect.DeepEqual(orgs, want) {
+		t.Errorf("orgs = %v, want %v (sorted, deduped)", orgs, want)
+	}
+
+	// Human actor sees everything, including private.
+	a2, _ := appWithFake(t, "human", sampleEntries()...)
+	orgs2, err := a2.Orgs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, o := range orgs2 {
+		if o == "private" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("human actor should see org \"private\"")
+	}
+}
+
+func TestOrgs_StoreError(t *testing.T) {
+	a, f := appWithFake(t, "claude-code", sampleEntries()...)
+	f.ListErr = errors.New("nope")
+	if _, err := a.Orgs(context.Background()); err == nil {
+		t.Fatal("want error")
+	}
+}
+
+func TestBrowseDetailed_FiltersByPolicy(t *testing.T) {
+	a, _ := appWithFake(t, "claude-code", sampleEntries()...)
+	ctx := context.Background()
+	entries, err := a.BrowseDetailed(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Path == "private/bank" {
+			t.Errorf("AI should not see private/bank in BrowseDetailed")
+		}
+	}
+	// Metadata must actually be populated (this is the whole point of the
+	// method — List() alone would only give paths).
+	var sawUsername bool
+	for _, e := range entries {
+		if e.Path == "jasp/github" && e.Username == "alice" {
+			sawUsername = true
+		}
+	}
+	if !sawUsername {
+		t.Errorf("expected decrypted metadata for jasp/github, got %+v", entries)
+	}
+}
+
+func TestBrowseDetailed_OrgFilter(t *testing.T) {
+	a, _ := appWithFake(t, "human", sampleEntries()...)
+	ctx := context.Background()
+	entries, err := a.BrowseDetailed(ctx, "jasp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 jasp entries, got %d", len(entries))
+	}
+	for _, e := range entries {
+		if store.OrgOf(e.Path) != "jasp" {
+			t.Errorf("BrowseDetailed(jasp) returned %q", e.Path)
+		}
+	}
+}
+
+// TestBrowseDetailed_NoPerPathGetRows is the load-bearing test for the
+// whole feature: browsing entries must never look, in the audit log, like
+// reading every single one of them — otherwise "last read" becomes
+// meaningless the moment someone opens the web UI's entries list.
+func TestBrowseDetailed_NoPerPathGetRows(t *testing.T) {
+	a, _ := appWithFake(t, "human", sampleEntries()...)
+	ctx := context.Background()
+	if _, err := a.BrowseDetailed(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	getRows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionGet, Limit: 50})
+	if len(getRows) != 0 {
+		t.Fatalf("BrowseDetailed must not write ActionGet rows, got %d: %+v", len(getRows), getRows)
+	}
+	detailRows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionListDetail, Limit: 50})
+	if len(detailRows) != 1 {
+		t.Fatalf("want exactly 1 aggregated list_detail row, got %d", len(detailRows))
+	}
+}
+
+func TestBrowseDetailed_StoreError(t *testing.T) {
+	a, f := appWithFake(t, "human", sampleEntries()...)
+	f.ListErr = errors.New("nope")
+	if _, err := a.BrowseDetailed(context.Background(), ""); err == nil {
+		t.Fatal("want error")
+	}
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionListDetail, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultError {
+		t.Fatalf("want one error audit row, got %+v", rows)
+	}
+}
+
+// TestPathTraversal_PolicyAndStoreAgreeOnBytes is a regression test for a
+// critical finding from PR review: a caller could request a path like
+// "jasp/../private/bank" — a prefix-based policy rule ("allow jasp/**")
+// judges the raw string as allowed, while gopass's own path resolution
+// (filepath.Clean) collapses it to "private/bank" before touching disk.
+// That let a policy-denied path be read through an allowed org, and wrote
+// a falsified "ok" audit row attributing the access to the wrong path.
+// Every path-taking App method must reject non-canonical paths outright
+// before Policy.Evaluate ever sees them.
+func TestPathTraversal_PolicyAndStoreAgreeOnBytes(t *testing.T) {
+	entries := []*store.Entry{
+		{Path: "jasp/github", Username: "alice", Password: "p1"},
+		{Path: "private/bank", Username: "me", Password: "p4"},
+	}
+	traversal := "jasp/../private/bank"
+
+	t.Run("Get", func(t *testing.T) {
+		a, _ := appWithFake(t, "claude-code", entries...)
+		if _, err := a.Get(context.Background(), traversal); err == nil {
+			t.Fatal("want denied/invalid-path error, got nil")
+		}
+	})
+	t.Run("Inspect", func(t *testing.T) {
+		a, _ := appWithFake(t, "claude-code", entries...)
+		if _, err := a.Inspect(context.Background(), traversal); err == nil {
+			t.Fatal("want denied/invalid-path error, got nil")
+		}
+	})
+	t.Run("GenerateTOTP", func(t *testing.T) {
+		a, _ := appWithFake(t, "claude-code", entries...)
+		if _, _, err := a.GenerateTOTP(context.Background(), traversal, time.Now()); err == nil {
+			t.Fatal("want denied/invalid-path error, got nil")
+		}
+	})
+	t.Run("Rotate", func(t *testing.T) {
+		a, _ := appWithFake(t, "claude-code", entries...)
+		if err := a.Rotate(context.Background(), traversal, "new"); err == nil {
+			t.Fatal("want denied/invalid-path error, got nil")
+		}
+	})
+	t.Run("Remove", func(t *testing.T) {
+		a, _ := appWithFake(t, "claude-code", entries...)
+		if err := a.Remove(context.Background(), traversal); err == nil {
+			t.Fatal("want denied/invalid-path error, got nil")
+		}
+	})
+	t.Run("Add", func(t *testing.T) {
+		a, _ := appWithFake(t, "claude-code", entries...)
+		if err := a.Add(context.Background(), &store.Entry{Path: traversal, Password: "x"}); err == nil {
+			t.Fatal("want denied/invalid-path error, got nil")
+		}
+	})
+
+	// The audit row for the rejected attempt must record the raw,
+	// suspicious input — never the org/path the attacker was trying to
+	// reach — so the probe stays visible to an operator reviewing the log.
+	a, _ := appWithFake(t, "claude-code", entries...)
+	_, _ = a.Inspect(context.Background(), traversal)
+	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Limit: 5})
+	if len(rows) != 1 {
+		t.Fatalf("want 1 audit row, got %d", len(rows))
+	}
+	if rows[0].Result != audit.ResultDenied {
+		t.Errorf("result = %q, want denied", rows[0].Result)
+	}
+	if rows[0].SecretPath != traversal {
+		t.Errorf("audit secret_path = %q, want raw input %q (not silently rewritten)", rows[0].SecretPath, traversal)
+	}
+}
+
+func TestCleanSecretPath(t *testing.T) {
+	valid := []string{"jasp/github", "zuhause/router", "a/b/c"}
+	invalid := []string{"", "/jasp/github", "jasp/../private", "../private", "jasp/./x", "jasp//x", "."}
+	for _, p := range valid {
+		if err := cleanSecretPath(p); err != nil {
+			t.Errorf("cleanSecretPath(%q) = %v, want nil", p, err)
+		}
+	}
+	for _, p := range invalid {
+		if err := cleanSecretPath(p); err == nil {
+			t.Errorf("cleanSecretPath(%q) = nil, want error", p)
+		}
+	}
+}
+
+func TestInspect_OK(t *testing.T) {
+	a, _ := appWithFake(t, "human", sampleEntries()...)
+	ctx := context.Background()
+	e, err := a.Inspect(ctx, "jasp/github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Username != "alice" {
+		t.Errorf("username = %q, want alice", e.Username)
+	}
+}
+
+func TestInspect_Denied(t *testing.T) {
+	a, _ := appWithFake(t, "claude-code", sampleEntries()...)
+	ctx := context.Background()
+	if _, err := a.Inspect(ctx, "private/bank"); err == nil {
+		t.Fatal("want denied error")
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionListDetail, Limit: 5})
+	if len(rows) != 1 || rows[0].Result != audit.ResultDenied {
+		t.Fatalf("want one denied list_detail row, got %+v", rows)
+	}
+}
+
+func TestInspect_StoreError(t *testing.T) {
+	a, f := appWithFake(t, "human", sampleEntries()...)
+	f.GetErr = errors.New("nope")
+	if _, err := a.Inspect(context.Background(), "jasp/github"); err == nil {
+		t.Fatal("want error")
+	}
+}
+
+func TestInspect_DoesNotWriteGetRow(t *testing.T) {
+	a, _ := appWithFake(t, "human", sampleEntries()...)
+	ctx := context.Background()
+	if _, err := a.Inspect(ctx, "jasp/github"); err != nil {
+		t.Fatal(err)
+	}
+	getRows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionGet, Limit: 5})
+	if len(getRows) != 0 {
+		t.Fatalf("Inspect must not write ActionGet rows, got %d", len(getRows))
+	}
+}
+
+func TestBrowseDetailed_SkipsUndecryptableEntries(t *testing.T) {
+	a, f := appWithFake(t, "human", sampleEntries()...)
+	f.GetErr = errors.New("decrypt failure")
+	entries, err := a.BrowseDetailed(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected zero entries when every Get fails, got %d", len(entries))
 	}
 }

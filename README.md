@@ -356,7 +356,9 @@ mys web --port 7823
 # → http://127.0.0.1:7823
 ```
 
-Read-only. Zeigt nur Pfade, Metadaten, Audit-Log — **niemals**
+Read-only, hinter Touch-ID-Login. Neben Statistiken und Audit-Log gibt es
+unter `/entries` einen durchsuchbaren Secrets-Browser — gruppiert nach Org,
+mit Metadaten (Kind, Tags, Domain, Username) je Eintrag. **Niemals**
 Passwort-Werte. Bindet ausschließlich auf das Loopback-Interface.
 
 Screenshots siehe [`docs/screenshots/`](docs/screenshots).

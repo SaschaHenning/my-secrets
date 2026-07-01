@@ -174,10 +174,20 @@ without retry loops.
 
 ## Web UI
 
-Loopback-only (`127.0.0.1`), two pages (overview + audit filters).
-Templates embedded via `//go:embed`. The UI has no write endpoints and
-never fetches or displays the password value — it only talks to the
-audit DB and to a path-listing helper.
+Loopback-only (`127.0.0.1`), behind a Touch-ID login (`internal/web/auth_darwin.go`)
+with a cookie-based session (`internal/web/session.go`, 30 min idle
+timeout). Three page groups: overview + audit filters, and a secrets
+browser (`/entries`, `/entries/{path...}`) for browsing/searching
+policy-visible entries by org, with metadata (kind, tags, domain,
+username). Templates embedded via `//go:embed`.
+
+The browser decrypts entries to render metadata (gopass has no
+metadata-only decrypt) but does so through `App.BrowseDetailed`/`App.Inspect`,
+which write a single aggregated `list_detail` audit row per call instead of
+one `get` row per path — browsing the list must not look, in the audit
+log, like reading every secret in it. `App.Get` (an actual reveal) stays
+the only path that writes `get` rows. The UI still has no write endpoints
+and does not render password values.
 
 Auto-shutdown on parent context cancel. A `localhostOnly` middleware
 rejects non-loopback `RemoteAddr`.
