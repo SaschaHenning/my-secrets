@@ -73,6 +73,15 @@ mkdir -p bin
   -o bin/mys ./cmd/mys
 ok "bin/mys built ($(du -h bin/mys | cut -f1))"
 
+# macOS 15+/26 runs a codesigning monitor that SIGKILLs binaries whose
+# ad-hoc signature it won't accept. Re-sign explicitly so the binary runs;
+# cp preserves the embedded signature, so the installed copy inherits it.
+if command -v codesign >/dev/null 2>&1; then
+  codesign --sign - --force bin/mys && ok "bin/mys codesigned (ad-hoc)"
+else
+  warn "codesign not found — skipping ad-hoc signing (binary may be killed on macOS 15+)"
+fi
+
 # --- 4. Install to /usr/local/bin ----------------------------------------
 
 banner "Installing mys to /usr/local/bin"

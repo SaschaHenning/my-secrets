@@ -14,6 +14,14 @@ build: $(BIN)
 $(BIN): $(shell find . -name '*.go' -not -path './vendor/*')
 	@mkdir -p $(BIN_DIR)
 	$(GO) build $(LDFLAGS) -o $(BIN) ./cmd/mys
+	@# macOS 15+/26 runs a codesigning monitor that SIGKILLs binaries
+	@# whose ad-hoc signature it won't accept; an explicit re-sign fixes
+	@# it. cp preserves the embedded signature, so any later copy (e.g.
+	@# ~/.local/bin/mys) inherits it — no manual codesign step needed.
+	@# No-op on non-Darwin or where codesign is absent.
+	@if [ "$$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then \
+		codesign --sign - --force $(BIN) && echo "codesigned $(BIN) (ad-hoc)"; \
+	fi
 
 test:
 	$(GO) test -race -count=1 $(PKG)
