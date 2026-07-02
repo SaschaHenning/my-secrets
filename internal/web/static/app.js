@@ -70,7 +70,8 @@
 //   Shift+Enter  open the active row's detail page
 //   Alt+Enter    copy the active row's username instead of the password
 (function () {
-  if (!document.getElementById('search')) return; // entries page only
+  var searchEl = document.getElementById('search');
+  if (!searchEl) return; // entries page only
 
   var activeRow = null;
 
@@ -126,7 +127,25 @@
     if (link) window.location.assign(link.getAttribute('href'));
   }
 
+  // Clear the filter, re-show every row, drop the highlight, and put the
+  // cursor back in the search box for the next query.
+  function resetSearch() {
+    searchEl.value = '';
+    searchEl.dispatchEvent(new Event('input', { bubbles: true }));
+    setActive(null);
+    searchEl.focus();
+  }
+
   document.addEventListener('keydown', function (e) {
+    // Escape resets the search and clears the selection — handled before
+    // the focus guard below so it works even when a copy button is
+    // focused (Esc has no native action on those anyway).
+    if (e.key === 'Escape') {
+      if (searchEl.value === '' && !activeRow) return; // nothing to reset
+      e.preventDefault();
+      resetSearch();
+      return;
+    }
     // Don't hijack keys aimed at a focused link or button (e.g. after
     // Tab): let them activate natively, so Enter opens the focused row's
     // link / triggers its own button instead of the active row's. The
@@ -146,7 +165,28 @@
 
   // A changed filter can hide the active row — drop the highlight so the
   // next Enter targets the new top match.
-  document.getElementById('search').addEventListener('input', function () {
+  searchEl.addEventListener('input', function () {
     if (activeRow && visibleRows().indexOf(activeRow) === -1) setActive(null);
+  });
+})();
+
+// Escape on an entry detail page (/entries/<path>) backs out to the list.
+// If you got here by clicking a row, the previous history entry is the
+// (filtered) list, so history.back() restores it with your search intact.
+// Otherwise — a bookmark/deep link, or a login round-trip that leaves
+// /login as the previous history entry — go straight to /entries, so Esc
+// never strands you on the login form. Gated on the referrer being inside
+// the entries section rather than history.length, which a login redirect
+// inflates. The list page (/entries, no trailing path) is handled by the
+// keyboard IIFE above, so it's excluded here.
+(function () {
+  if (location.pathname.indexOf('/entries/') !== 0) return;
+  var cameFromEntries =
+    document.referrer.indexOf(window.location.origin + '/entries') === 0;
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    if (cameFromEntries && window.history.length > 1) window.history.back();
+    else window.location.assign('/entries');
   });
 })();
