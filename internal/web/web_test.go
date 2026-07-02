@@ -796,6 +796,38 @@ func TestHandleEntries_DataSearchAttributeDrivesClientFilter(t *testing.T) {
 	}
 }
 
+// TestHandleEntries_KeyboardNavContract guards the server-side markup the
+// keyboard navigation in app.js depends on: each result is an `.entry-row`
+// carrying a `data-copy-password` and a detail link, and the keyboard
+// hint renders. If the markup drifts, the JS silently stops working, so
+// this pins the contract even though the JS itself can't run in a Go test.
+func TestHandleEntries_KeyboardNavContract(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a, newEntriesCache())(w, r)
+	body := w.Body.String()
+
+	// A row the JS can navigate to and act on.
+	if !strings.Contains(body, `class="entry-row"`) {
+		t.Fatal("no .entry-row rows — keyboard nav has nothing to select")
+	}
+	if !strings.Contains(body, `data-copy-password="jasp/github"`) {
+		t.Error("row missing data-copy-password (Enter copy target)")
+	}
+	if !strings.Contains(body, `href="/entries/jasp/github"`) {
+		t.Error("row missing detail link (Shift+Enter open target)")
+	}
+	// The keyboard hint is shown when there are entries.
+	if !strings.Contains(body, "kbd-hint") || !strings.Contains(body, "Passwort kopieren") {
+		t.Error("keyboard hint not rendered on a non-empty entries page")
+	}
+	// app.js (which wires the keys) is pulled in via the shared head.
+	if !strings.Contains(body, `/static/app.js`) {
+		t.Error("app.js not included — keyboard nav would not load")
+	}
+}
+
 func TestHandleEntries_ShowsLastRead(t *testing.T) {
 	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
 	ts := time.Date(2026, 3, 4, 12, 0, 0, 0, time.UTC)

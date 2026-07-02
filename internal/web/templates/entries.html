@@ -18,6 +18,9 @@
 <section>
   <label for="search" class="sr-only">Search entries</label>
   <input type="search" id="search" value="{{.Query}}" placeholder="path, domain, username, tag…" aria-label="Search entries" autofocus autocomplete="off">
+  {{if .Groups}}
+  <p class="kbd-hint"><kbd>↓</kbd><kbd>↑</kbd> auswählen · <kbd>Enter</kbd> Passwort kopieren · <kbd>⇧ Enter</kbd> öffnen · <kbd>⌥ Enter</kbd> Nutzername</p>
+  {{end}}
 
   {{if not .Groups}}
     <p class="empty">no entries yet — run `mys add` to create your first one</p>
