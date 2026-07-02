@@ -367,6 +367,11 @@ Zeile. Das Suchfeld filtert **live im Browser**, ohne Seiten-Reload.
 Jede Zeile hat zwei Kopier-Buttons: Nutzername und Passwort, beide
 direkt aus der Liste. Werte bleiben sonst **immer maskiert**.
 
+**Ganz ohne Maus:** tippen filtert; `↓`/`↑` wählt einen Treffer,
+`Enter` kopiert dessen Passwort (oder den obersten Treffer, wenn keiner
+markiert ist), `⇧ Enter` öffnet die Detailseite, `⌥ Enter` kopiert den
+Nutzernamen. Typischer Ablauf: App öffnen → Touch ID → tippen → `Enter`.
+
 **Reveal ist session-gebunden:** einmal eingeloggt, deckt/kopiert man
 Werte ohne erneute Abfrage — bewusst so, weil die Konsole
 (`mys get --reveal`) ohnehin ungebremst und mächtiger ist, eine

@@ -137,6 +137,18 @@ table.audit code, .entries-table code { font-family: 'SF Mono', Menlo, monospace
 .entries-table a { color: var(--text); text-decoration: none; }
 .entries-table a:hover code { color: var(--accent); }
 .entry-actions { white-space: nowrap; }
+/* Keyboard-navigation highlight for the active row (↓/↑). */
+.entry-row.active > td { background: var(--surface2); }
+.entry-row.active > td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.kbd-hint { color: var(--muted); font-size: 0.75rem; margin: 0.25rem 0 1rem; }
+kbd {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+  font-size: 0.72rem;
+  font-family: 'SF Mono', Menlo, monospace;
+}
 
 .icon-btn {
   background: var(--surface2);
