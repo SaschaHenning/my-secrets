@@ -818,9 +818,13 @@ func TestHandleEntries_KeyboardNavContract(t *testing.T) {
 	if !strings.Contains(body, `href="/entries/jasp/github"`) {
 		t.Error("row missing detail link (Shift+Enter open target)")
 	}
-	// The keyboard hint is shown when there are entries.
+	// The keyboard hint is shown when there are entries, including the
+	// Esc-resets-search affordance.
 	if !strings.Contains(body, "kbd-hint") || !strings.Contains(body, "Passwort kopieren") {
 		t.Error("keyboard hint not rendered on a non-empty entries page")
+	}
+	if !strings.Contains(body, "Suche zurücksetzen") {
+		t.Error("keyboard hint missing the Esc-resets-search affordance")
 	}
 	// app.js (which wires the keys) is pulled in via the shared head.
 	if !strings.Contains(body, `/static/app.js`) {
@@ -870,6 +874,28 @@ func TestHandleEntryDetail_ShowsLastRead(t *testing.T) {
 
 	if !strings.Contains(w.Body.String(), "2026-03-04") {
 		t.Errorf("expected last-read date in detail page: %s", w.Body.String())
+	}
+}
+
+// TestHandleEntryDetail_BackAffordance pins the "escape back to the list"
+// contract: the detail page renders the back link and the Esc hint, and
+// pulls in app.js (whose /entries/<path> handler wires Esc → history.back).
+func TestHandleEntryDetail_BackAffordance(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries/jasp/github", nil)
+	r.SetPathValue("path", "jasp/github")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+	body := w.Body.String()
+
+	if !strings.Contains(body, `href="/entries"`) {
+		t.Error("detail page missing the back-to-list link")
+	}
+	if !strings.Contains(body, "kbd-hint") || !strings.Contains(body, "zurück") {
+		t.Error("detail page missing the Esc-back hint")
+	}
+	if !strings.Contains(body, `/static/app.js`) {
+		t.Error("app.js not included — Esc-back would not load")
 	}
 }
 
