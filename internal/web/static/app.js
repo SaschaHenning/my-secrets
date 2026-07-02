@@ -127,6 +127,12 @@
   }
 
   document.addEventListener('keydown', function (e) {
+    // Don't hijack keys aimed at a focused link or button (e.g. after
+    // Tab): let them activate natively, so Enter opens the focused row's
+    // link / triggers its own button instead of the active row's. The
+    // search input isn't an a/button, so the type→↓→Enter flow is
+    // unaffected (arrows keep focus in #search).
+    if (e.target.closest('a, button')) return;
     if (e.key === 'ArrowDown') { e.preventDefault(); move(1); return; }
     if (e.key === 'ArrowUp') { e.preventDefault(); move(-1); return; }
     if (e.key !== 'Enter') return;
