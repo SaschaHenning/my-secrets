@@ -170,17 +170,23 @@
   });
 })();
 
-// Escape on an entry detail page (/entries/<path>) backs out to where you
-// came from — the filtered list you clicked through, restored from the
-// browser's history — or /entries if there's nothing to go back to (e.g. a
-// bookmarked/deep-linked detail page). The list page (/entries, no trailing
-// path) is handled by the keyboard IIFE above, so it's excluded here.
+// Escape on an entry detail page (/entries/<path>) backs out to the list.
+// If you got here by clicking a row, the previous history entry is the
+// (filtered) list, so history.back() restores it with your search intact.
+// Otherwise — a bookmark/deep link, or a login round-trip that leaves
+// /login as the previous history entry — go straight to /entries, so Esc
+// never strands you on the login form. Gated on the referrer being inside
+// the entries section rather than history.length, which a login redirect
+// inflates. The list page (/entries, no trailing path) is handled by the
+// keyboard IIFE above, so it's excluded here.
 (function () {
   if (location.pathname.indexOf('/entries/') !== 0) return;
+  var cameFromEntries =
+    document.referrer.indexOf(window.location.origin + '/entries') === 0;
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
     e.preventDefault();
-    if (window.history.length > 1) window.history.back();
+    if (cameFromEntries && window.history.length > 1) window.history.back();
     else window.location.assign('/entries');
   });
 })();

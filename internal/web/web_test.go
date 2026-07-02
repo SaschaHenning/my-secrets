@@ -888,7 +888,10 @@ func TestHandleEntryDetail_BackAffordance(t *testing.T) {
 	handleEntryDetail(a)(w, r)
 	body := w.Body.String()
 
-	if !strings.Contains(body, `href="/entries"`) {
+	// Assert on the back-link's own text, not just href="/entries" — the
+	// nav bar always carries that href, so a bare href check would stay
+	// green even if the "← Alle Einträge" affordance were deleted.
+	if !strings.Contains(body, "Alle Einträge") {
 		t.Error("detail page missing the back-to-list link")
 	}
 	if !strings.Contains(body, "kbd-hint") || !strings.Contains(body, "zurück") {
