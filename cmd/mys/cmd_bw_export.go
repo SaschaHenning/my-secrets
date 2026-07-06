@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
+	"github.com/SaschaHenning/my-secrets/internal/bw"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
+	"github.com/SaschaHenning/my-secrets/internal/store"
 	"github.com/spf13/cobra"
 )
 
@@ -24,6 +27,9 @@ func bwExportCmd(requester *string) *cobra.Command {
 		Short: "Export entries as Bitwarden-compatible JSON (one-way, PLAINTEXT)",
 		Long: `Exports every secret in the selected org to a Bitwarden-compatible JSON file.
 The output is PLAINTEXT — do not leave it on disk.
+
+Items are grouped into "mys/<org>" folders so an import never mixes with the
+rest of the vault. TOTP entries are exported as otpauth URIs in login.totp.
 
 Requires --reveal AND --i-understand to run. AI callers cannot invoke this
 command; it is rejected for actor_kind=ai.`,
@@ -45,47 +51,7 @@ command; it is rejected for actor_kind=ai.`,
 				return err
 			}
 			defer a.Close(ctx)
-			paths, err := a.List(ctx, org)
-			if err != nil {
-				return err
-			}
-			items := make([]map[string]any, 0, len(paths))
-			for _, p := range paths {
-				e, err := a.Get(ctx, p)
-				if err != nil {
-					fmt.Fprintf(cmd.ErrOrStderr(), "skip %s: %v\n", p, err)
-					continue
-				}
-				items = append(items, map[string]any{
-					"name":  p,
-					"notes": e.Notes,
-					"login": map[string]any{
-						"username": e.Username,
-						"password": e.Password,
-						"uris": []map[string]any{
-							{"uri": e.URL},
-						},
-					},
-					"folderId": e.Org,
-				})
-			}
-			payload := map[string]any{
-				"encrypted": false,
-				"folders":   []map[string]any{},
-				"items":     items,
-			}
-			if out == "" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(payload)
-			}
-			// 0o600 — file must not be world- or group-readable.
-			f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			enc := json.NewEncoder(f)
-			enc.SetIndent("", "  ")
-			return enc.Encode(payload)
+			return runBwExport(ctx, a, cmd.OutOrStdout(), cmd.ErrOrStderr(), org, out)
 		},
 	}
 	c.Flags().StringVar(&org, "org", "", "filter by org")
@@ -93,4 +59,39 @@ command; it is rejected for actor_kind=ai.`,
 	c.Flags().BoolVar(&reveal, "reveal", false, "REQUIRED — acknowledge that output contains plaintext passwords")
 	c.Flags().BoolVar(&confirm, "i-understand", false, "REQUIRED — confirm you understand plaintext will be written")
 	return c
+}
+
+// runBwExport lists, decrypts and maps the entries, then encodes the
+// Bitwarden payload to stdout or a 0600 file. Split from RunE so tests
+// can drive it against a fake store.
+func runBwExport(ctx context.Context, a *app.App, stdout, stderr io.Writer, org, out string) error {
+	paths, err := a.List(ctx, org)
+	if err != nil {
+		return err
+	}
+	entries := make([]*store.Entry, 0, len(paths))
+	for _, p := range paths {
+		e, err := a.Get(ctx, p)
+		if err != nil {
+			fmt.Fprintf(stderr, "skip %s: %v\n", p, err)
+			continue
+		}
+		entries = append(entries, e)
+	}
+	payload, err := bw.BuildExport(entries)
+	if err != nil {
+		return err
+	}
+	if out == "" {
+		return json.NewEncoder(stdout).Encode(payload)
+	}
+	// 0o600 — file must not be world- or group-readable.
+	f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(payload)
 }
