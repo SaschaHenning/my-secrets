@@ -1,7 +1,8 @@
 // Package bw maps my-secrets store entries to Bitwarden's unencrypted
 // JSON export format — the shape `bw import bitwardenjson` and the web
-// vault's „Bitwarden (json)" importer accept. The same types feed the
-// bw-push / bw-import mirror commands, so the mapping lives in one place.
+// vault's „Bitwarden (json)" importer accept. The upcoming bw-push /
+// bw-import mirror commands (#87/#88) will share these types, so the
+// mapping lives in one place.
 package bw
 
 import (
@@ -51,11 +52,13 @@ type Export struct {
 	Items     []Item   `json:"items"`
 }
 
+// Folder is one Bitwarden folder; items reference it via FolderID.
 type Folder struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 }
 
+// Item is one vault item. Only login items (TypeLogin) are produced.
 type Item struct {
 	ID       string  `json:"id,omitempty"`
 	Type     int     `json:"type"`
@@ -67,6 +70,7 @@ type Item struct {
 	Login    *Login  `json:"login,omitempty"`
 }
 
+// Login carries the credential payload of a login item.
 type Login struct {
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
@@ -74,10 +78,12 @@ type Login struct {
 	URIs     []URI  `json:"uris,omitempty"`
 }
 
+// URI is one login URI association.
 type URI struct {
 	URI string `json:"uri"`
 }
 
+// Field is one custom field on an item (Type: FieldText or FieldHidden).
 type Field struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`

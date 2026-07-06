@@ -88,6 +88,13 @@ func runBwExport(ctx context.Context, a *app.App, stdout, stderr io.Writer, org,
 			fmt.Fprintf(stderr, "skip %s: %v\n", p, err)
 			continue
 		}
+		// Same skip-and-warn contract as a failed Get: one unmappable
+		// entry (e.g. a legacy TOTP algorithm) must not block the rest
+		// of the export.
+		if _, err := bw.ItemFromEntry(e); err != nil {
+			fmt.Fprintf(stderr, "skip %s: %v\n", p, err)
+			continue
+		}
 		entries = append(entries, e)
 	}
 	payload, err := bw.BuildExport(entries)

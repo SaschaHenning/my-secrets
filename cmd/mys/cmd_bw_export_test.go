@@ -138,6 +138,32 @@ func TestRunBwExport_EmitsImportablePayload(t *testing.T) {
 	}
 }
 
+func TestRunBwExport_SkipsUnmappableEntries(t *testing.T) {
+	a := fakeApp(t,
+		&store.Entry{Path: "jasp/good", Org: "jasp", Password: "x"},
+		&store.Entry{
+			// Unsupported TOTP algorithm — must be skipped with a
+			// warning, not abort the whole export.
+			Path: "jasp/legacy-2fa", Org: "jasp", Kind: store.KindTOTP,
+			Password: "JBSWY3DPEHPK3PXP", TOTPAlgorithm: "MD5",
+		},
+	)
+	var stdout, stderr bytes.Buffer
+	if err := runBwExport(context.Background(), a, &stdout, &stderr, "", ""); err != nil {
+		t.Fatalf("runBwExport: %v", err)
+	}
+	var payload bw.Export
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+	if len(payload.Items) != 1 || payload.Items[0].Name != "good" {
+		t.Fatalf("items = %+v, want only jasp/good", payload.Items)
+	}
+	if !strings.Contains(stderr.String(), "skip jasp/legacy-2fa") {
+		t.Errorf("stderr = %q, want skip warning for legacy-2fa", stderr.String())
+	}
+}
+
 func TestRunBwExport_OrgFilter(t *testing.T) {
 	a := fakeApp(t,
 		&store.Entry{Path: "jasp/a", Org: "jasp", Password: "x"},
