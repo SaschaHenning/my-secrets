@@ -21,8 +21,12 @@ import (
 // the password (or TOTP) slot, which keeps the import path simple.
 const TypeLogin = 1
 
-// FieldText is the Bitwarden custom-field type for plain-text fields.
-const FieldText = 0
+// Bitwarden custom-field types: plain text and hidden (masked in the
+// UI, like a password field).
+const (
+	FieldText   = 0
+	FieldHidden = 1
+)
 
 // FieldPath is the custom-field name carrying the full store path on
 // every exported item. It is the stable match key the push/import
@@ -94,16 +98,13 @@ func FolderID(name string) string {
 	return uuid.NewSHA1(folderNamespace, []byte(name)).String()
 }
 
-// orgOf returns the entry's org, deriving it from the path's first
-// segment when the Org field was not populated by the reader.
+// orgOf returns the entry's org, deriving it from the path when the
+// Org field was not populated by the reader.
 func orgOf(e *store.Entry) string {
 	if e.Org != "" {
 		return e.Org
 	}
-	if i := strings.IndexByte(e.Path, '/'); i > 0 {
-		return e.Path[:i]
-	}
-	return ""
+	return store.OrgOf(e.Path)
 }
 
 // ItemName returns the item's display name: the path with the org
@@ -162,6 +163,21 @@ func metadataFields(e *store.Entry) []Field {
 	if e.GitHubProject != "" {
 		fs = append(fs, Field{Name: "github_project", Value: e.GitHubProject, Type: FieldText})
 	}
+	// Structured extras (mys add --field …) travel as "field.<key>" so a
+	// full export/mirror loses nothing. Secret-like keys are exported as
+	// hidden fields, mirroring the store's own search redaction rule.
+	keys := make([]string, 0, len(e.Fields))
+	for k := range e.Fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		typ := FieldText
+		if strings.Contains(k, "password") || strings.Contains(k, "secret") {
+			typ = FieldHidden
+		}
+		fs = append(fs, Field{Name: "field." + k, Value: e.Fields[k], Type: typ})
+	}
 	return fs
 }
 
@@ -169,6 +185,9 @@ func metadataFields(e *store.Entry) []Field {
 // digits/period fall back to the authenticator defaults (6 / 30s), the
 // same tolerance App.GenerateTOTP applies.
 func totpURI(e *store.Entry) (string, error) {
+	if strings.TrimSpace(e.Password) == "" {
+		return "", fmt.Errorf("empty totp seed")
+	}
 	alg, err := totp.ParseAlgorithm(e.TOTPAlgorithm)
 	if err != nil {
 		return "", err

@@ -8,11 +8,16 @@ import (
 	"os"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
+	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/bw"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	"github.com/spf13/cobra"
 )
+
+// openAuditOnly is swapped out in tests so refused-attempt audit rows
+// do not land in the developer's real audit DB.
+var openAuditOnly = app.OpenAuditOnly
 
 // bwExportCmd builds the `mys bw-export` subcommand.
 func bwExportCmd(requester *string) *cobra.Command {
@@ -41,9 +46,16 @@ command; it is rejected for actor_kind=ai.`,
 			if !reveal || !confirm {
 				return fmt.Errorf("bw-export requires both --reveal and --i-understand; refusing")
 			}
-			// Deny AI-flagged callers outright.
+			// Deny AI-flagged callers outright — and leave a forensic
+			// trace: a refused bulk-export attempt is exactly the kind
+			// of event the audit log exists for.
 			detected := caller.Identify(*requester)
 			if detected.Kind == caller.KindAI {
+				if aa, aerr := openAuditOnly(); aerr == nil {
+					aa.Override = *requester
+					aa.AuditExport(ctx, org, audit.ResultDenied, "bw-export refused for AI caller")
+					_ = aa.Close(ctx)
+				}
 				return fmt.Errorf("bw-export is refused for AI callers")
 			}
 			a, err := app.Open(ctx, *requester)
@@ -82,6 +94,18 @@ func runBwExport(ctx context.Context, a *app.App, stdout, stderr io.Writer, org,
 	if err != nil {
 		return err
 	}
+	dest := out
+	if dest == "" {
+		dest = "stdout"
+	}
+	if err := writeExport(payload, stdout, out); err != nil {
+		return err
+	}
+	a.AuditExport(ctx, org, audit.ResultOK, fmt.Sprintf("dest=%s count=%d", dest, len(entries)))
+	return nil
+}
+
+func writeExport(payload bw.Export, stdout io.Writer, out string) error {
 	if out == "" {
 		return json.NewEncoder(stdout).Encode(payload)
 	}
@@ -91,6 +115,11 @@ func runBwExport(ctx context.Context, a *app.App, stdout, stderr io.Writer, org,
 		return err
 	}
 	defer f.Close()
+	// OpenFile only applies the mode to newly created files; force it
+	// so re-exporting over an existing 0644 file cannot stay readable.
+	if err := f.Chmod(0o600); err != nil {
+		return err
+	}
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	return enc.Encode(payload)

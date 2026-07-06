@@ -56,6 +56,16 @@
           "name": "github_project",
           "value": "JASP-eu/congplan",
           "type": 0
+        },
+        {
+          "name": "field.api_secret",
+          "value": "extra-s3cr3t",
+          "type": 1
+        },
+        {
+          "name": "field.region",
+          "value": "eu-central-1",
+          "type": 0
         }
       ],
       "login": {

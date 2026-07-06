@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/SaschaHenning/my-secrets/internal/app"
+	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/bw"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 )
@@ -28,7 +31,22 @@ func TestBwExportCmd_RequiresBothConfirmFlags(t *testing.T) {
 	}
 }
 
-func TestBwExportCmd_RefusesAICallers(t *testing.T) {
+func TestBwExportCmd_RefusesAICallersAndAuditsIt(t *testing.T) {
+	// Route the refusal audit row into an isolated log instead of the
+	// developer's real DB. The command closes the App it opens, so the
+	// stub hands out a dedicated handle and the assertion re-opens the
+	// same file afterwards.
+	dbPath := filepath.Join(t.TempDir(), "audit.sqlite")
+	prev := openAuditOnly
+	openAuditOnly = func() (*app.App, error) {
+		l, err := audit.Open(dbPath)
+		if err != nil {
+			return nil, err
+		}
+		return &app.App{Audit: l, Override: "ai"}, nil
+	}
+	t.Cleanup(func() { openAuditOnly = prev })
+
 	req := "ai"
 	c := bwExportCmd(&req)
 	c.SetArgs([]string{"--reveal", "--i-understand"})
@@ -36,6 +54,36 @@ func TestBwExportCmd_RefusesAICallers(t *testing.T) {
 	c.SetErr(&bytes.Buffer{})
 	if err := c.Execute(); err == nil || !strings.Contains(err.Error(), "refused for AI callers") {
 		t.Errorf("err = %v, want AI refusal", err)
+	}
+	l, err := audit.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen audit: %v", err)
+	}
+	defer l.Close()
+	rows, err := l.Tail(context.Background(), audit.Filter{Action: audit.ActionExport})
+	if err != nil {
+		t.Fatalf("tail: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Result != audit.ResultDenied {
+		t.Fatalf("rows = %+v, want exactly one denied export row", rows)
+	}
+}
+
+func TestRunBwExport_WritesSummaryAuditRow(t *testing.T) {
+	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "x"})
+	var stdout, stderr bytes.Buffer
+	if err := runBwExport(context.Background(), a, &stdout, &stderr, "jasp", ""); err != nil {
+		t.Fatalf("runBwExport: %v", err)
+	}
+	rows, err := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionExport})
+	if err != nil {
+		t.Fatalf("tail: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Result != audit.ResultOK {
+		t.Fatalf("rows = %+v, want exactly one ok export row", rows)
+	}
+	if !strings.Contains(rows[0].Reason, "count=1") || !strings.Contains(rows[0].Reason, "dest=stdout") {
+		t.Errorf("reason = %q, want dest + count", rows[0].Reason)
 	}
 }
 

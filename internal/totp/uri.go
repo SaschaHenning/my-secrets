@@ -35,11 +35,8 @@ func BuildURI(e Entry) string {
 		period = 30
 	}
 	q.Set("period", strconv.FormatUint(uint64(period), 10))
-	u := url.URL{
-		Scheme:   "otpauth",
-		Host:     "totp",
-		Path:     "/" + label,
-		RawQuery: q.Encode(),
-	}
-	return u.String()
+	// Escape the label as a single path segment: labels derived from
+	// store paths can contain "/", which strict Key-URI parsers would
+	// otherwise read as extra path components.
+	return "otpauth://totp/" + url.PathEscape(label) + "?" + q.Encode()
 }

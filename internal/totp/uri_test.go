@@ -56,6 +56,20 @@ func TestBuildURI_DefaultsAreExplicit(t *testing.T) {
 	}
 }
 
+func TestBuildURI_EscapesSlashInLabel(t *testing.T) {
+	uri := BuildURI(Entry{Seed: "JBSWY3DPEHPK3PXP", Label: "stage/2fa"})
+	if !strings.HasPrefix(uri, "otpauth://totp/stage%2F2fa?") {
+		t.Errorf("uri %q: slash in label must be escaped as a single path segment", uri)
+	}
+	got, err := ParseURI(uri)
+	if err != nil {
+		t.Fatalf("ParseURI: %v", err)
+	}
+	if got.Label != "stage/2fa" {
+		t.Errorf("label round trip = %q, want %q", got.Label, "stage/2fa")
+	}
+}
+
 func TestBuildURI_IssuerPrefixesLabel(t *testing.T) {
 	uri := BuildURI(Entry{Seed: "JBSWY3DPEHPK3PXP", Issuer: "My Corp", Label: "me@corp.eu"})
 	if !strings.HasPrefix(uri, "otpauth://totp/My%20Corp:me@corp.eu?") {

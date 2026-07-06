@@ -27,6 +27,10 @@ func testEntries() []*store.Entry {
 			Notes:         "rotates with each deploy",
 			Password:      "s3cr3t-token",
 			RotateAfter:   "90d",
+			Fields: map[string]string{
+				"region":     "eu-central-1",
+				"api_secret": "extra-s3cr3t",
+			},
 		},
 		{
 			// Org intentionally empty — must be derived from the path.
@@ -143,6 +147,34 @@ func TestItemFromEntry_BadTOTPAlgorithmFails(t *testing.T) {
 	}
 	if _, err := ItemFromEntry(e); err == nil {
 		t.Fatal("want error for unsupported TOTP algorithm")
+	}
+}
+
+func TestMetadataFields_ExportsEntryFields(t *testing.T) {
+	e := &store.Entry{
+		Path: "jasp/x", Org: "jasp", Password: "p",
+		Fields: map[string]string{"api_secret": "v1", "region": "eu"},
+	}
+	it, err := ItemFromEntry(e)
+	if err != nil {
+		t.Fatalf("ItemFromEntry: %v", err)
+	}
+	got := map[string]int{}
+	for _, f := range it.Fields {
+		got[f.Name] = f.Type
+	}
+	if typ, ok := got["field.api_secret"]; !ok || typ != FieldHidden {
+		t.Errorf("field.api_secret = (%d, %v), want hidden custom field", typ, ok)
+	}
+	if typ, ok := got["field.region"]; !ok || typ != FieldText {
+		t.Errorf("field.region = (%d, %v), want text custom field", typ, ok)
+	}
+}
+
+func TestItemFromEntry_EmptyTOTPSeedFails(t *testing.T) {
+	e := &store.Entry{Path: "zuhause/empty", Org: "zuhause", Kind: store.KindTOTP}
+	if _, err := ItemFromEntry(e); err == nil {
+		t.Fatal("want error for empty totp seed")
 	}
 }
 

@@ -6,7 +6,9 @@ HKDF-stretched key, AES-256-CBC + HMAC "2.iv|ct|mac" enc-strings, RSA
 keypair) against the legacy /identity/accounts/register endpoint that
 Vaultwarden still serves. Only intended for throwaway test instances.
 
-Usage: bw_e2e_register.py <server-url> <email> <password> [ca-cert.pem]
+Usage: BW_E2E_PASSWORD=<pw> bw_e2e_register.py <server-url> <email> [ca-cert.pem]
+
+The password comes from the environment, never argv (ps-visible).
 """
 import base64
 import os
@@ -46,10 +48,11 @@ def enc_string(data: bytes, enc_key: bytes, mac_key: bytes) -> str:
 
 
 def main() -> None:
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 3 or not os.environ.get("BW_E2E_PASSWORD"):
         sys.exit(__doc__)
-    url, email, password = sys.argv[1], sys.argv[2], sys.argv[3]
-    verify = sys.argv[4] if len(sys.argv) > 4 else True
+    url, email = sys.argv[1], sys.argv[2]
+    password = os.environ["BW_E2E_PASSWORD"]
+    verify = sys.argv[3] if len(sys.argv) > 3 else True
 
     master = pbkdf2(password.encode(), email.lower().encode(), KDF_ITERATIONS)
     payload_hash = b64(pbkdf2(master, password.encode(), 1))

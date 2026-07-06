@@ -12,10 +12,13 @@
 # openssl, curl. Network: pulls vaultwarden/server:latest once.
 
 set -euo pipefail
+# Everything below writes throwaway-but-plaintext material (TLS key,
+# bw CLI state, decrypted item dumps) — keep it owner-only.
+umask 077
 
 PORT="${BW_E2E_PORT:-8443}"
 EMAIL="test@mys.local"
-PASSWORD="MysE2e-Passw0rd!"
+PASSWORD="${BW_E2E_PASSWORD:-MysE2e-Passw0rd!}"
 CONTAINER="mys-bw-e2e"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GOLDEN="$REPO_ROOT/internal/bw/testdata/export_golden.json"
@@ -42,11 +45,12 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout "$WORK/certs/key.pem" -out "$WORK/certs/cert.pem" -days 2 \
   -subj "/CN=localhost" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
-chmod 644 "$WORK/certs/key.pem" "$WORK/certs/cert.pem"
+chmod 600 "$WORK/certs/key.pem"
+chmod 644 "$WORK/certs/cert.pem"
 
 echo "=== vaultwarden container ==="
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-docker run -d --name "$CONTAINER" --rm -p "$PORT:80" \
+docker run -d --name "$CONTAINER" --rm -p "127.0.0.1:$PORT:80" \
   -v "$WORK/certs:/certs:ro" \
   -e 'ROCKET_TLS={certs="/certs/cert.pem",key="/certs/key.pem"}' \
   -e SIGNUPS_ALLOWED=true \
@@ -62,18 +66,20 @@ done
 echo "=== register test account ==="
 python3 -m venv "$WORK/venv"
 "$WORK/venv/bin/pip" -q install cryptography requests
-"$WORK/venv/bin/python" "$REPO_ROOT/scripts/bw_e2e_register.py" \
-  "https://localhost:$PORT" "$EMAIL" "$PASSWORD" "$WORK/certs/cert.pem"
+BW_E2E_PASSWORD="$PASSWORD" "$WORK/venv/bin/python" "$REPO_ROOT/scripts/bw_e2e_register.py" \
+  "https://localhost:$PORT" "$EMAIL" "$WORK/certs/cert.pem"
 
 echo "=== bw login + import ==="
 bw config server "https://localhost:$PORT" >/dev/null
-SESSION="$(bw login "$EMAIL" "$PASSWORD" --raw)"
-bw import bitwardenjson "$GOLDEN" --session "$SESSION"
-bw sync --session "$SESSION" >/dev/null
+# Session + master password travel via env, never argv (ps-visible).
+BW_SESSION="$(BW_PASSWORD="$PASSWORD" bw login "$EMAIL" --passwordenv BW_PASSWORD --raw)"
+export BW_SESSION
+bw import bitwardenjson "$GOLDEN"
+bw sync >/dev/null
 
 echo "=== assertions ==="
-bw list items --session "$SESSION" >"$WORK/items.json"
-bw list folders --session "$SESSION" >"$WORK/folders.json"
+bw list items >"$WORK/items.json"
+bw list folders >"$WORK/folders.json"
 python3 - "$WORK/items.json" "$WORK/folders.json" <<'PY'
 import json, sys
 
@@ -95,12 +101,12 @@ assert len(totp) == 1, f"want exactly 1 totp item, got {len(totp)}"
 print("payload assertions OK")
 PY
 
-ID="$(bw list items --search github-2fa --session "$SESSION" \
+ID="$(bw list items --search github-2fa \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')"
-CODE="$(bw get totp "$ID" --session "$SESSION")"
+CODE="$(bw get totp "$ID")"
 case "$CODE" in
-  [0-9][0-9][0-9][0-9][0-9][0-9]) echo "totp code OK ($CODE)" ;;
-  *) echo "totp code invalid: $CODE" >&2; exit 1 ;;
+  [0-9][0-9][0-9][0-9][0-9][0-9]) echo "totp code OK" ;;
+  *) echo "totp code invalid" >&2; exit 1 ;;
 esac
 
 echo
