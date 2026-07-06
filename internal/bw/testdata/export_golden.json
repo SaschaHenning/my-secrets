@@ -1,0 +1,134 @@
+{
+  "encrypted": false,
+  "folders": [
+    {
+      "id": "1327ea4a-9803-5103-b43f-67dc3be8e1de",
+      "name": "mys"
+    },
+    {
+      "id": "68c3398f-92e4-5671-b342-82d0ab78e023",
+      "name": "mys/jasp"
+    },
+    {
+      "id": "084c3fd3-7d30-5fd7-af67-166333c62a4f",
+      "name": "mys/zuhause"
+    }
+  ],
+  "items": [
+    {
+      "type": 1,
+      "name": "stage/jwt-access-secret",
+      "notes": "rotates with each deploy",
+      "folderId": "68c3398f-92e4-5671-b342-82d0ab78e023",
+      "favorite": false,
+      "fields": [
+        {
+          "name": "mys-path",
+          "value": "jasp/stage/jwt-access-secret",
+          "type": 0
+        },
+        {
+          "name": "org",
+          "value": "jasp",
+          "type": 0
+        },
+        {
+          "name": "kind",
+          "value": "token",
+          "type": 0
+        },
+        {
+          "name": "rotate_after",
+          "value": "90d",
+          "type": 0
+        },
+        {
+          "name": "tags",
+          "value": "stage,jwt",
+          "type": 0
+        },
+        {
+          "name": "domain",
+          "value": "stage.jasp.eu",
+          "type": 0
+        },
+        {
+          "name": "github_project",
+          "value": "JASP-eu/congplan",
+          "type": 0
+        },
+        {
+          "name": "field.api_secret",
+          "value": "extra-s3cr3t",
+          "type": 1
+        },
+        {
+          "name": "field.region",
+          "value": "eu-central-1",
+          "type": 0
+        }
+      ],
+      "login": {
+        "username": "svc-stage",
+        "password": "s3cr3t-token",
+        "uris": [
+          {
+            "uri": "https://stage.jasp.eu"
+          }
+        ]
+      }
+    },
+    {
+      "type": 1,
+      "name": "github-2fa",
+      "folderId": "084c3fd3-7d30-5fd7-af67-166333c62a4f",
+      "favorite": false,
+      "fields": [
+        {
+          "name": "mys-path",
+          "value": "zuhause/github-2fa",
+          "type": 0
+        },
+        {
+          "name": "org",
+          "value": "zuhause",
+          "type": 0
+        },
+        {
+          "name": "kind",
+          "value": "totp",
+          "type": 0
+        }
+      ],
+      "login": {
+        "totp": "otpauth://totp/GitHub:sascha?algorithm=SHA1\u0026digits=6\u0026issuer=GitHub\u0026period=30\u0026secret=JBSWY3DPEHPK3PXP"
+      }
+    },
+    {
+      "type": 1,
+      "name": "toplevel-note",
+      "folderId": "1327ea4a-9803-5103-b43f-67dc3be8e1de",
+      "favorite": false,
+      "fields": [
+        {
+          "name": "mys-path",
+          "value": "toplevel-note",
+          "type": 0
+        },
+        {
+          "name": "org",
+          "value": "",
+          "type": 0
+        },
+        {
+          "name": "kind",
+          "value": "password",
+          "type": 0
+        }
+      ],
+      "login": {
+        "password": "hunter2"
+      }
+    }
+  ]
+}

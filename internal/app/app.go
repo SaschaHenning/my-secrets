@@ -655,6 +655,16 @@ func (a *App) AuditInit(ctx context.Context, note string) {
 	a.writeAudit(ctx, audit.ActionInit, "", d, audit.ResultOK, note)
 }
 
+// AuditExport records a bulk plaintext export attempt (bw-export) — one
+// summary row per invocation, so an export of N entries is
+// distinguishable in the audit log from N unrelated gets. The org filter
+// is carried in the path column (org=<org> encoding); reason carries
+// destination and entry count on success, or the refusal cause.
+func (a *App) AuditExport(ctx context.Context, org, result, reason string) {
+	d := caller.Identify(a.Override)
+	a.writeAudit(ctx, audit.ActionExport, orgPath(org), d, result, reason)
+}
+
 // AuditWebOpen records that the web UI was started.
 func (a *App) AuditWebOpen(ctx context.Context, addr string) {
 	d := caller.Identify(a.Override)
