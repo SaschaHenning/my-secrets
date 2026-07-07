@@ -97,6 +97,13 @@ func init() {
 	templates = template.Must(template.New("").Funcs(funcs).ParseFS(assets, "templates/*.html"))
 }
 
+// Version is the running binary's version string, injected by cmd/mys
+// before Serve (ldflags-set main.Version). Package-level like
+// app.NoSyncFlag so the Serve signature stays stable. Shown in the
+// login and start page footers so a PWA user can verify an update
+// landed without a shell.
+var Version = "dev"
+
 // Serve starts the HTTP server on 127.0.0.1:port and blocks until the
 // context is cancelled, the process receives an idle-timeout signal, or
 // the server itself fails. The audit-open app passed in must have its
@@ -358,12 +365,12 @@ func renderLogin(w http.ResponseWriter, errMsg, next string) {
   </div>
 </section>
 </main>
-<footer>local read-only UI · bound to 127.0.0.1 · no secret values are rendered here</footer>
+<footer>local read-only UI · bound to 127.0.0.1 · no secret values are rendered here · mys %s</footer>
 <script>
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/static/sw.js');
 </script>
 </body>
-</html>`, nextField, errBlock)
+</html>`, nextField, errBlock, template.HTMLEscapeString(Version))
 }
 
 // --- handlers --------------------------------------------------------------
@@ -408,6 +415,7 @@ func handleIndex(a *app.App) http.HandlerFunc {
 			"Recents":     recents,
 			"Page":        "index",
 			"SyncRemotes": syncRemotes,
+			"Version":     Version,
 		}
 		if err := templates.ExecuteTemplate(w, "index.html", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

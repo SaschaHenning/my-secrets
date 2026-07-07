@@ -1372,6 +1372,29 @@ func TestHandleIndex(t *testing.T) {
 	}
 }
 
+// TestVersionShownInFooters pins the update-verification surface: the
+// login page (pre-auth, reachable without Touch ID) and the start page
+// both render the injected binary version in their footers, so a PWA
+// user can confirm an update landed without a shell.
+func TestVersionShownInFooters(t *testing.T) {
+	prev := Version
+	Version = "v9.9.9-test"
+	t.Cleanup(func() { Version = prev })
+
+	lw := httptest.NewRecorder()
+	handleLogin(newSessionStore(time.Minute), time.Minute)(lw, httptest.NewRequest("GET", "/login", nil))
+	if !strings.Contains(lw.Body.String(), "mys v9.9.9-test") {
+		t.Errorf("login footer missing version: %s", lw.Body.String())
+	}
+
+	a := newAuditApp(t)
+	iw := httptest.NewRecorder()
+	handleIndex(a)(iw, httptest.NewRequest("GET", "/", nil))
+	if !strings.Contains(iw.Body.String(), "mys v9.9.9-test") {
+		t.Errorf("start page footer missing version")
+	}
+}
+
 // TestHandleIndex_SearchAndRecentlyUsed covers the redesigned start page:
 // a search form pointing at /entries, and a "zuletzt benutzt" list built
 // from the audit log's get/ok rows (never from denied gets), each with a
