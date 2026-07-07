@@ -157,7 +157,7 @@ func ChangedFields(stored, incoming *store.Entry) []string {
 	if incoming.Kind == store.KindTOTP || stored.Kind == store.KindTOTP {
 		if stored.Password != incoming.Password ||
 			stored.TOTPIssuer != incoming.TOTPIssuer ||
-			stored.TOTPLabel != incoming.TOTPLabel ||
+			normLabel(stored) != normLabel(incoming) ||
 			normAlg(stored.TOTPAlgorithm) != normAlg(incoming.TOTPAlgorithm) ||
 			normDigits(stored.TOTPDigits) != normDigits(incoming.TOTPDigits) ||
 			normPeriod(stored.TOTPPeriod) != normPeriod(incoming.TOTPPeriod) {
@@ -180,6 +180,16 @@ func ChangedFields(stored, incoming *store.Entry) []string {
 	}
 	sort.Strings(changed)
 	return changed
+}
+
+// normLabel resolves the TOTP label the mirror would render: ItemFromEntry
+// defaults an empty label to the item name, so an unset store label and
+// its round-tripped explicit form must compare equal.
+func normLabel(e *store.Entry) string {
+	if e.TOTPLabel == "" {
+		return ItemName(e)
+	}
+	return e.TOTPLabel
 }
 
 // TOTP parameter zero values mean "default" (SHA1 / 6 digits / 30s) —

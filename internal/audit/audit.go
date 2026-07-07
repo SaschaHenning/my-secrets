@@ -52,6 +52,11 @@ const (
 	// per mirror run (server + change counts), on top of the per-secret
 	// get rows the app layer writes anyway.
 	ActionBWPush = "bw_push"
+	// ActionBWImport is the per-run summary row of `mys bw-import` — one
+	// row per diff or apply run (server + diff class counts, plus the
+	// applied/skipped/failed outcome on --apply), on top of the
+	// per-secret get/add rows the app layer writes anyway.
+	ActionBWImport = "bw_import"
 )
 
 // Results recorded against each action.
