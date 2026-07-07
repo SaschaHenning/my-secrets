@@ -19,6 +19,7 @@ func webCmd() *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
+			web.Version = Version
 			// The web UI now browses/decrypts entries (see internal/web's
 			// /entries routes), so it needs store access, not just the
 			// audit DB. Override is forced to "human": mys web is always
