@@ -103,6 +103,7 @@ func rootCmd() *cobra.Command {
 		webCmd(),
 		mcpCmd(),
 		bwExportCmd(&requester),
+		bwPushCmd(&requester),
 		syncCmd(&requester),
 		recipientCmd(&requester),
 		installSkillCmd(),

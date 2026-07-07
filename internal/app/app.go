@@ -665,6 +665,14 @@ func (a *App) AuditExport(ctx context.Context, org, result, reason string) {
 	a.writeAudit(ctx, audit.ActionExport, orgPath(org), d, result, reason)
 }
 
+// AuditBWPush records one bw-push mirror run — same one-row-per-run
+// shape as AuditExport, with the target server and change counts in the
+// reason. Refusals and failures land here too (result denied/error).
+func (a *App) AuditBWPush(ctx context.Context, org, result, reason string) {
+	d := caller.Identify(a.Override)
+	a.writeAudit(ctx, audit.ActionBWPush, orgPath(org), d, result, reason)
+}
+
 // AuditWebOpen records that the web UI was started.
 func (a *App) AuditWebOpen(ctx context.Context, addr string) {
 	d := caller.Identify(a.Override)
