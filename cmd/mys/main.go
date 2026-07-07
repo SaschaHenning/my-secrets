@@ -104,6 +104,7 @@ func rootCmd() *cobra.Command {
 		mcpCmd(),
 		bwExportCmd(&requester),
 		bwPushCmd(&requester),
+		bwImportCmd(&requester),
 		syncCmd(&requester),
 		recipientCmd(&requester),
 		installSkillCmd(),

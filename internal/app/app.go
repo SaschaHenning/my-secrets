@@ -673,6 +673,14 @@ func (a *App) AuditBWPush(ctx context.Context, org, result, reason string) {
 	a.writeAudit(ctx, audit.ActionBWPush, orgPath(org), d, result, reason)
 }
 
+// AuditBWImport records one bw-import run — same one-row-per-run shape
+// as AuditBWPush, with the diff class counts (and, on --apply, the
+// applied/skipped/failed outcome) in the reason.
+func (a *App) AuditBWImport(ctx context.Context, org, result, reason string) {
+	d := caller.Identify(a.Override)
+	a.writeAudit(ctx, audit.ActionBWImport, orgPath(org), d, result, reason)
+}
+
 // AuditWebOpen records that the web UI was started.
 func (a *App) AuditWebOpen(ctx context.Context, addr string) {
 	d := caller.Identify(a.Override)
