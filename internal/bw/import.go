@@ -3,6 +3,7 @@ package bw
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/SaschaHenning/my-secrets/internal/store"
 )
@@ -46,6 +47,15 @@ func BuildImportDiff(storeEntries map[string]*store.Entry, remote RemoteState, o
 	for _, it := range remote.Items {
 		folder := remote.FolderNames[it.FolderID]
 		path := PathForItem(it, folder)
+		// A phone-created item in the bare mys root folder derives its
+		// FULL path from its name — a "/" in the name would smuggle the
+		// item into an org the folder placement never named. Items in
+		// mys/<org> folders keep their org from the folder, so nested
+		// names are fine there.
+		if PathOf(it) == "" && folder == FolderPrefix && strings.Contains(it.Name, "/") {
+			warnings = append(warnings, fmt.Sprintf("skip %q in the mys root folder: item name must not contain '/'", it.Name))
+			continue
+		}
 		if org != "" && store.OrgOf(path) != org {
 			continue
 		}

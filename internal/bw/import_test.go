@@ -82,6 +82,27 @@ func TestBuildImportDiff_DuplicateMysPathWarnsAndSkips(t *testing.T) {
 	}
 }
 
+func TestBuildImportDiff_BareRootItemWithSlashNameWarns(t *testing.T) {
+	// In the bare "mys" root folder the item NAME becomes the full store
+	// path — a "/" in it would pick an org the folder never named.
+	rootFolder := Folder{ID: "f0", Name: FolderPrefix}
+	remote := RemoteState{
+		Folders:     []Folder{rootFolder},
+		FolderNames: map[string]string{"f0": FolderPrefix},
+		Items: []Item{{
+			Type: TypeLogin, Name: "jasp/smuggled", FolderID: "f0",
+			Login: &Login{Password: "p"},
+		}},
+	}
+	diffs, _, warnings := BuildImportDiff(map[string]*store.Entry{}, remote, "")
+	if len(diffs) != 0 {
+		t.Errorf("slash-named root item must not produce diff rows: %+v", diffs)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "must not contain '/'") {
+		t.Errorf("warnings = %v, want slash-name warning", warnings)
+	}
+}
+
 func TestBuildImportDiff_NonLoginItemWarns(t *testing.T) {
 	remote := remoteWith(t, "jasp", Item{Type: 2, Name: "secure-note"})
 	diffs, _, warnings := BuildImportDiff(map[string]*store.Entry{}, remote, "")

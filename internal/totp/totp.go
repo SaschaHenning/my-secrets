@@ -125,7 +125,9 @@ func ParseURI(uri string) (Entry, error) {
 	//   otpauth://totp/<issuer>:<label>?secret=...&issuer=...&algorithm=...&digits=...&period=...
 	u, err := url.Parse(uri)
 	if err != nil {
-		return Entry{}, fmt.Errorf("parse uri: %w", err)
+		// url.Parse embeds the full offending string in its error — for
+		// an otpauth uri that is the secret seed. Never wrap it.
+		return Entry{}, errors.New("parse uri: invalid otpauth uri")
 	}
 	if u.Scheme != "otpauth" {
 		return Entry{}, fmt.Errorf("unsupported scheme %q", u.Scheme)
