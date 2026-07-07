@@ -38,10 +38,12 @@ type RemoteState struct {
 }
 
 // FetchRemoteState lists the vault folders, keeps only the mys
-// namespace (restricted further to mys/<org> — plus the shared "mys"
-// root for org == "" — when org is set), and fetches items folder by
-// folder. Items outside the namespace are never read.
-func FetchRemoteState(ctx context.Context, c *Client, org string) (RemoteState, error) {
+// namespace, and fetches items folder by folder. Items outside the
+// namespace are never read. The whole namespace is always fetched —
+// even for an --org-filtered push — so mys-path matching sees an item
+// that was hand-moved into another mys/* folder instead of creating a
+// duplicate next to it.
+func FetchRemoteState(ctx context.Context, c *Client) (RemoteState, error) {
 	all, err := c.ListFolders(ctx)
 	if err != nil {
 		return RemoteState{}, err
@@ -49,9 +51,6 @@ func FetchRemoteState(ctx context.Context, c *Client, org string) (RemoteState, 
 	rs := RemoteState{FolderNames: map[string]string{}}
 	for _, f := range all {
 		if !InNamespace(f.Name) {
-			continue
-		}
-		if org != "" && f.Name != FolderName(org) {
 			continue
 		}
 		rs.Folders = append(rs.Folders, f)
@@ -108,8 +107,10 @@ func (p PushPlan) HasWrites() bool {
 // namespace. storePaths must contain every path that exists in the
 // store (unfiltered by --org) — it is the safety net that keeps prune
 // from trashing mirror items whose entry still exists but fell outside
-// the current filter.
-func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote RemoteState, prune bool) PushPlan {
+// the current filter. A non-empty org additionally restricts prunes to
+// items whose mys-path belongs to that org: a filtered push must not
+// touch other orgs' stale items.
+func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote RemoteState, prune bool, org string) PushPlan {
 	var plan PushPlan
 	byPath := map[string][]Item{}
 	for _, it := range remote.Items {
@@ -170,6 +171,9 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 			if p == "" || storePaths[p] {
 				continue
 			}
+			if org != "" && store.OrgOf(p) != org {
+				continue
+			}
 			plan.Prunes = append(plan.Prunes, PlannedPrune{ID: it.ID, Path: p})
 		}
 		sort.Slice(plan.Prunes, func(i, j int) bool { return plan.Prunes[i].Path < plan.Prunes[j].Path })
@@ -180,6 +184,11 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 // contentEqual compares the mirror-managed content of two items: name,
 // notes, login payload, and custom fields. Folder placement is compared
 // separately by the caller (ids differ per vault, names are canonical).
+// Fields and URIs are compared in order: the mirror writes them
+// deterministically and Bitwarden stores both as plain JSON arrays, so
+// order survives the round trip (pinned by the idempotent-re-push E2E
+// against a real server). Worst case on a server that reorders would be
+// a redundant update — never data loss.
 func contentEqual(a, b Item) bool {
 	if a.Name != b.Name || a.Notes != b.Notes {
 		return false

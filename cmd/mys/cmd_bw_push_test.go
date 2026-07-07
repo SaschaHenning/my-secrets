@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/bw"
+	"github.com/SaschaHenning/my-secrets/internal/policy"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 )
 
@@ -19,12 +21,17 @@ type stubBWRunner struct {
 	Calls     [][]string
 	Envs      [][]string
 	Responses map[string][]byte
+	Errs      map[string]error
 }
 
 func (s *stubBWRunner) Run(_ context.Context, _ []byte, env []string, args ...string) ([]byte, error) {
 	s.Calls = append(s.Calls, args)
 	s.Envs = append(s.Envs, env)
-	return s.Responses[strings.Join(args, " ")], nil
+	key := strings.Join(args, " ")
+	if err := s.Errs[key]; err != nil {
+		return nil, err
+	}
+	return s.Responses[key], nil
 }
 
 func (s *stubBWRunner) called(prefix string) bool {
@@ -270,5 +277,119 @@ func TestRunBwPush_UnlockReadsMasterPasswordViaAuditedGet(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Result != audit.ResultOK {
 		t.Fatalf("rows = %+v, want one ok get row for the master password", rows)
+	}
+}
+
+func TestRunBwPush_NeverMirrorsMasterPasswordAndPruneHealsIt(t *testing.T) {
+	// The vault's unlock secret exists as a store entry AND was (by
+	// mistake) mirrored earlier. Push must not (re)create it, and
+	// --prune must trash the stale copy even though the entry exists.
+	mp := &store.Entry{Path: bw.DefaultMasterPasswordPath, Org: "private", Password: "master-pw"}
+	a := fakeApp(t, mp)
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":                   unlockedStatus,
+		"list folders":             []byte(`[{"id":"f1","name":"mys/private"}]`),
+		"list items --folderid f1": mirrorItemJSON(t, "f1", mp),
+		"delete item a":            nil,
+	}}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{Session: "tok", Prune: true, Yes: true})
+	if err != nil {
+		t.Fatalf("runBwPush: %v", err)
+	}
+	if r.called("create") || r.called("edit") {
+		t.Error("master password must never be mirrored")
+	}
+	if !r.called("delete item a") {
+		t.Error("stale master-password mirror item must be pruned")
+	}
+}
+
+func TestRunBwPush_PolicyInvisiblePathsAreNotPruned(t *testing.T) {
+	// The caller's scope policy hides zuhause/** — its mirror items must
+	// survive a --prune run instead of being judged "gone".
+	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "x"})
+	a.Policy = &policy.Policy{Actors: map[string]policy.Rules{
+		"human": {Allow: []string{"jasp/**"}},
+		"ai":    {Allow: []string{"jasp/**"}},
+	}}
+	hidden := mirrorItemJSON(t, "f2", &store.Entry{Path: "zuhause/router", Org: "zuhause", Password: "y"})
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":                   unlockedStatus,
+		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"},{"id":"f2","name":"mys/zuhause"}]`),
+		"list items --folderid f1": mirrorItemJSON(t, "f1", &store.Entry{Path: "jasp/a", Org: "jasp", Password: "x"}),
+		"list items --folderid f2": hidden,
+	}}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{Session: "tok", Prune: true, Yes: true})
+	if err != nil {
+		t.Fatalf("runBwPush: %v", err)
+	}
+	if r.called("delete") {
+		t.Error("policy-invisible path must not be pruned")
+	}
+	if !strings.Contains(stderr.String(), "policy-invisible") {
+		t.Errorf("stderr = %q, want policy-invisible warning", stderr.String())
+	}
+}
+
+func TestBwPushCmd_RejectsNestedOrg(t *testing.T) {
+	req := "human"
+	c := bwPushCmd(&req)
+	c.SetArgs([]string{"--org", "jasp/stage"})
+	c.SetOut(&bytes.Buffer{})
+	c.SetErr(&bytes.Buffer{})
+	if err := c.Execute(); err == nil || !strings.Contains(err.Error(), "top-level org") {
+		t.Errorf("err = %v, want nested-org refusal", err)
+	}
+}
+
+func TestRunBwPush_EarlyFailureWritesSanitizedAuditRow(t *testing.T) {
+	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "x"})
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status": []byte(`{"serverUrl":"https://v.example","status":"unauthenticated"}`),
+	}}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{})
+	if err == nil {
+		t.Fatal("want session setup error")
+	}
+	rows := bwPushRows(t, a)
+	if len(rows) != 1 || rows[0].Result != audit.ResultError || rows[0].Reason != "session setup failed" {
+		t.Fatalf("rows = %+v, want one sanitized session-setup error row", rows)
+	}
+}
+
+func TestRunBwPush_ExecuteFailureAuditRowCarriesNoSubprocessOutput(t *testing.T) {
+	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "x"})
+	r := &stubBWRunner{
+		Responses: map[string][]byte{
+			"status":        unlockedStatus,
+			"list folders":  []byte(`[]`),
+			"create folder": []byte(`{"id":"srv-f","name":"mys/jasp"}`),
+		},
+		Errs: map[string]error{
+			// Simulates bw stderr leaking payload content into the error.
+			"create item": errors.New("bw create item: exit 1: TAINTED-STDERR-CONTENT"),
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{Session: "tok", Yes: true})
+	if err == nil || !strings.Contains(err.Error(), "TAINTED-STDERR-CONTENT") {
+		t.Fatalf("err = %v, full error must still reach the caller", err)
+	}
+	rows := bwPushRows(t, a)
+	if len(rows) != 1 || rows[0].Result != audit.ResultError {
+		t.Fatalf("rows = %+v, want one error row", rows)
+	}
+	if strings.Contains(rows[0].Reason, "TAINTED") {
+		t.Fatalf("audit reason %q must not embed subprocess output", rows[0].Reason)
+	}
+	if !strings.Contains(rows[0].Reason, "folders=1") {
+		t.Errorf("audit reason %q should carry partial progress counts", rows[0].Reason)
 	}
 }

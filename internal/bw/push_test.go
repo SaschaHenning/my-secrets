@@ -32,7 +32,7 @@ func TestBuildPushPlan_EmptyVaultCreatesEverything(t *testing.T) {
 		{Path: "jasp/a", Org: "jasp", Password: "x"},
 		{Path: "zuhause/b", Org: "zuhause", Password: "y"},
 	}
-	plan := BuildPushPlan(entries, pathsOf(entries...), RemoteState{FolderNames: map[string]string{}}, false)
+	plan := BuildPushPlan(entries, pathsOf(entries...), RemoteState{FolderNames: map[string]string{}}, false, "")
 	if len(plan.Creates) != 2 || len(plan.Updates) != 0 || len(plan.Prunes) != 0 || plan.Unchanged != 0 {
 		t.Fatalf("plan = %+v, want 2 creates only", plan)
 	}
@@ -51,7 +51,7 @@ func TestBuildPushPlan_IdempotentSecondRun(t *testing.T) {
 		FolderNames: map[string]string{"f1": "mys/jasp"},
 		Items:       []Item{mirrorItem(t, e, "i1", "f1")},
 	}
-	plan := BuildPushPlan([]*store.Entry{e}, pathsOf(e), remote, true)
+	plan := BuildPushPlan([]*store.Entry{e}, pathsOf(e), remote, true, "")
 	if plan.HasWrites() {
 		t.Fatalf("plan = %+v, want no writes on identical state", plan)
 	}
@@ -68,7 +68,7 @@ func TestBuildPushPlan_ChangedContentUpdates(t *testing.T) {
 		Items:       []Item{mirrorItem(t, old, "i1", "f1")},
 	}
 	rotated := &store.Entry{Path: "jasp/a", Org: "jasp", Password: "new"}
-	plan := BuildPushPlan([]*store.Entry{rotated}, pathsOf(rotated), remote, false)
+	plan := BuildPushPlan([]*store.Entry{rotated}, pathsOf(rotated), remote, false, "")
 	if len(plan.Updates) != 1 || plan.Updates[0].ID != "i1" || plan.Updates[0].Path != "jasp/a" {
 		t.Fatalf("plan = %+v, want exactly one update of i1", plan)
 	}
@@ -86,7 +86,7 @@ func TestBuildPushPlan_FolderMoveUpdates(t *testing.T) {
 		FolderNames: map[string]string{"f1": "mys/jasp", "f2": "mys/zuhause"},
 		Items:       []Item{mirrorItem(t, e, "i1", "f2")},
 	}
-	plan := BuildPushPlan([]*store.Entry{e}, pathsOf(e), remote, false)
+	plan := BuildPushPlan([]*store.Entry{e}, pathsOf(e), remote, false, "")
 	if len(plan.Updates) != 1 {
 		t.Fatalf("plan = %+v, want folder move as update", plan)
 	}
@@ -104,7 +104,7 @@ func TestBuildPushPlan_PruneOnlyTrulyGonePaths(t *testing.T) {
 		Items:       []Item{mirrorItem(t, kept, "i-keep", "f1"), goneItem, elsewhereItem},
 	}
 	storePaths := map[string]bool{"jasp/keep": true, "zuhause/other": true}
-	plan := BuildPushPlan([]*store.Entry{kept}, storePaths, remote, true)
+	plan := BuildPushPlan([]*store.Entry{kept}, storePaths, remote, true, "")
 	if len(plan.Prunes) != 1 || plan.Prunes[0].ID != "i-gone" || plan.Prunes[0].Path != "jasp/gone" {
 		t.Fatalf("Prunes = %+v, want exactly jasp/gone", plan.Prunes)
 	}
@@ -117,7 +117,7 @@ func TestBuildPushPlan_NoPruneWithoutFlag(t *testing.T) {
 		FolderNames: map[string]string{"f1": "mys/jasp"},
 		Items:       []Item{gone},
 	}
-	plan := BuildPushPlan(nil, map[string]bool{}, remote, false)
+	plan := BuildPushPlan(nil, map[string]bool{}, remote, false, "")
 	if len(plan.Prunes) != 0 {
 		t.Fatalf("Prunes = %+v, want none without --prune", plan.Prunes)
 	}
@@ -133,7 +133,7 @@ func TestBuildPushPlan_ForeignItemsUntouched(t *testing.T) {
 		FolderNames: map[string]string{"f1": "mys/jasp"},
 		Items:       []Item{foreign},
 	}
-	plan := BuildPushPlan(nil, map[string]bool{}, remote, true)
+	plan := BuildPushPlan(nil, map[string]bool{}, remote, true, "")
 	if len(plan.Prunes) != 0 {
 		t.Fatalf("Prunes = %+v, foreign item must not be pruned", plan.Prunes)
 	}
@@ -149,7 +149,7 @@ func TestBuildPushPlan_DuplicateMatchKeySkipsWithWarning(t *testing.T) {
 		FolderNames: map[string]string{"f1": "mys/jasp"},
 		Items:       []Item{mirrorItem(t, e, "i1", "f1"), mirrorItem(t, e, "i2", "f1")},
 	}
-	plan := BuildPushPlan([]*store.Entry{e}, pathsOf(e), remote, false)
+	plan := BuildPushPlan([]*store.Entry{e}, pathsOf(e), remote, false, "")
 	if plan.HasWrites() {
 		t.Fatalf("plan = %+v, want no writes on ambiguous match", plan)
 	}
@@ -161,7 +161,7 @@ func TestBuildPushPlan_DuplicateMatchKeySkipsWithWarning(t *testing.T) {
 func TestBuildPushPlan_UnmappableEntryWarnsAndSkips(t *testing.T) {
 	bad := &store.Entry{Path: "jasp/legacy", Org: "jasp", Kind: store.KindTOTP,
 		Password: "JBSWY3DPEHPK3PXP", TOTPAlgorithm: "MD5"}
-	plan := BuildPushPlan([]*store.Entry{bad}, pathsOf(bad), RemoteState{FolderNames: map[string]string{}}, false)
+	plan := BuildPushPlan([]*store.Entry{bad}, pathsOf(bad), RemoteState{FolderNames: map[string]string{}}, false, "")
 	if plan.HasWrites() {
 		t.Fatalf("plan = %+v, want no writes for unmappable entry", plan)
 	}
@@ -179,7 +179,7 @@ func TestBuildPushPlan_NonLoginMatchSkipsWithWarning(t *testing.T) {
 		FolderNames: map[string]string{"f1": "mys/jasp"},
 		Items:       []Item{note},
 	}
-	plan := BuildPushPlan([]*store.Entry{e}, pathsOf(e), remote, false)
+	plan := BuildPushPlan([]*store.Entry{e}, pathsOf(e), remote, false, "")
 	if plan.HasWrites() || len(plan.Warnings) != 1 {
 		t.Fatalf("plan = %+v, want warning-only for non-login match", plan)
 	}
@@ -209,5 +209,40 @@ func TestContentEqual_NilLogin(t *testing.T) {
 	c := Item{Name: "x", Login: &Login{Password: "p"}}
 	if contentEqual(a, c) {
 		t.Error("nil login must differ from populated login")
+	}
+}
+
+func TestBuildPushPlan_OrgFilterScopesPrunes(t *testing.T) {
+	// An --org jasp prune must not touch another org's stale item even
+	// though the whole namespace was fetched for matching.
+	goneJasp := mirrorItem(t, &store.Entry{Path: "jasp/gone", Org: "jasp", Password: "x"}, "i-jasp", "f1")
+	goneZuhause := mirrorItem(t, &store.Entry{Path: "zuhause/gone", Org: "zuhause", Password: "y"}, "i-zuhause", "f2")
+	remote := RemoteState{
+		Folders:     []Folder{{ID: "f1", Name: "mys/jasp"}, {ID: "f2", Name: "mys/zuhause"}},
+		FolderNames: map[string]string{"f1": "mys/jasp", "f2": "mys/zuhause"},
+		Items:       []Item{goneJasp, goneZuhause},
+	}
+	plan := BuildPushPlan(nil, map[string]bool{}, remote, true, "jasp")
+	if len(plan.Prunes) != 1 || plan.Prunes[0].Path != "jasp/gone" {
+		t.Fatalf("Prunes = %+v, want only the jasp item", plan.Prunes)
+	}
+}
+
+func TestBuildPushPlan_HandMovedItemIsMatchedNotDuplicated(t *testing.T) {
+	// The mirror item was hand-moved into another mys/* folder. The
+	// full-namespace fetch must match it by mys-path and move it back —
+	// never create a duplicate next to it.
+	e := &store.Entry{Path: "jasp/a", Org: "jasp", Password: "x"}
+	remote := RemoteState{
+		Folders:     []Folder{{ID: "f1", Name: "mys/jasp"}, {ID: "f2", Name: "mys/zuhause"}},
+		FolderNames: map[string]string{"f1": "mys/jasp", "f2": "mys/zuhause"},
+		Items:       []Item{mirrorItem(t, e, "i1", "f2")},
+	}
+	plan := BuildPushPlan([]*store.Entry{e}, pathsOf(e), remote, false, "jasp")
+	if len(plan.Creates) != 0 {
+		t.Fatalf("Creates = %+v, hand-moved item must not be duplicated", plan.Creates)
+	}
+	if len(plan.Updates) != 1 || plan.Updates[0].ID != "i1" || plan.Updates[0].Folder != "mys/jasp" {
+		t.Fatalf("Updates = %+v, want move back to mys/jasp", plan.Updates)
 	}
 }

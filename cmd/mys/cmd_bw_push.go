@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
@@ -40,6 +41,11 @@ Bitwarden trash (soft delete only). AI callers cannot invoke this command.`,
 			if ctx == nil {
 				ctx = context.Background()
 			}
+			// Nested prefixes like "jasp/stage" would make the store
+			// filter and the mys/<org> folder mapping diverge silently.
+			if strings.Contains(opts.Org, "/") {
+				return fmt.Errorf("--org must be a top-level org name (no '/'): %q", opts.Org)
+			}
 			// Deny AI-flagged callers outright — with a forensic audit
 			// row, same contract as bw-export: a bulk mirror of the
 			// store is exactly what an AI caller must never trigger.
@@ -58,6 +64,11 @@ Bitwarden trash (soft delete only). AI callers cannot invoke this command.`,
 			}
 			opts.Config = cfg
 			opts.Session = os.Getenv("BW_SESSION")
+			release, err := bw.AcquireLock("")
+			if err != nil {
+				return err
+			}
+			defer release()
 			a, err := app.Open(ctx, *requester)
 			if err != nil {
 				return err
@@ -91,6 +102,28 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 	if cfg == nil {
 		cfg = &bw.Config{}
 	}
+	// fail audits an early abort under bw_push so failed attempts are
+	// reconstructable from the log. The reason carries only OUR stage
+	// label, never err.Error(): bw's stderr is embedded in those errors
+	// and a third-party binary's stderr must not end up verbatim in the
+	// persistent audit DB. The full error still reaches the caller (and
+	// the CLI's own ephemeral stderr).
+	fail := func(stage string, err error) error {
+		a.AuditBWPush(ctx, opts.Org, audit.ResultError, stage+" failed")
+		return err
+	}
+	// Pin the server BEFORE anything touches the master password: a bw
+	// CLI pointed at the wrong server must not even trigger the audited
+	// password read, let alone an unlock. `bw status` works unlocked.
+	st, err := c.Status(ctx)
+	if err != nil {
+		return fail("bw status", err)
+	}
+	if cfg.ServerURL != "" && st.ServerURL != cfg.ServerURL {
+		reason := fmt.Sprintf("server mismatch: bw is configured for %s, expected %s", st.ServerURL, cfg.ServerURL)
+		a.AuditBWPush(ctx, opts.Org, audit.ResultError, reason)
+		return fmt.Errorf("%s — refusing to push", reason)
+	}
 	// The master password is fetched through the audited app layer like
 	// any other secret — its read shows up in the audit log.
 	getPassword := func(ctx context.Context) (string, error) {
@@ -100,28 +133,25 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 		}
 		return e.Password, nil
 	}
-	if err := c.EnsureSession(ctx, opts.Session, getPassword); err != nil {
-		return err
-	}
-	st, err := c.Status(ctx)
-	if err != nil {
-		return err
-	}
-	if cfg.ServerURL != "" && st.ServerURL != cfg.ServerURL {
-		reason := fmt.Sprintf("server mismatch: bw is configured for %s, expected %s", st.ServerURL, cfg.ServerURL)
-		a.AuditBWPush(ctx, opts.Org, audit.ResultError, reason)
-		return fmt.Errorf("%s — refusing to push", reason)
+	if _, err := c.EnsureSession(ctx, opts.Session, getPassword); err != nil {
+		return fail("session setup", err)
 	}
 	if err := c.Sync(ctx); err != nil {
-		return err
+		return fail("bw sync", err)
 	}
 
 	paths, err := a.List(ctx, opts.Org)
 	if err != nil {
-		return err
+		return fail("store list", err)
 	}
 	entries := make([]*store.Entry, 0, len(paths))
 	for _, p := range paths {
+		// The vault's own unlock secret must never be mirrored into the
+		// vault it unlocks: Emergency Access or a vault export would
+		// hand out the master password itself.
+		if p == cfg.PasswordPath() {
+			continue
+		}
 		e, err := a.Get(ctx, p)
 		if err != nil {
 			fmt.Fprintf(stderr, "skip %s: %v\n", p, err)
@@ -136,25 +166,46 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 	allPaths := paths
 	if opts.Org != "" {
 		if allPaths, err = a.List(ctx, ""); err != nil {
-			return err
+			return fail("store list", err)
 		}
 	}
 	for _, p := range allPaths {
 		storePaths[p] = true
 	}
+	// Deliberately absent from the prune safety net: if an earlier run
+	// (or a hand copy) put the master password into the mirror, --prune
+	// heals that by trashing it even though the store entry exists.
+	delete(storePaths, cfg.PasswordPath())
 
-	remote, err := bw.FetchRemoteState(ctx, c, opts.Org)
+	remote, err := bw.FetchRemoteState(ctx, c)
 	if err != nil {
-		return err
+		return fail("vault read", err)
 	}
-	plan := bw.BuildPushPlan(entries, storePaths, remote, opts.Prune)
+	// Policy-invisible paths count as "still present": a caller whose
+	// scope policy hides an org sees its paths missing from List — that
+	// must never let --prune trash the org's mirror items.
+	det := caller.Identify(a.Override)
+	for _, it := range remote.Items {
+		p := bw.PathOf(it)
+		if p == "" || storePaths[p] {
+			continue
+		}
+		if !a.Policy.Evaluate(string(det.Kind), det.AgentLabel, p).Allowed {
+			storePaths[p] = true
+			fmt.Fprintf(stderr, "warning: %s is policy-invisible for this caller — its mirror item is left alone\n", p)
+		}
+	}
+	plan := bw.BuildPushPlan(entries, storePaths, remote, opts.Prune, opts.Org)
 	for _, w := range plan.Warnings {
 		fmt.Fprintln(stderr, "warning:", w)
 	}
 	printPushPlan(stdout, st, plan)
 
-	counts := fmt.Sprintf("server=%s create=%d update=%d prune=%d unchanged=%d",
-		st.ServerURL, len(plan.Creates), len(plan.Updates), len(plan.Prunes), plan.Unchanged)
+	// warnings= keeps skipped entries visible in the audit trail — a
+	// no-op row must not read as "everything mirrored cleanly" when
+	// entries were skipped.
+	counts := fmt.Sprintf("server=%s create=%d update=%d prune=%d unchanged=%d warnings=%d",
+		st.ServerURL, len(plan.Creates), len(plan.Updates), len(plan.Prunes), plan.Unchanged, len(plan.Warnings))
 	if opts.DryRun {
 		a.AuditBWPush(ctx, opts.Org, audit.ResultOK, "dry-run "+counts)
 		fmt.Fprintln(stdout, "dry-run: no changes written")
@@ -177,8 +228,9 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 	}
 	res, err := bw.ExecutePush(ctx, c, plan, remote)
 	if err != nil {
+		// Counts only, no err text — see the fail() comment above.
 		a.AuditBWPush(ctx, opts.Org, audit.ResultError,
-			fmt.Sprintf("failed after folders=%d created=%d updated=%d pruned=%d: %v", res.CreatedFolders, res.Created, res.Updated, res.Pruned, err))
+			fmt.Sprintf("push failed after folders=%d created=%d updated=%d pruned=%d", res.CreatedFolders, res.Created, res.Updated, res.Pruned))
 		return err
 	}
 	a.AuditBWPush(ctx, opts.Org, audit.ResultOK, counts)

@@ -82,12 +82,15 @@ func TestEnsureSession_ValidEnvSessionWins(t *testing.T) {
 		"status": []byte(`{"serverUrl":"https://v.example","status":"unlocked"}`),
 	}}
 	c := NewClient(r)
-	err := c.EnsureSession(context.Background(), "env-token", func(context.Context) (string, error) {
+	st, err := c.EnsureSession(context.Background(), "env-token", func(context.Context) (string, error) {
 		t.Fatal("password must not be read when the env session is valid")
 		return "", nil
 	})
 	if err != nil {
 		t.Fatalf("EnsureSession: %v", err)
+	}
+	if st.ServerURL != "https://v.example" {
+		t.Fatalf("status = %+v, want fetched server url", st)
 	}
 	if got := r.Calls[0].Env[0]; got != "BW_SESSION=env-token" {
 		t.Fatalf("status env = %q, want inherited session", got)
@@ -100,7 +103,7 @@ func TestEnsureSession_StaleEnvSessionFallsBackToUnlock(t *testing.T) {
 		"unlock --passwordenv BW_PASSWORD --raw": []byte("fresh-token"),
 	}}
 	c := NewClient(r)
-	err := c.EnsureSession(context.Background(), "stale-token", func(context.Context) (string, error) {
+	_, err := c.EnsureSession(context.Background(), "stale-token", func(context.Context) (string, error) {
 		return "master-pw", nil
 	})
 	if err != nil {
@@ -115,7 +118,7 @@ func TestEnsureSession_UnauthenticatedFailsWithLoginHint(t *testing.T) {
 	r := &fakeRunner{Responses: map[string][]byte{
 		"status": []byte(`{"serverUrl":"https://v.example","status":"unauthenticated"}`),
 	}}
-	err := NewClient(r).EnsureSession(context.Background(), "", func(context.Context) (string, error) {
+	_, err := NewClient(r).EnsureSession(context.Background(), "", func(context.Context) (string, error) {
 		t.Fatal("password must not be read when not logged in")
 		return "", nil
 	})
@@ -180,7 +183,7 @@ func TestFetchRemoteState_OnlyNamespaceFoldersAreRead(t *testing.T) {
 		"list items --folderid f1": []byte(`[{"id":"i1","type":1,"name":"a","folderId":"f1"}]`),
 		"list items --folderid f3": []byte(`[]`),
 	}}
-	rs, err := FetchRemoteState(context.Background(), NewClient(r), "")
+	rs, err := FetchRemoteState(context.Background(), NewClient(r))
 	if err != nil {
 		t.Fatalf("FetchRemoteState: %v", err)
 	}
@@ -197,25 +200,24 @@ func TestFetchRemoteState_OnlyNamespaceFoldersAreRead(t *testing.T) {
 	}
 }
 
-func TestFetchRemoteState_OrgFilterRestrictsToOneFolder(t *testing.T) {
+func TestFetchRemoteState_AlwaysFetchesWholeNamespace(t *testing.T) {
+	// Even an --org-filtered push must see the whole mys/* namespace:
+	// mys-path matching needs items that were hand-moved into another
+	// org folder, otherwise a filtered push would create duplicates.
 	r := &fakeRunner{Responses: map[string][]byte{
 		"list folders": []byte(`[
 			{"id":"f1","name":"mys/jasp"},
 			{"id":"f3","name":"mys/zuhause"}
 		]`),
 		"list items --folderid f1": []byte(`[]`),
+		"list items --folderid f3": []byte(`[]`),
 	}}
-	rs, err := FetchRemoteState(context.Background(), NewClient(r), "jasp")
+	rs, err := FetchRemoteState(context.Background(), NewClient(r))
 	if err != nil {
 		t.Fatalf("FetchRemoteState: %v", err)
 	}
-	if len(rs.Folders) != 1 || rs.Folders[0].Name != "mys/jasp" {
-		t.Fatalf("folders = %+v, want only mys/jasp", rs.Folders)
-	}
-	for _, key := range r.callKeys() {
-		if strings.Contains(key, "f3") {
-			t.Fatal("filtered-out org folder was read")
-		}
+	if len(rs.Folders) != 2 {
+		t.Fatalf("folders = %+v, want both namespace folders", rs.Folders)
 	}
 }
 

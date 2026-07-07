@@ -120,34 +120,39 @@ func (c *Client) Unlock(ctx context.Context, masterPassword string) error {
 // token (from the BW_SESSION environment) wins when it is still valid;
 // otherwise the vault is unlocked with the master password from
 // getPassword. Login itself is never automated — it may involve 2FA and
-// is a one-time manual setup step.
-func (c *Client) EnsureSession(ctx context.Context, envSession string, getPassword func(context.Context) (string, error)) error {
+// is a one-time manual setup step. The returned Status carries the
+// server URL and account (fetched here anyway), so callers do not have
+// to spawn a second `bw status`.
+func (c *Client) EnsureSession(ctx context.Context, envSession string, getPassword func(context.Context) (string, error)) (Status, error) {
 	if envSession != "" {
 		c.session = envSession
 		st, err := c.Status(ctx)
 		if err != nil {
-			return err
+			return Status{}, err
 		}
 		if st.Status == StatusUnlocked {
-			return nil
+			return st, nil
 		}
 		c.session = "" // stale or foreign token — fall through to unlock
 	}
 	st, err := c.Status(ctx)
 	if err != nil {
-		return err
+		return Status{}, err
 	}
 	switch st.Status {
 	case StatusUnlocked:
-		return nil
+		return st, nil
 	case StatusUnauthenticated:
-		return fmt.Errorf("bw is not logged in on this machine — run `bw login` once (server: %s)", st.ServerURL)
+		return Status{}, fmt.Errorf("bw is not logged in on this machine — run `bw login` once (server: %s)", st.ServerURL)
 	}
 	pw, err := getPassword(ctx)
 	if err != nil {
-		return fmt.Errorf("read bitwarden master password: %w", err)
+		return Status{}, fmt.Errorf("read bitwarden master password: %w", err)
 	}
-	return c.Unlock(ctx, pw)
+	if err := c.Unlock(ctx, pw); err != nil {
+		return Status{}, err
+	}
+	return st, nil
 }
 
 // Sync pulls the latest vault state into the CLI's local cache.
