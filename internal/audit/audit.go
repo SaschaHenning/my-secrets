@@ -48,6 +48,10 @@ const (
 	// content. Policy-gated like every other path-taking action, so a
 	// denied path doesn't leak how many times it was ever changed.
 	ActionHistory = "history"
+	// ActionBWPush is the per-run summary row of `mys bw-push` — one row
+	// per mirror run (server + change counts), on top of the per-secret
+	// get rows the app layer writes anyway.
+	ActionBWPush = "bw_push"
 )
 
 // Results recorded against each action.
