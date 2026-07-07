@@ -77,7 +77,10 @@ func EntryFromItem(it Item, folderName string) (*store.Entry, error) {
 	if login.TOTP != "" {
 		t, err := totp.ParseURI(login.TOTP)
 		if err != nil {
-			return nil, fmt.Errorf("%s: totp uri: %w", e.Path, err)
+			// The parse error may embed the raw otpauth uri — seed
+			// included — and callers print these errors as warnings.
+			// Never propagate the original error text.
+			return nil, fmt.Errorf("%s: login.totp is not a valid otpauth uri", e.Path)
 		}
 		e.Kind = store.KindTOTP
 		e.Password = t.Seed
@@ -88,6 +91,11 @@ func EntryFromItem(it Item, folderName string) (*store.Entry, error) {
 		e.TOTPPeriod = int(t.Period)
 	} else {
 		e.Password = login.Password
+		if e.Kind == store.KindTOTP {
+			// The kind metadata field is stale when the item no longer
+			// carries an otpauth uri — the credential is a password now.
+			e.Kind = store.KindPassword
+		}
 	}
 	if e.Kind == "" {
 		e.Kind = store.KindPassword
@@ -118,7 +126,11 @@ func MergeEntry(existing, incoming *store.Entry, changed []string) *store.Entry 
 		case name == "notes":
 			out.Notes = incoming.Notes
 		case name == "totp":
-			out.Kind = store.KindTOTP
+			// A kind switch travels with the totp diff: the phone may
+			// have replaced the password with an authenticator seed —
+			// or dropped the seed again in favour of a plain password
+			// (incoming then carries KindPassword and empty parameters).
+			out.Kind = incoming.Kind
 			out.Password = incoming.Password
 			out.TOTPIssuer = incoming.TOTPIssuer
 			out.TOTPLabel = incoming.TOTPLabel
@@ -143,6 +155,11 @@ func MergeEntry(existing, incoming *store.Entry, changed []string) *store.Entry 
 // ChangedFields compares the reverse-mapped Bitwarden state against the
 // store entry and returns the sorted names of fields that differ —
 // names only, never values, so the result is safe to print and audit.
+// Deliberately compared are only the credential surfaces a phone edit
+// can legitimately change (username/password/url/notes/totp/field.*);
+// store metadata mirrored into custom fields (kind, rotate_after, tags,
+// domain, github_project) stays under the store's authority — the
+// reverse channel never imports metadata edits.
 func ChangedFields(stored, incoming *store.Entry) []string {
 	var changed []string
 	if stored.Username != incoming.Username {

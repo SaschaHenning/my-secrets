@@ -92,6 +92,37 @@ func TestEntryFromItem_RejectsBadTOTPURI(t *testing.T) {
 	}
 }
 
+func TestEntryFromItem_TOTPParseErrorNeverLeaksTheURI(t *testing.T) {
+	// Callers print these errors as warnings — the raw otpauth uri
+	// (seed included) must never appear in the error text.
+	it := Item{Type: TypeLogin, Name: "x", Login: &Login{TOTP: "otpauth://totp/x?secret=LEAKME\x00"}}
+	_, err := EntryFromItem(it, "mys")
+	if err == nil {
+		t.Fatal("malformed totp uri must be rejected")
+	}
+	if strings.Contains(err.Error(), "LEAKME") {
+		t.Errorf("error text leaks the otpauth uri: %v", err)
+	}
+}
+
+func TestEntryFromItem_StaleTOTPKindFieldNormalised(t *testing.T) {
+	// Phone edit removed the otpauth uri in favour of a password, but
+	// the mirrored kind metadata field still says "totp" — the payload
+	// wins, otherwise the merge would rebuild a broken TOTP entry.
+	it := Item{
+		Type: TypeLogin, Name: "otp",
+		Fields: []Field{{Name: "kind", Value: store.KindTOTP, Type: FieldText}},
+		Login:  &Login{Password: "new-pw"},
+	}
+	e, err := EntryFromItem(it, "mys/zuhause")
+	if err != nil {
+		t.Fatalf("EntryFromItem: %v", err)
+	}
+	if e.Kind != store.KindPassword || e.Password != "new-pw" {
+		t.Errorf("entry = %+v, want password kind with the plain password", e)
+	}
+}
+
 func TestPathForItem(t *testing.T) {
 	withKey := Item{Fields: []Field{{Name: FieldPath, Value: "jasp/moved"}}, Name: "other"}
 	cases := []struct {
@@ -158,6 +189,22 @@ func TestMergeEntry_TOTPSwitchCarriesAllParameters(t *testing.T) {
 		got.TOTPIssuer != "I" || got.TOTPLabel != "L" ||
 		got.TOTPAlgorithm != "SHA256" || got.TOTPDigits != 8 || got.TOTPPeriod != 60 {
 		t.Errorf("totp switch must carry the full parameter set: %+v", got)
+	}
+}
+
+func TestMergeEntry_TOTPToPasswordSwitchClearsParameters(t *testing.T) {
+	existing := &store.Entry{
+		Path: "z/otp", Kind: store.KindTOTP, Password: "SEED",
+		TOTPIssuer: "I", TOTPLabel: "L", TOTPAlgorithm: "SHA256", TOTPDigits: 8, TOTPPeriod: 60,
+	}
+	incoming := &store.Entry{Path: "z/otp", Kind: store.KindPassword, Password: "plain-pw"}
+	got := MergeEntry(existing, incoming, []string{"totp"})
+	if got.Kind != store.KindPassword || got.Password != "plain-pw" {
+		t.Errorf("merge = %+v, want password entry", got)
+	}
+	if got.TOTPIssuer != "" || got.TOTPLabel != "" || got.TOTPAlgorithm != "" ||
+		got.TOTPDigits != 0 || got.TOTPPeriod != 0 {
+		t.Errorf("stale totp parameters must be cleared: %+v", got)
 	}
 }
 

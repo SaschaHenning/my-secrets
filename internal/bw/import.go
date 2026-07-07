@@ -50,6 +50,10 @@ func BuildImportDiff(storeEntries map[string]*store.Entry, remote RemoteState, o
 			continue
 		}
 		if seen[path] > 1 {
+			// Mark the path as matched anyway: an existing store entry
+			// behind an ambiguous remote pair must not be reported as
+			// STORE-ONLY — it has vault counterparts, just too many.
+			matched[path] = true
 			warnings = append(warnings, fmt.Sprintf("skip %s: %d Bitwarden items map to this path — resolve the duplicates first", path, seen[path]))
 			continue
 		}

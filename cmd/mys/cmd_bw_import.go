@@ -170,6 +170,26 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 	if err != nil {
 		return fail("vault read", err)
 	}
+	// Policy-invisible paths stay invisible in the diff too: a caller
+	// whose scope policy hides an org must not learn that org's paths
+	// from the vault side either. The count-only warning deliberately
+	// names no paths. (App.Add would refuse the write anyway — this
+	// keeps the read surface consistent with the store's.)
+	det := caller.Identify(a.Override)
+	visible := remote.Items[:0]
+	hidden := 0
+	for _, it := range remote.Items {
+		p := bw.PathForItem(it, remote.FolderNames[it.FolderID])
+		if !a.Policy.Evaluate(string(det.Kind), det.AgentLabel, p).Allowed {
+			hidden++
+			continue
+		}
+		visible = append(visible, it)
+	}
+	remote.Items = visible
+	if hidden > 0 {
+		fmt.Fprintf(stderr, "warning: %d vault item(s) policy-invisible for this caller — skipped\n", hidden)
+	}
 	diffs, inSync, warnings := bw.BuildImportDiff(storeEntries, remote, opts.Org)
 	// A vault item claiming the master-password path must never reach an
 	// apply: it could overwrite the very secret that unlocks the vault.
@@ -247,6 +267,11 @@ apply:
 		if d.Class == bw.ClassChanged {
 			entry = bw.MergeEntry(storeEntries[d.Path], d.Incoming, d.Changed)
 		}
+		// App.Add restamps RotatedAt — accepted: the dominant import
+		// case IS a credential rotated on the phone, and Add is the
+		// only audited full-entry write path. A metadata-only apply
+		// thus reads as freshly rotated; the gopass git history keeps
+		// the precise record.
 		if err := a.Add(ctx, entry); err != nil {
 			fmt.Fprintf(stderr, "failed %s: %v\n", d.Path, err)
 			failed++
@@ -277,16 +302,16 @@ func promptApply(r *bufio.Reader, out io.Writer, d bw.ImportDiff) (string, error
 	for {
 		fmt.Fprintf(out, "import %s %s? [y/n/a/q] ", d.Class, label)
 		line, err := r.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", err
+		}
 		switch strings.TrimSpace(line) {
 		case "y", "n", "a", "q":
 			return strings.TrimSpace(line), nil
 		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				fmt.Fprintln(out)
-				return "q", nil
-			}
-			return "", err
+		if err != nil { // EOF without a valid answer
+			fmt.Fprintln(out)
+			return "q", nil
 		}
 		fmt.Fprintln(out, "answer y (import), n (skip), a (all remaining), q (quit)")
 	}

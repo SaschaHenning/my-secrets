@@ -196,7 +196,11 @@ func TestRunBwImport_ApplyYesWritesViaAdd(t *testing.T) {
 	}
 }
 
-func TestRunBwImport_PolicyDenialBlocksForeignOrgWrite(t *testing.T) {
+func TestRunBwImport_PolicyInvisiblePathsExcludedFromDiffAndWrite(t *testing.T) {
+	// The caller's scope policy hides zuhause/** — vault items mapping
+	// there must neither show up in the diff (path leak) nor ever be
+	// written. App.Add would refuse the write anyway; this pins the
+	// earlier line of defence.
 	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Kind: store.KindPassword, Password: "x"})
 	a.Policy = &policy.Policy{Actors: map[string]policy.Rules{
 		"human": {Allow: []string{"jasp/**"}},
@@ -210,20 +214,23 @@ func TestRunBwImport_PolicyDenialBlocksForeignOrgWrite(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	err := runBwImport(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
 		bwImportOptions{Session: "tok", Apply: true, Yes: true})
-	if err == nil || !strings.Contains(err.Error(), "1 of 1 writes failed") {
-		t.Fatalf("err = %v, want failed-writes error", err)
+	if err != nil {
+		t.Fatalf("runBwImport: %v", err)
+	}
+	if strings.Contains(stdout.String(), "zuhause/router") {
+		t.Errorf("policy-invisible path must not appear in the diff:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "policy-invisible") {
+		t.Errorf("stderr = %q, want count-only policy-invisible warning", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "zuhause/router") {
+		t.Errorf("the warning must not name the hidden path: %q", stderr.String())
 	}
 	if _, err := a.Store.Get(context.Background(), "zuhause/router"); err == nil {
-		t.Error("policy-denied write must not reach the store")
+		t.Error("policy-hidden item must never reach the store")
 	}
-	rows := addRows(t, a)
-	if len(rows) != 1 || rows[0].Result != audit.ResultDenied {
-		t.Fatalf("add rows = %+v, want one denied row", rows)
-	}
-	irows := bwImportRows(t, a)
-	if len(irows) != 1 || irows[0].Result != audit.ResultError ||
-		!strings.Contains(irows[0].Reason, "failed=1") {
-		t.Fatalf("bw_import rows = %+v, want one error row with failed=1", irows)
+	if rows := addRows(t, a); len(rows) != 0 {
+		t.Errorf("no add rows expected: %+v", rows)
 	}
 }
 

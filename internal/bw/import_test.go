@@ -71,7 +71,9 @@ func TestBuildImportDiff_Classification(t *testing.T) {
 func TestBuildImportDiff_DuplicateMysPathWarnsAndSkips(t *testing.T) {
 	e := &store.Entry{Path: "jasp/dup", Org: "jasp", Kind: store.KindPassword, Password: "a"}
 	remote := remoteWith(t, "jasp", mirrorItem(t, e, "i1", "f-jasp"), mirrorItem(t, e, "i2", "f-jasp"))
-	diffs, _, warnings := BuildImportDiff(map[string]*store.Entry{}, remote, "")
+	// The store entry behind the ambiguous pair must not surface as
+	// STORE-ONLY — it has vault counterparts, just too many.
+	diffs, _, warnings := BuildImportDiff(map[string]*store.Entry{e.Path: e}, remote, "")
 	if len(diffs) != 0 {
 		t.Errorf("duplicate items must not produce diff rows: %+v", diffs)
 	}
