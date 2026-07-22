@@ -106,6 +106,14 @@ func RunWizard(ctx context.Context, io WizardIO, opts WizardOptions) (*Config, e
 	if style == "" {
 		style = DetectRemoteStyle(ctx, opts.Runner)
 		fmt.Fprintf(io.Out, "Git-Protokoll laut `gh auth status`: %s\n", style)
+		// gh reporting ssh only means the user *prefers* ssh — not that
+		// an SSH key for GitHub is actually set up on this machine.
+		// Probe before committing to ssh URLs; an explicitly requested
+		// style (opts.RemoteStyle) is respected without a probe.
+		if style == RemoteSSH && !ProbeGitHubSSH(ctx, opts.Runner) {
+			fmt.Fprintln(io.Out, "GitHub ist per SSH nicht erreichbar — nutze HTTPS als Fallback (SSH später via `git remote set-url` umstellbar).")
+			style = RemoteHTTPS
+		}
 	}
 
 	cfg := &Config{Version: 1, Layout: layout, Owner: owner}
@@ -273,10 +281,17 @@ func configureRepo(ctx context.Context, out io.Writer, opts WizardOptions, cfg *
 		}
 	}
 	fmt.Fprintf(out, "Setze Remote origin → %s\n", url)
-	if _, err := GopassGitRemoteAdd(ctx, opts.Runner, mount, url); err != nil {
-		if !strings.Contains(err.Error(), "already") {
-			return err
+	// Converge on the wanted URL instead of tolerating whatever origin
+	// is already there: add-with-"already"-tolerance both broke under a
+	// localized git and silently kept a stale URL.
+	if cur, err := GopassGit(ctx, opts.Runner, mount, "remote", "get-url", "origin"); err == nil {
+		if strings.TrimSpace(string(cur)) != url {
+			if _, err := GopassGit(ctx, opts.Runner, mount, "remote", "set-url", "origin", url); err != nil {
+				return err
+			}
 		}
+	} else if _, err := GopassGitRemoteAdd(ctx, opts.Runner, mount, url); err != nil {
+		return err
 	}
 	// If we picked HTTPS, make sure `gh` is registered as git's
 	// credential helper so the first push succeeds without manual

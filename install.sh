@@ -5,7 +5,7 @@
 #   1. Checks prerequisites (Homebrew, git).
 #   2. Installs Homebrew packages: go, gopass, gnupg.
 #   3. Builds the mys binary.
-#   4. Copies it to /usr/local/bin (asks for sudo).
+#   4. Copies it to ~/bin (no sudo needed).
 #   5. Runs `mys init --install-skill` which — in this one command —
 #      generates/picks a GPG key, initialises the gopass store, wires
 #      up pinentry-touchid (macOS), writes the scope policy, creates
@@ -82,18 +82,25 @@ else
   warn "codesign not found — skipping ad-hoc signing (binary may be killed on macOS 15+)"
 fi
 
-# --- 4. Install to /usr/local/bin ----------------------------------------
+# --- 4. Install to ~/bin --------------------------------------------------
+# /usr/local/bin is a bad target here: it does not exist on a fresh
+# Apple-Silicon Mac, needs sudo, and the surrounding tooling expects
+# the binary at $HOME/bin/mys (MYS_BIN).
 
-banner "Installing mys to /usr/local/bin"
+banner "Installing mys to ~/bin"
 
-INSTALL_PATH="/usr/local/bin/mys"
-if [[ -w "$(dirname "$INSTALL_PATH")" ]]; then
-  cp bin/mys "$INSTALL_PATH"
-else
-  echo "    /usr/local/bin is not writable — sudo needed to install."
-  sudo cp bin/mys "$INSTALL_PATH"
-fi
+INSTALL_PATH="$HOME/bin/mys"
+mkdir -p "$HOME/bin"
+# Remove first: overwriting a signed binary in place keeps the inode and
+# macOS then SIGKILLs it with a stale code-signature cache.
+rm -f "$INSTALL_PATH"
+cp bin/mys "$INSTALL_PATH"
 ok "mys → $INSTALL_PATH"
+
+case ":$PATH:" in
+  *":$HOME/bin:"*) ;;
+  *) warn "$HOME/bin is not in your PATH — add it to your shell profile:  export PATH=\"\$HOME/bin:\$PATH\"" ;;
+esac
 
 # --- 5. mys init (GPG key + gopass store + policy + audit + skill) ------
 
@@ -105,11 +112,11 @@ banner "Running 'mys init --install-skill'"
 # --install-skill — symlinks the Claude Code skill into ~/.claude/skills.
 # The command is idempotent, so re-running the installer is safe.
 if [[ -d "$HOME/.claude" ]]; then
-  mys init --install-skill
+  "$INSTALL_PATH" init --install-skill
   ok "mys initialised (key, store, policy, audit, skill)"
 else
-  warn "~/.claude not found — running 'mys init' without skill install."
-  mys init
+  warn "$HOME/.claude not found — running 'mys init' without skill install."
+  "$INSTALL_PATH" init
   ok "mys initialised (key, store, policy, audit)"
   warn "  After installing Claude Code, run:  mys install-skill"
 fi
@@ -129,13 +136,16 @@ if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
 fi
 
 # Use python3 (stdlib json) to merge rather than depending on jq.
-python3 - "$CLAUDE_SETTINGS" <<'PY'
+# Register the absolute binary path — ~/bin is not guaranteed to be on
+# the PATH of the process that spawns the MCP server.
+python3 - "$CLAUDE_SETTINGS" "$INSTALL_PATH" <<'PY'
 import json, sys, pathlib
 p = pathlib.Path(sys.argv[1])
 data = json.loads(p.read_text() or "{}")
 mcp = data.setdefault("mcpServers", {})
-if mcp.get("my-secrets") != {"command": "mys", "args": ["mcp"]}:
-    mcp["my-secrets"] = {"command": "mys", "args": ["mcp"]}
+want = {"command": sys.argv[2], "args": ["mcp"]}
+if mcp.get("my-secrets") != want:
+    mcp["my-secrets"] = want
     p.write_text(json.dumps(data, indent=2) + "\n")
     print("    registered in", p)
 else:
