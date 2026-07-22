@@ -10,15 +10,20 @@ ok()     { printf "    \033[32m✓\033[0m %s\n" "$*"; }
 warn()   { printf "    \033[33m!\033[0m %s\n" "$*"; }
 
 banner "Removing mys binary"
+if [[ -f "$HOME/bin/mys" ]]; then
+  rm "$HOME/bin/mys"
+  ok "removed ~/bin/mys"
+else
+  warn "$HOME/bin/mys not found"
+fi
+# Clean up a legacy install from before the ~/bin switch.
 if [[ -f /usr/local/bin/mys ]]; then
   if [[ -w /usr/local/bin ]]; then
     rm /usr/local/bin/mys
   else
     sudo rm /usr/local/bin/mys
   fi
-  ok "removed /usr/local/bin/mys"
-else
-  warn "/usr/local/bin/mys not found"
+  ok "removed legacy /usr/local/bin/mys"
 fi
 
 banner "Removing Claude Code skill symlink"
