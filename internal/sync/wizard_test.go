@@ -3,6 +3,7 @@ package sync
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -16,7 +17,10 @@ type fakeRunner struct {
 	// responses maps "name arg0 arg1 ..." (any prefix) to an output.
 	// The first matching prefix wins. Missing matches return nil, nil.
 	responses map[string]string
-	err       error
+	// errFor maps the same prefix form to an error; a matching call
+	// returns its canned response (if any) together with that error.
+	errFor map[string]error
+	err    error
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -28,12 +32,19 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte
 		return nil, f.err
 	}
 	joined := strings.Join(call, " ")
+	var out []byte
 	for prefix, resp := range f.responses {
 		if strings.HasPrefix(joined, prefix) {
-			return []byte(resp), nil
+			out = []byte(resp)
+			break
 		}
 	}
-	return nil, nil
+	for prefix, e := range f.errFor {
+		if strings.HasPrefix(joined, prefix) {
+			return out, e
+		}
+	}
+	return out, nil
 }
 
 func TestWizardScopeDisclaimerAlwaysPrinted(t *testing.T) {
@@ -196,6 +207,127 @@ func TestWizardPerOrgCreatesOnePerOrg(t *testing.T) {
 		if want[r.Mount] != r.URL {
 			t.Errorf("remote %q url: got %q want %q", r.Mount, r.URL, want[r.Mount])
 		}
+	}
+}
+
+func TestWizardAutoStyleFallsBackToHTTPSWhenSSHUnreachable(t *testing.T) {
+	var out bytes.Buffer
+	fr := &fakeRunner{
+		responses: map[string]string{
+			"gh auth status": "  - Git operations protocol: ssh",
+		},
+		errFor: map[string]error{
+			"ssh -T git@github.com": errors.New("ssh: connect to host github.com port 22: Operation timed out"),
+		},
+	}
+	cfg, err := RunWizard(context.Background(), WizardIO{
+		In:  strings.NewReader(""),
+		Out: &out,
+	}, WizardOptions{
+		NonInteractive: true,
+		Layout:         LayoutSingle,
+		Owner:          "alice",
+		SingleRepoName: "my-secrets-store",
+		Runner:         fr,
+		DryRun:         true,
+	})
+	if err != nil {
+		t.Fatalf("wizard: %v", err)
+	}
+	if len(cfg.Remotes) != 1 || cfg.Remotes[0].URL != "https://github.com/alice/my-secrets-store.git" {
+		t.Errorf("expected https fallback URL, got %+v", cfg.Remotes)
+	}
+	if !strings.Contains(out.String(), "HTTPS als Fallback") {
+		t.Errorf("fallback notice missing from output:\n%s", out.String())
+	}
+}
+
+func TestWizardAutoStyleKeepsSSHWhenProbeAuthenticates(t *testing.T) {
+	// GitHub's `ssh -T` exits non-zero even on success — the
+	// (server-side, never localized) greeting is the success signal.
+	var out bytes.Buffer
+	fr := &fakeRunner{
+		responses: map[string]string{
+			"gh auth status":        "  - Git operations protocol: ssh",
+			"ssh -T git@github.com": "Hi alice! You've successfully authenticated, but GitHub does not provide shell access.",
+		},
+		errFor: map[string]error{
+			"ssh -T git@github.com": errors.New("exit status 1"),
+		},
+	}
+	cfg, err := RunWizard(context.Background(), WizardIO{
+		In:  strings.NewReader(""),
+		Out: &out,
+	}, WizardOptions{
+		NonInteractive: true,
+		Layout:         LayoutSingle,
+		Owner:          "alice",
+		SingleRepoName: "my-secrets-store",
+		Runner:         fr,
+		DryRun:         true,
+	})
+	if err != nil {
+		t.Fatalf("wizard: %v", err)
+	}
+	if len(cfg.Remotes) != 1 || cfg.Remotes[0].URL != "git@github.com:alice/my-secrets-store.git" {
+		t.Errorf("expected ssh URL to survive successful probe, got %+v", cfg.Remotes)
+	}
+}
+
+func TestConfigureRepoConvergesStaleRemoteURL(t *testing.T) {
+	var out bytes.Buffer
+	fr := &fakeRunner{
+		responses: map[string]string{
+			"gopass git remote get-url origin": "git@github.com:alice/old-store.git\n",
+		},
+	}
+	cfg := &Config{Version: 1, Layout: LayoutSingle, Owner: "alice"}
+	err := configureRepo(context.Background(), &out, WizardOptions{Runner: fr}, cfg,
+		DefaultStoreMount, "alice", "my-secrets-store", RemoteSSH)
+	if err != nil {
+		t.Fatalf("configureRepo: %v", err)
+	}
+	want := "git@github.com:alice/my-secrets-store.git"
+	var sawSetURL, sawAdd bool
+	for _, c := range fr.calls {
+		j := strings.Join(c, " ")
+		if j == "gopass git remote set-url origin "+want {
+			sawSetURL = true
+		}
+		if strings.HasPrefix(j, "gopass git remote add") {
+			sawAdd = true
+		}
+	}
+	if !sawSetURL {
+		t.Errorf("expected `remote set-url origin %s`, calls: %v", want, fr.calls)
+	}
+	if sawAdd {
+		t.Errorf("unexpected `remote add` on existing origin, calls: %v", fr.calls)
+	}
+}
+
+func TestConfigureRepoAddsRemoteWhenMissing(t *testing.T) {
+	var out bytes.Buffer
+	fr := &fakeRunner{
+		errFor: map[string]error{
+			"gopass git remote get-url origin": errors.New("error: No such remote 'origin'"),
+		},
+	}
+	cfg := &Config{Version: 1, Layout: LayoutSingle, Owner: "alice"}
+	err := configureRepo(context.Background(), &out, WizardOptions{Runner: fr}, cfg,
+		DefaultStoreMount, "alice", "my-secrets-store", RemoteSSH)
+	if err != nil {
+		t.Fatalf("configureRepo: %v", err)
+	}
+	want := "gopass git remote add origin git@github.com:alice/my-secrets-store.git"
+	var sawAdd bool
+	for _, c := range fr.calls {
+		if strings.Join(c, " ") == want {
+			sawAdd = true
+		}
+	}
+	if !sawAdd {
+		t.Errorf("expected %q, calls: %v", want, fr.calls)
 	}
 }
 

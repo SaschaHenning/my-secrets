@@ -83,7 +83,10 @@ func syncSetupCmd(requester *string) *cobra.Command {
 			if chosen == "" && yes {
 				chosen = syncpkg.LayoutSingle
 			}
-			style := syncpkg.RemoteSSH
+			// Leave the style empty unless --https forces it: the wizard
+			// then picks the protocol via `gh auth status` and falls back
+			// to HTTPS when GitHub is not reachable over SSH.
+			var style syncpkg.RemoteStyle
 			if useHTTPS {
 				style = syncpkg.RemoteHTTPS
 			}
@@ -125,9 +128,9 @@ func syncSetupCmd(requester *string) *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&yes, "yes", false, "Non-interaktiv — nimmt Defaults (single-repo, SSH) ohne Rückfrage")
+	c.Flags().BoolVar(&yes, "yes", false, "Non-interaktiv — nimmt Defaults (single-repo, Protokoll via gh auth status) ohne Rückfrage")
 	c.Flags().StringVar(&layout, "layout", "", "single | per-org (optional im --yes-Modus)")
-	c.Flags().BoolVar(&useHTTPS, "https", false, "HTTPS-URLs statt SSH für die Remote")
+	c.Flags().BoolVar(&useHTTPS, "https", false, "HTTPS-URLs für die Remote erzwingen (sonst: Protokoll via gh auth status, HTTPS-Fallback wenn SSH nicht erreichbar)")
 	c.Flags().StringVar(&repoName, "repo", "", "Repo-Name für single-repo (default: my-secrets-store)")
 	return c
 }

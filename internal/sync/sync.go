@@ -165,6 +165,24 @@ func DetectRemoteStyle(ctx context.Context, r Runner) RemoteStyle {
 	return RemoteHTTPS
 }
 
+// ProbeGitHubSSH checks whether an authenticated SSH connection to
+// github.com works (honouring the user's ~/.ssh/config, e.g. a
+// ssh.github.com:443 fallback block). GitHub never grants a shell, so
+// a successful auth still exits non-zero — success is detected by the
+// server-side (never localized) greeting instead of the exit code.
+func ProbeGitHubSSH(ctx context.Context, r Runner) bool {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	out, err := r.Run(ctx, "ssh", "-T", "git@github.com",
+		"-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+		"-o", "StrictHostKeyChecking=accept-new")
+	if err == nil {
+		return true
+	}
+	return strings.Contains(strings.ToLower(string(out)), "successfully authenticated")
+}
+
 // BuildRemoteURL assembles a GitHub repo URL in the requested style.
 // Owner and name are normalised (trimmed, no trailing .git).
 func BuildRemoteURL(style RemoteStyle, owner, name string) (string, error) {
@@ -226,8 +244,12 @@ type Runner interface {
 type ExecRunner struct{}
 
 // Run executes name with args, capturing combined stdout+stderr.
+// Subprocesses run in the C locale: callers match on English substrings
+// of git/gopass output ("already", "not found"), which a localized git
+// (e.g. German „existiert bereits") would otherwise break.
 func (ExecRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return out, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
