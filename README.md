@@ -80,7 +80,7 @@ cd ~/Code/my-secrets
 ```
 
 Das Skript installiert alle Homebrew-Pakete, baut das Binary, legt es
-nach `/usr/local/bin`, ruft `mys init --install-skill` auf (das erledigt
+nach `~/bin` (ohne sudo), ruft `mys init --install-skill` auf (das erledigt
 inzwischen auch GPG-Key + gopass-Init) und trägt den MCP-Server in
 `~/.claude/settings.json` ein. `mys install-skill` existiert weiterhin
 als eigenständiger Befehl für manuelles Nachinstallieren — neu auch mit
@@ -477,7 +477,8 @@ Audit-Log unbrauchbar machen.
 # Einmalig: GitHub-Repo anlegen, gopass-Remote setzen, initialer Push
 mys sync setup
 
-# Im CI / non-interaktiv (Defaults: single-repo, SSH):
+# Im CI / non-interaktiv (Defaults: single-repo, Protokoll via
+# `gh auth status`, mit HTTPS-Fallback wenn SSH nicht erreichbar):
 mys sync setup --yes
 
 # Alltag

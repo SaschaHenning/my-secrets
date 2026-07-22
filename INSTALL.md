@@ -10,8 +10,8 @@ Komplett von Null (kein GPG-Key, kein gopass-Store, kein my-secrets):
 brew install gopass pinentry-mac
 git clone https://github.com/SaschaHenning/my-secrets ~/Code/my-secrets
 cd ~/Code/my-secrets
-make build && sudo cp bin/mys /usr/local/bin/
-mys init --install-skill
+make build && mkdir -p ~/bin && install bin/mys ~/bin/
+~/bin/mys init --install-skill
 ```
 
 Das reicht. `mys init` generiert den GPG-Key, initialisiert den
@@ -27,7 +27,7 @@ cd ~/Code/my-secrets
 ```
 
 Das Skript prüft Voraussetzungen, installiert Homebrew-Pakete, baut das
-Binary, legt es nach `/usr/local/bin`, ruft `mys init --install-skill`
+Binary, legt es nach `~/bin` (ohne sudo), ruft `mys init --install-skill`
 (das erledigt inzwischen auch GPG-Key + gopass-Store) und trägt den
 MCP-Server in `~/.claude/settings.json` ein.
 
@@ -93,15 +93,21 @@ Das erzeugt `bin/mys` (~28 MB, statisch gelinkt).
 ## Schritt 3 · Binary installieren
 
 ```bash
-sudo cp bin/mys /usr/local/bin/
-mys --version   # Sanity-Check
+mkdir -p ~/bin
+install bin/mys ~/bin/
+~/bin/mys --version   # Sanity-Check
 ```
+
+`~/bin` muss im PATH liegen (`export PATH="$HOME/bin:$PATH"` in der
+Shell-Konfiguration). Wichtig: `install` (oder `rm` + `cp`) statt bloßem
+`cp` über ein existierendes Binary — beim In-place-Überschreiben killt
+macOS das Binary wegen der veralteten Codesignatur-Zuordnung (SIGKILL).
 
 Alternativ: Symlink auf das Build-Artefakt, damit `git pull + make build`
 automatisch nachzieht:
 
 ```bash
-sudo ln -sf "$PWD/bin/mys" /usr/local/bin/mys
+ln -sf "$PWD/bin/mys" ~/bin/mys
 ```
 
 ## Schritt 4 · my-secrets initialisieren (GPG-Key, gopass-Store, Policy, Skill)
@@ -212,7 +218,7 @@ Eintrag mit `actor_kind=ai`.
 cd ~/Code/my-secrets
 git pull
 make build
-sudo cp bin/mys /usr/local/bin/
+install bin/mys ~/bin/
 # Falls der Symlink-Pfad oben genutzt wurde, erübrigt sich der letzte Schritt.
 ```
 
@@ -226,7 +232,7 @@ cd ~/Code/my-secrets
 ```
 
 Entfernt:
-- `/usr/local/bin/mys`
+- `~/bin/mys` (und ein etwaiges Legacy-`/usr/local/bin/mys`)
 - `~/.claude/skills/my-secrets` (Symlink)
 - MCP-Server-Eintrag aus `~/.claude/settings.json`
 
