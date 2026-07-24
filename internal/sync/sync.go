@@ -18,14 +18,18 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -33,6 +37,8 @@ import (
 // DefaultStoreMount is the logical name of the primary (root) gopass
 // store when the user chose the single-repo layout.
 const DefaultStoreMount = "root"
+
+const maxSyncConfigBytes = 1 << 20
 
 // Layout describes how the user's secrets are split across remotes.
 type Layout string
@@ -61,6 +67,16 @@ type StoreRemote struct {
 	// keys described by team-keys.yaml in that mount's repository.
 	// The default/root store is never allowed to be shared.
 	Shared bool `yaml:"shared,omitempty"`
+	// TeamAudit configures the separate signed read-audit repository for
+	// this shared mount. It is invalid on personal or root stores.
+	TeamAudit *TeamAuditConfig `yaml:"team_audit,omitempty"`
+}
+
+// TeamAuditConfig identifies a shared mount's separate audit repository
+// and the primary OpenPGP fingerprint authorized to sign local events.
+type TeamAuditConfig struct {
+	URL                string `yaml:"url"`
+	SigningFingerprint string `yaml:"signing_fingerprint"`
 }
 
 // Config is the persisted sync state.
@@ -97,16 +113,54 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	b, err := os.ReadFile(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &Config{Version: 1}, nil
 		}
+		return nil, fmt.Errorf("inspect sync config: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, errors.New("read sync config: config must be a regular file")
+	}
+	if info.Size() > maxSyncConfigBytes {
+		return nil, errors.New("read sync config: config is too large")
+	}
+	file, err := os.Open(path)
+	if err != nil {
 		return nil, fmt.Errorf("read sync config: %w", err)
 	}
+	openedInfo, statErr := file.Stat()
+	if statErr != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("inspect opened sync config: %w", statErr)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		_ = file.Close()
+		return nil, errors.New("read sync config: config must be a stable regular file")
+	}
+	b, readErr := io.ReadAll(io.LimitReader(file, maxSyncConfigBytes+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read sync config: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close sync config: %w", closeErr)
+	}
+	if len(b) > maxSyncConfigBytes {
+		return nil, errors.New("read sync config: config is too large")
+	}
+
 	var c Config
-	if err := yaml.Unmarshal(b, &c); err != nil {
-		return nil, fmt.Errorf("parse sync config: %w", err)
+	decoder := yaml.NewDecoder(bytes.NewReader(b))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&c); err != nil {
+		return nil, errors.New("parse sync config: invalid YAML syntax or schema")
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, errors.New(
+			"parse sync config: exactly one YAML document is required")
 	}
 	if c.Version == 0 {
 		c.Version = 1
@@ -164,7 +218,7 @@ func saveConfigNextRevisionLocked(path string, c *Config) error {
 		return fmt.Errorf("save sync config: revision exhausted")
 	}
 	candidate := *c
-	candidate.Remotes = append([]StoreRemote(nil), c.Remotes...)
+	candidate.Remotes = cloneStoreRemotes(c.Remotes)
 	candidate.Revision++
 	if err := saveConfigFile(path, &candidate); err != nil {
 		return err
@@ -190,6 +244,9 @@ func saveConfigFile(path string, c *Config) error {
 	b, err := yaml.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("marshal sync config: %w", err)
+	}
+	if len(b) > maxSyncConfigBytes {
+		return errors.New("marshal sync config: config is too large")
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".sync-*.tmp")
 	if err != nil {
@@ -254,6 +311,61 @@ func MarkSharedSyncedAndSave(
 	return current, nil
 }
 
+// UpdateSharedTeamAuditAndSave reloads sync.yaml under its exclusive
+// writer lock, updates only the target shared mount's audit settings,
+// and saves a new revision without overwriting concurrent config edits.
+func UpdateSharedTeamAuditAndSave(
+	ctx context.Context,
+	path string,
+	mount string,
+	audit TeamAuditConfig,
+) (*Config, error) {
+	if err := ValidateSharedMountName(mount); err != nil {
+		return nil, err
+	}
+	normalizedAudit, err := normalizeTeamAuditConfig(audit)
+	if err != nil {
+		return nil, err
+	}
+	resolvedPath, err := resolveConfigPath(path)
+	if err != nil {
+		return nil, err
+	}
+	release, err := acquireConfigLock(ctx, resolvedPath)
+	if err != nil {
+		return nil, err
+	}
+	current, updateErr := Load(resolvedPath)
+	if updateErr == nil {
+		updateErr = setSharedTeamAudit(current, mount, normalizedAudit)
+	}
+	if updateErr == nil {
+		updateErr = saveConfigNextRevisionLocked(resolvedPath, current)
+	}
+	if err := errors.Join(updateErr, release()); err != nil {
+		return nil, err
+	}
+	return current, nil
+}
+
+func setSharedTeamAudit(
+	config *Config,
+	mount string,
+	audit TeamAuditConfig,
+) error {
+	for i := range config.Remotes {
+		if config.Remotes[i].Mount != mount {
+			continue
+		}
+		if !config.Remotes[i].Shared {
+			return fmt.Errorf("mount %q is not configured as shared", mount)
+		}
+		config.Remotes[i].TeamAudit = cloneTeamAuditConfig(&audit)
+		return config.Validate()
+	}
+	return fmt.Errorf("shared mount %q is not configured", mount)
+}
+
 // Validate checks invariants that security-sensitive shared-mount
 // decisions rely on. In particular, duplicate mount entries are rejected
 // rather than letting list order decide whether a mount is shared.
@@ -279,6 +391,17 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("remote %d: %w", i, err)
 			}
 		}
+		if remote.TeamAudit != nil {
+			if !remote.Shared {
+				return fmt.Errorf(
+					"remote %d: team audit requires a shared mount", i)
+			}
+			if err := validateTeamAuditConfig(
+				*remote.TeamAudit, remote.URL,
+			); err != nil {
+				return fmt.Errorf("remote %d: %w", i, err)
+			}
+		}
 	}
 	return nil
 }
@@ -291,7 +414,7 @@ func (c *Config) Remote(mount string) (StoreRemote, bool) {
 	mount = strings.TrimSpace(mount)
 	for _, remote := range c.Remotes {
 		if remote.Mount == mount {
-			return remote, true
+			return cloneStoreRemote(remote), true
 		}
 	}
 	return StoreRemote{}, false
@@ -441,9 +564,15 @@ func (c *Config) MergeSharedFrom(previous *Config) error {
 			if !existing.Shared || existing.URL != remote.URL {
 				return fmt.Errorf("shared mount %q conflicts with wizard result", remote.Mount)
 			}
+			for i := range c.Remotes {
+				if c.Remotes[i].Mount == remote.Mount {
+					c.Remotes[i] = cloneStoreRemote(remote)
+					break
+				}
+			}
 			continue
 		}
-		c.Remotes = append(c.Remotes, remote)
+		c.Remotes = append(c.Remotes, cloneStoreRemote(remote))
 	}
 	if err := c.Validate(); err != nil {
 		return err
@@ -453,6 +582,252 @@ func (c *Config) MergeSharedFrom(previous *Config) error {
 	// detect another writer that completed while the wizard was open.
 	c.Revision = previous.Revision
 	return nil
+}
+
+// NormalizeTeamAuditFingerprint validates a 40-hex OpenPGP primary
+// fingerprint and returns its canonical uppercase representation.
+func NormalizeTeamAuditFingerprint(fingerprint string) (string, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(fingerprint))
+	if len(normalized) != 40 {
+		return "", errors.New("invalid team audit signing fingerprint")
+	}
+	for _, char := range normalized {
+		if !((char >= '0' && char <= '9') ||
+			(char >= 'A' && char <= 'F')) {
+			return "", errors.New("invalid team audit signing fingerprint")
+		}
+	}
+	return normalized, nil
+}
+
+func normalizeTeamAuditConfig(audit TeamAuditConfig) (TeamAuditConfig, error) {
+	if err := validateTeamAuditRemoteURL(audit.URL); err != nil {
+		return TeamAuditConfig{}, err
+	}
+	fingerprint, err := NormalizeTeamAuditFingerprint(
+		audit.SigningFingerprint)
+	if err != nil {
+		return TeamAuditConfig{}, err
+	}
+	audit.SigningFingerprint = fingerprint
+	return audit, nil
+}
+
+func validateTeamAuditConfig(audit TeamAuditConfig, storeURL string) error {
+	normalized, err := normalizeTeamAuditConfig(audit)
+	if err != nil {
+		return err
+	}
+	if normalized.SigningFingerprint != audit.SigningFingerprint {
+		return errors.New(
+			"team audit signing fingerprint must use canonical uppercase")
+	}
+	if sameGitRemote(audit.URL, storeURL) {
+		return errors.New("team audit remote must differ from store remote")
+	}
+	return nil
+}
+
+func validateTeamAuditRemoteURL(remoteURL string) error {
+	invalid := func() error {
+		return errors.New("invalid team audit remote URL")
+	}
+	if remoteURL == "" || strings.TrimSpace(remoteURL) != remoteURL ||
+		strings.HasPrefix(remoteURL, "-") ||
+		strings.ContainsAny(remoteURL, "?#%") ||
+		strings.IndexFunc(remoteURL, func(char rune) bool {
+			return unicode.IsControl(char) || unicode.IsSpace(char)
+		}) >= 0 {
+		return invalid()
+	}
+	if filepath.IsAbs(remoteURL) {
+		if filepath.Clean(remoteURL) != remoteURL ||
+			remoteURL == string(filepath.Separator) {
+			return invalid()
+		}
+		return nil
+	}
+	if strings.HasPrefix(remoteURL, "git@") {
+		hostPath := strings.TrimPrefix(remoteURL, "git@")
+		host, remotePath, ok := strings.Cut(hostPath, ":")
+		if !ok || !validTeamAuditHost(host) ||
+			!validTeamAuditRemotePath(remotePath) {
+			return invalid()
+		}
+		return nil
+	}
+
+	parsed, err := url.Parse(remoteURL)
+	if err != nil || parsed.Opaque != "" || parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return invalid()
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "file":
+		localPath := filepath.FromSlash(parsed.Path)
+		if parsed.Host != "" || parsed.User != nil ||
+			!filepath.IsAbs(localPath) ||
+			filepath.Clean(localPath) != localPath ||
+			localPath == string(filepath.Separator) {
+			return invalid()
+		}
+	case "https":
+		if parsed.Hostname() == "" || parsed.User != nil ||
+			!validTeamAuditHost(parsed.Hostname()) ||
+			!validTeamAuditRemotePath(parsed.Path) {
+			return invalid()
+		}
+	case "ssh":
+		if parsed.Hostname() == "" ||
+			!validTeamAuditHost(parsed.Hostname()) ||
+			!validTeamAuditRemotePath(parsed.Path) {
+			return invalid()
+		}
+		if parsed.User != nil {
+			if !validTeamAuditUsername(parsed.User.Username()) {
+				return invalid()
+			}
+			if _, hasPassword := parsed.User.Password(); hasPassword {
+				return invalid()
+			}
+		}
+	default:
+		return invalid()
+	}
+	return nil
+}
+
+func validTeamAuditHost(host string) bool {
+	segments := strings.Split(host, ".")
+	if len(segments) == 0 {
+		return false
+	}
+	for _, segment := range segments {
+		if segment == "" || strings.HasPrefix(segment, "-") ||
+			strings.HasSuffix(segment, "-") {
+			return false
+		}
+		for _, char := range segment {
+			if !((char >= 'a' && char <= 'z') ||
+				(char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') ||
+				char == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validTeamAuditUsername(username string) bool {
+	if username == "" {
+		return false
+	}
+	for _, char := range username {
+		if !((char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '.' || char == '_' || char == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func validTeamAuditRemotePath(remotePath string) bool {
+	trimmed := strings.TrimPrefix(remotePath, "/")
+	if trimmed == "" || strings.HasSuffix(remotePath, "/") ||
+		strings.Contains(trimmed, "//") ||
+		strings.HasPrefix(trimmed, "-") {
+		return false
+	}
+	for _, segment := range strings.Split(trimmed, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+		for _, char := range segment {
+			if !((char >= 'a' && char <= 'z') ||
+				(char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') ||
+				char == '.' || char == '_' || char == '-' ||
+				char == '~') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sameGitRemote(first string, second string) bool {
+	if first == second {
+		return true
+	}
+	firstIdentity, firstOK := gitRemoteIdentity(first)
+	secondIdentity, secondOK := gitRemoteIdentity(second)
+	return firstOK && secondOK && firstIdentity == secondIdentity
+}
+
+func gitRemoteIdentity(remoteURL string) (string, bool) {
+	if filepath.IsAbs(remoteURL) {
+		return "local:" + filepath.Clean(remoteURL), true
+	}
+	if strings.HasPrefix(remoteURL, "git@") {
+		hostPath := strings.TrimPrefix(remoteURL, "git@")
+		host, remotePath, ok := strings.Cut(hostPath, ":")
+		if !ok || host == "" || remotePath == "" {
+			return "", false
+		}
+		return networkGitRemoteIdentity(host, remotePath), true
+	}
+	parsed, err := url.Parse(remoteURL)
+	if err != nil {
+		return "", false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "file":
+		if parsed.Host != "" ||
+			!filepath.IsAbs(filepath.FromSlash(parsed.Path)) {
+			return "", false
+		}
+		return "local:" +
+			filepath.Clean(filepath.FromSlash(parsed.Path)), true
+	case "https", "ssh":
+		if parsed.Hostname() == "" || parsed.Path == "" {
+			return "", false
+		}
+		return networkGitRemoteIdentity(
+			parsed.Hostname(), parsed.Path,
+		), true
+	default:
+		return "", false
+	}
+}
+
+func networkGitRemoteIdentity(host string, remotePath string) string {
+	repository := strings.Trim(strings.TrimSpace(remotePath), "/")
+	repository = strings.TrimSuffix(repository, ".git")
+	return "network:" + strings.ToLower(host) + "/" + repository
+}
+
+func cloneTeamAuditConfig(config *TeamAuditConfig) *TeamAuditConfig {
+	if config == nil {
+		return nil
+	}
+	clone := *config
+	return &clone
+}
+
+func cloneStoreRemote(remote StoreRemote) StoreRemote {
+	remote.TeamAudit = cloneTeamAuditConfig(remote.TeamAudit)
+	return remote
+}
+
+func cloneStoreRemotes(remotes []StoreRemote) []StoreRemote {
+	clones := make([]StoreRemote, len(remotes))
+	for i := range remotes {
+		clones[i] = cloneStoreRemote(remotes[i])
+	}
+	return clones
 }
 
 // ValidateSharedMountName rejects aliases that could address the default
@@ -965,7 +1340,67 @@ func GhRepoCreate(ctx context.Context, r Runner, owner, name string) ([]byte, er
 		return nil, fmt.Errorf("gh CLI not found — install via `brew install gh` and run `gh auth login`")
 	}
 	slug := owner + "/" + name
-	return r.Run(ctx, "gh", "repo", "create", slug, "--private", "--confirm")
+	return r.Run(ctx, "gh", "repo", "create", slug, "--private")
+}
+
+// RepoVisibility is GitHub's repository visibility enum.
+type RepoVisibility string
+
+const (
+	RepoVisibilityPrivate  RepoVisibility = "PRIVATE"
+	RepoVisibilityPublic   RepoVisibility = "PUBLIC"
+	RepoVisibilityInternal RepoVisibility = "INTERNAL"
+)
+
+// GhRepoVisibility returns the authenticated user's confirmed view of a
+// repository's visibility. A recognized GitHub not-found response is the only
+// case reported as exists=false; auth, network, API, and malformed-output
+// failures remain errors so security-sensitive callers can fail closed.
+func GhRepoVisibility(
+	ctx context.Context,
+	r Runner,
+	owner string,
+	name string,
+) (visibility RepoVisibility, exists bool, err error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	if _, err := exec.LookPath("gh"); err != nil {
+		return "", false, fmt.Errorf(
+			"gh CLI not found — install via `brew install gh`",
+		)
+	}
+	slug := owner + "/" + name
+	out, err := r.Run(
+		ctx,
+		"gh",
+		"repo",
+		"view",
+		slug,
+		"--json",
+		"visibility",
+		"--jq",
+		".visibility",
+	)
+	if err != nil {
+		if ghRepoNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("query repository visibility: %w", err)
+	}
+	visibility = RepoVisibility(
+		strings.ToUpper(strings.TrimSpace(string(out))),
+	)
+	switch visibility {
+	case RepoVisibilityPrivate,
+		RepoVisibilityPublic,
+		RepoVisibilityInternal:
+		return visibility, true, nil
+	default:
+		return "", false, errors.New(
+			"query repository visibility: unexpected response",
+		)
+	}
 }
 
 // GhCurrentUser returns the login name of the authenticated `gh` user.
@@ -998,11 +1433,17 @@ func GhRepoExists(ctx context.Context, r Runner, owner, name string) (bool, erro
 	if err != nil {
 		// `gh repo view` exits non-zero for „not found"; treat that as
 		// „does not exist" but surface other errors (auth, network).
-		msg := err.Error()
-		if strings.Contains(msg, "Could not resolve") || strings.Contains(msg, "not found") || strings.Contains(msg, "HTTP 404") {
+		if ghRepoNotFound(err) {
 			return false, nil
 		}
 		return false, err
 	}
 	return true, nil
+}
+
+func ghRepoNotFound(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "Could not resolve") ||
+		strings.Contains(message, "not found") ||
+		strings.Contains(message, "HTTP 404")
 }

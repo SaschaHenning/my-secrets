@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,6 +16,8 @@ import (
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
+	"github.com/SaschaHenning/my-secrets/internal/lockanchor"
+	"github.com/SaschaHenning/my-secrets/internal/policy"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
 	"github.com/spf13/cobra"
@@ -195,7 +199,10 @@ GPG-Schlüssel. team-keys.yaml im Store ordnet Fingerprints zu Personen.
 Die Entschlüsselung bleibt lokal und kann mys umgehen. Das Trust-Modell
 ist deshalb advisory; ein client-seitiges Read-Audit ist nicht erzwingbar.`,
 	}
-	root.AddCommand(syncSharedSetupCmd(requester))
+	root.AddCommand(
+		syncSharedSetupCmd(requester),
+		syncSharedAuditCmd(requester),
+	)
 	return root
 }
 
@@ -356,6 +363,1077 @@ func validateSyncSharedSetupOptions(opts syncSharedSetupOptions) error {
 		return errors.New("--remote oder --owner ist erforderlich")
 	}
 	return nil
+}
+
+var errSyncSharedAuditHumanOnly = errors.New(
+	"team audit setup requires a human caller in an interactive or explicitly human session",
+)
+
+const defaultTeamAuditRepo = "mys-audit"
+
+type syncSharedAuditSetupOptions struct {
+	Mount              string
+	SigningFingerprint string
+	RemoteURL          string
+	Owner              string
+	Repo               string
+	UseHTTPS           bool
+	Yes                bool
+}
+
+type syncSharedAuditSetupDeps struct {
+	Runner    syncpkg.Runner
+	Load      func(string) (*syncpkg.Config, error)
+	MountPath func(
+		context.Context,
+		syncpkg.Runner,
+		string,
+	) (string, error)
+	ResolveRemote func(
+		context.Context,
+		syncpkg.Runner,
+		*syncpkg.Config,
+		syncSharedAuditSetupOptions,
+		string,
+	) (string, error)
+	NewClient   newTeamAuditClientFunc
+	BeginPolicy func(
+		context.Context,
+		string,
+	) (syncSharedPolicyTransaction, error)
+	// EnsurePolicy remains as a compatibility seam for focused command tests.
+	// Production setup always uses BeginPolicy.
+	EnsurePolicy func(string) (string, error)
+	Update       func(
+		context.Context,
+		string,
+		string,
+		syncpkg.TeamAuditConfig,
+	) (*syncpkg.Config, error)
+	OpenAudit func() (*app.App, error)
+}
+
+func defaultSyncSharedAuditSetupDeps() syncSharedAuditSetupDeps {
+	return syncSharedAuditSetupDeps{
+		Runner:        syncpkg.ExecRunner{},
+		Load:          syncpkg.Load,
+		MountPath:     syncpkg.GopassMountPath,
+		ResolveRemote: ensureSyncSharedAuditRemote,
+		NewClient:     newDefaultTeamAuditClient,
+		BeginPolicy: func(
+			ctx context.Context,
+			mount string,
+		) (syncSharedPolicyTransaction, error) {
+			return policy.BeginSharedDefaultContext(ctx, mount)
+		},
+		EnsurePolicy: policy.EnsureSharedDefault,
+		Update:       syncpkg.UpdateSharedTeamAuditAndSave,
+		OpenAudit:    app.OpenAuditOnly,
+	}
+}
+
+type syncSharedPolicyTransaction interface {
+	Path() string
+	Verify() error
+	Commit() error
+	Rollback() error
+}
+
+type retainedSyncSharedPolicy struct {
+	path string
+}
+
+func (transaction retainedSyncSharedPolicy) Path() string {
+	return transaction.path
+}
+
+func (retainedSyncSharedPolicy) Verify() error {
+	return nil
+}
+
+func (retainedSyncSharedPolicy) Commit() error {
+	return nil
+}
+
+func (retainedSyncSharedPolicy) Rollback() error {
+	return nil
+}
+
+func syncSharedAuditCmd(requester *string) *cobra.Command {
+	root := &cobra.Command{
+		Use:   "audit",
+		Short: "GPG-signed advisory read-audit for shared mounts",
+		Long: `The team read-audit is advisory: recipients can still decrypt shared
+secrets outside mys with gpg or gopass, without creating an audit event.`,
+	}
+	root.AddCommand(syncSharedAuditSetupCmd(requester))
+	return root
+}
+
+func syncSharedAuditSetupCmd(requester *string) *cobra.Command {
+	options := syncSharedAuditSetupOptions{Repo: defaultTeamAuditRepo}
+	command := &cobra.Command{
+		Use:   "setup",
+		Short: "Provision a separate signed team-audit repository",
+		Long: `Provision a per-device append-only audit branch for one existing shared
+mount. This administrative command is human-only. The audit repository is
+configured only after the remote was provisioned and completely verified.`,
+		Args: cobra.NoArgs,
+		RunE: func(command *cobra.Command, args []string) error {
+			return runSyncSharedAuditSetup(
+				command.Context(),
+				command,
+				*requester,
+				options,
+				defaultSyncSharedAuditSetupDeps(),
+			)
+		},
+	}
+	command.Flags().StringVar(
+		&options.Mount,
+		"mount",
+		"",
+		"existing shared mount (required)",
+	)
+	command.Flags().StringVar(
+		&options.SigningFingerprint,
+		"fingerprint",
+		"",
+		"40-character primary GPG signing fingerprint (required)",
+	)
+	command.Flags().StringVar(
+		&options.RemoteURL,
+		"remote",
+		"",
+		"existing credential-free Git URL or absolute local bare-repo path",
+	)
+	command.Flags().StringVar(
+		&options.Owner,
+		"owner",
+		"",
+		"GitHub owner (default: owner from sync.yaml)",
+	)
+	command.Flags().StringVar(
+		&options.Repo,
+		"repo",
+		options.Repo,
+		"GitHub repository name when --remote is omitted",
+	)
+	command.Flags().BoolVar(
+		&options.UseHTTPS,
+		"https",
+		false,
+		"force HTTPS for a GitHub audit repository",
+	)
+	command.Flags().BoolVar(
+		&options.Yes,
+		"yes",
+		false,
+		"provision the sensitive audit configuration without confirmation",
+	)
+	return command
+}
+
+func runSyncSharedAuditSetup(
+	ctx context.Context,
+	command *cobra.Command,
+	requester string,
+	options syncSharedAuditSetupOptions,
+	deps syncSharedAuditSetupDeps,
+) error {
+	return runSyncSharedAuditSetupAs(
+		ctx,
+		command,
+		caller.Identify(requester),
+		options,
+		deps,
+	)
+}
+
+func runSyncSharedAuditSetupAs(
+	ctx context.Context,
+	command *cobra.Command,
+	detail caller.Detail,
+	options syncSharedAuditSetupOptions,
+	deps syncSharedAuditSetupDeps,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateSyncSharedAuditSetupDeps(deps); err != nil {
+		return err
+	}
+	localAudit, err := deps.OpenAudit()
+	if err != nil {
+		return fmt.Errorf("open audit log before team audit setup: %w", err)
+	}
+	defer localAudit.Close(ctx)
+
+	execution := syncSharedAuditExecution{
+		Context:    ctx,
+		Command:    command,
+		Detail:     detail,
+		Deps:       deps,
+		LocalAudit: localAudit,
+	}
+	return execution.Run(options)
+}
+
+type syncSharedAuditSetupState struct {
+	Options     syncSharedAuditSetupOptions
+	Fingerprint string
+	Config      *syncpkg.Config
+	Target      string
+}
+
+type syncSharedAuditExecution struct {
+	Context    context.Context
+	Command    *cobra.Command
+	Detail     caller.Detail
+	Deps       syncSharedAuditSetupDeps
+	LocalAudit *app.App
+}
+
+func (execution syncSharedAuditExecution) Run(
+	options syncSharedAuditSetupOptions,
+) error {
+	if execution.Detail.Kind != caller.KindHuman {
+		auditErr := writeSyncAuditStrict(
+			execution.Context,
+			execution.LocalAudit,
+			execution.Detail,
+			actionSyncSetup,
+			options.Mount,
+			audit.ResultDenied,
+			"non-human caller refused team audit setup",
+		)
+		return errors.Join(errSyncSharedAuditHumanOnly, auditErr)
+	}
+	state, err := prepareSyncSharedAuditSetup(options, execution.Deps)
+	if err != nil {
+		return execution.fail(
+			options.Mount,
+			"team audit setup preflight failed",
+			err,
+		)
+	}
+	confirmed, err := confirmSyncSharedAuditSetup(
+		execution.Command,
+		execution.Command.OutOrStdout(),
+		state,
+	)
+	if err != nil {
+		return execution.fail(state.Options.Mount, "confirmation failed", err)
+	}
+	if !confirmed {
+		return execution.decline(state.Options.Mount)
+	}
+	return execution.runConfirmed(state)
+}
+
+func (execution syncSharedAuditExecution) decline(mount string) error {
+	if err := writeSyncAuditStrict(
+		execution.Context,
+		execution.LocalAudit,
+		execution.Detail,
+		actionSyncSetup,
+		mount,
+		audit.ResultDenied,
+		"operator declined team audit setup",
+	); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(
+		execution.Command.OutOrStdout(),
+		"abgebrochen",
+	); err != nil {
+		return fmt.Errorf("write team audit cancellation: %w", err)
+	}
+	return nil
+}
+
+func (execution syncSharedAuditExecution) runConfirmed(
+	state syncSharedAuditSetupState,
+) error {
+	lockedContext, release, err := lockanchor.AcquireContext(
+		execution.Context,
+	)
+	if err != nil {
+		return execution.fail(
+			state.Options.Mount,
+			"team audit setup lock failed",
+			err,
+		)
+	}
+	execution.Context = lockedContext
+	if err := writeSyncAuditStrict(
+		execution.Context,
+		execution.LocalAudit,
+		execution.Detail,
+		actionSyncSetup,
+		state.Options.Mount,
+		audit.ResultStarted,
+		"team audit provisioning started",
+	); err != nil {
+		return errors.Join(err, release())
+	}
+
+	remoteURL, updated, operationErr := execution.runConfirmedUnderAnchor(
+		state,
+	)
+	releaseErr := release()
+	if operationErr != nil {
+		return errors.Join(operationErr, releaseErr)
+	}
+	if releaseErr != nil {
+		return execution.fail(
+			state.Options.Mount,
+			"team audit setup lock release failed",
+			releaseErr,
+		)
+	}
+	return execution.finish(state, remoteURL, updated)
+}
+
+func (execution syncSharedAuditExecution) runConfirmedUnderAnchor(
+	state syncSharedAuditSetupState,
+) (string, *syncpkg.Config, error) {
+	provisioned, err := provisionSyncSharedAudit(
+		execution.Context,
+		state,
+		execution.Deps,
+	)
+	if err != nil {
+		err = abortSyncSharedPolicy(provisioned.Policy, err)
+		return "", nil, execution.fail(
+			state.Options.Mount,
+			"team audit provisioning failed",
+			err,
+		)
+	}
+	updated, err := persistSyncSharedAudit(
+		execution.Context,
+		state.Options.Mount,
+		provisioned.RemoteURL,
+		state.Fingerprint,
+		execution.Deps,
+	)
+	if err != nil {
+		err = abortSyncSharedPolicy(provisioned.Policy, err)
+		return "", nil, execution.fail(
+			state.Options.Mount,
+			"sync config update failed after audit provisioning",
+			err,
+		)
+	}
+	if err := provisioned.Policy.Verify(); err != nil {
+		err = abortSyncSharedPolicy(
+			provisioned.Policy,
+			fmt.Errorf("verify shared policy before commit: %w", err),
+		)
+		return "", nil, execution.fail(
+			state.Options.Mount,
+			"shared policy verification failed after config update",
+			err,
+		)
+	}
+	if err := provisioned.Policy.Commit(); err != nil {
+		return "", nil, execution.fail(
+			state.Options.Mount,
+			"shared policy commit failed after config update",
+			fmt.Errorf("commit shared policy: %w", err),
+		)
+	}
+	return provisioned.RemoteURL, updated, nil
+}
+
+func (execution syncSharedAuditExecution) finish(
+	state syncSharedAuditSetupState,
+	remoteURL string,
+	updated *syncpkg.Config,
+) error {
+	if err := writeSyncAuditStrict(
+		execution.Context,
+		execution.LocalAudit,
+		execution.Detail,
+		actionSyncSetup,
+		state.Options.Mount,
+		audit.ResultOK,
+		"team audit provisioned and verified",
+	); err != nil {
+		return err
+	}
+	return reportSyncSharedAuditSetup(
+		execution.Command.OutOrStdout(),
+		state.Options.Mount,
+		remoteURL,
+		state.Fingerprint,
+		updated,
+	)
+}
+
+func (execution syncSharedAuditExecution) fail(
+	mount string,
+	stage string,
+	operationErr error,
+) error {
+	return joinTeamAuditSetupError(
+		execution.Context,
+		execution.LocalAudit,
+		execution.Detail,
+		mount,
+		stage,
+		operationErr,
+	)
+}
+
+func prepareSyncSharedAuditSetup(
+	options syncSharedAuditSetupOptions,
+	deps syncSharedAuditSetupDeps,
+) (syncSharedAuditSetupState, error) {
+	fingerprint, err := syncpkg.NormalizeTeamAuditFingerprint(
+		options.SigningFingerprint,
+	)
+	if err != nil {
+		return syncSharedAuditSetupState{}, err
+	}
+	if err := validateSyncSharedAuditSetupOptions(options); err != nil {
+		return syncSharedAuditSetupState{}, err
+	}
+	config, err := deps.Load("")
+	if err != nil {
+		return syncSharedAuditSetupState{}, fmt.Errorf(
+			"load sync config: %w",
+			err,
+		)
+	}
+	if !config.IsSharedMount(options.Mount) {
+		return syncSharedAuditSetupState{}, fmt.Errorf(
+			"mount %q is not freshly configured as shared",
+			options.Mount,
+		)
+	}
+	options.SigningFingerprint = fingerprint
+	target, err := syncSharedAuditTarget(config, options)
+	if err != nil {
+		return syncSharedAuditSetupState{}, err
+	}
+	return syncSharedAuditSetupState{
+		Options:     options,
+		Fingerprint: fingerprint,
+		Config:      config,
+		Target:      target,
+	}, nil
+}
+
+func confirmSyncSharedAuditSetup(
+	command *cobra.Command,
+	output io.Writer,
+	state syncSharedAuditSetupState,
+) (bool, error) {
+	if state.Options.Yes {
+		return true, nil
+	}
+	if _, err := fmt.Fprintln(
+		output,
+		"Team-Audit ist advisory: direkte Entschlüsselung außerhalb von mys bleibt unsichtbar.",
+	); err != nil {
+		return false, fmt.Errorf("write team audit confirmation: %w", err)
+	}
+	for _, line := range []string{
+		"Mount: " + state.Options.Mount,
+		"Audit-Remote: " + state.Target,
+		"Signing-Fingerprint: " + state.Fingerprint,
+	} {
+		if _, err := fmt.Fprintln(output, line); err != nil {
+			return false, fmt.Errorf("write team audit confirmation: %w", err)
+		}
+	}
+	return syncpkg.PromptYesNo(
+		bufio.NewReader(command.InOrStdin()),
+		output,
+		"Signiertes Team-Audit jetzt provisionieren?",
+		false,
+	)
+}
+
+func provisionSyncSharedAudit(
+	ctx context.Context,
+	state syncSharedAuditSetupState,
+	deps syncSharedAuditSetupDeps,
+) (syncSharedAuditProvision, error) {
+	storePath, err := deps.MountPath(
+		ctx,
+		deps.Runner,
+		state.Options.Mount,
+	)
+	if err != nil {
+		return syncSharedAuditProvision{}, fmt.Errorf(
+			"resolve live shared store: %w",
+			err,
+		)
+	}
+	remoteURL, err := deps.ResolveRemote(
+		ctx,
+		deps.Runner,
+		state.Config,
+		state.Options,
+		state.Fingerprint,
+	)
+	if err != nil {
+		return syncSharedAuditProvision{}, fmt.Errorf(
+			"provision audit remote: %w",
+			err,
+		)
+	}
+	client, err := deps.NewClient(
+		state.Options.Mount,
+		remoteURL,
+		state.Fingerprint,
+		storePath,
+	)
+	if err != nil {
+		return syncSharedAuditProvision{}, fmt.Errorf(
+			"configure team audit: %w",
+			err,
+		)
+	}
+	transaction, err := beginSyncSharedPolicy(
+		ctx,
+		state.Options.Mount,
+		deps,
+	)
+	if err != nil {
+		return syncSharedAuditProvision{}, fmt.Errorf(
+			"initialize shared policy: %w",
+			err,
+		)
+	}
+	provisioned := syncSharedAuditProvision{
+		RemoteURL: remoteURL,
+		Policy:    transaction,
+	}
+	if err := client.Provision(ctx); err != nil {
+		return provisioned, err
+	}
+	return provisioned, nil
+}
+
+type syncSharedAuditProvision struct {
+	RemoteURL string
+	Policy    syncSharedPolicyTransaction
+}
+
+func beginSyncSharedPolicy(
+	ctx context.Context,
+	mount string,
+	deps syncSharedAuditSetupDeps,
+) (syncSharedPolicyTransaction, error) {
+	if deps.BeginPolicy != nil {
+		transaction, err := deps.BeginPolicy(ctx, mount)
+		if transaction != nil && err != nil {
+			return nil, abortSyncSharedPolicy(transaction, err)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if transaction == nil {
+			return nil, errors.New(
+				"shared policy transaction returned no policy path",
+			)
+		}
+		if transaction.Path() == "" {
+			return nil, abortSyncSharedPolicy(
+				transaction,
+				errors.New(
+					"shared policy transaction returned no policy path",
+				),
+			)
+		}
+		return transaction, nil
+	}
+	path, err := deps.EnsurePolicy(mount)
+	if err != nil {
+		return nil, err
+	}
+	if path == "" {
+		return nil, errors.New("shared policy setup returned no policy path")
+	}
+	return retainedSyncSharedPolicy{path: path}, nil
+}
+
+func abortSyncSharedPolicy(
+	transaction syncSharedPolicyTransaction,
+	operationErr error,
+) error {
+	if transaction == nil {
+		return operationErr
+	}
+	abortErr := transaction.Rollback()
+	if abortErr == nil {
+		return operationErr
+	}
+	return errors.Join(
+		operationErr,
+		fmt.Errorf("release shared policy setup lock after failure: %w", abortErr),
+	)
+}
+
+func persistSyncSharedAudit(
+	ctx context.Context,
+	mount string,
+	remoteURL string,
+	fingerprint string,
+	deps syncSharedAuditSetupDeps,
+) (*syncpkg.Config, error) {
+	_, updateErr := deps.Update(
+		ctx,
+		"",
+		mount,
+		syncpkg.TeamAuditConfig{
+			URL:                remoteURL,
+			SigningFingerprint: fingerprint,
+		},
+	)
+	persisted, loadErr := deps.Load("")
+	if loadErr != nil {
+		return nil, errors.Join(
+			updateErr,
+			fmt.Errorf("reload persisted sync config: %w", loadErr),
+		)
+	}
+	if persisted == nil {
+		return nil, errors.Join(
+			updateErr,
+			errors.New("reload persisted sync config returned nil state"),
+		)
+	}
+	remote, ok := persisted.Remote(mount)
+	if !ok || remote.TeamAudit == nil ||
+		remote.TeamAudit.URL != remoteURL ||
+		remote.TeamAudit.SigningFingerprint != fingerprint {
+		return nil, errors.Join(
+			updateErr,
+			errors.New(
+				"persisted team audit config does not match requested state",
+			),
+		)
+	}
+	return persisted, nil
+}
+
+func reportSyncSharedAuditSetup(
+	output io.Writer,
+	mount string,
+	remoteURL string,
+	fingerprint string,
+	updated *syncpkg.Config,
+) error {
+	if updated == nil {
+		return errors.New("team audit config update returned nil state")
+	}
+	configPath, err := syncpkg.DefaultPath()
+	if err != nil {
+		return fmt.Errorf("resolve sync config path: %w", err)
+	}
+	for _, line := range []string{
+		"Team-Audit für " + mount + " bereit.",
+		"Audit-Remote: " + remoteURL,
+		"Signing-Fingerprint: " + fingerprint,
+		"Sync-Konfiguration gespeichert: " + configPath,
+	} {
+		if _, err := fmt.Fprintln(output, line); err != nil {
+			return fmt.Errorf("write team audit setup result: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateSyncSharedAuditSetupDeps(
+	deps syncSharedAuditSetupDeps,
+) error {
+	if deps.Load == nil ||
+		deps.MountPath == nil ||
+		deps.BeginPolicy == nil && deps.EnsurePolicy == nil ||
+		deps.ResolveRemote == nil ||
+		deps.NewClient == nil ||
+		deps.Update == nil ||
+		deps.OpenAudit == nil {
+		return errors.New("team audit setup dependencies are incomplete")
+	}
+	return nil
+}
+
+func validateSyncSharedAuditSetupOptions(
+	options syncSharedAuditSetupOptions,
+) error {
+	if err := syncpkg.ValidateSharedMountName(options.Mount); err != nil {
+		return err
+	}
+	hasRemote := strings.TrimSpace(options.RemoteURL) != ""
+	hasOwner := strings.TrimSpace(options.Owner) != ""
+	if hasRemote && hasOwner {
+		return errors.New("--remote and --owner are mutually exclusive")
+	}
+	if hasRemote && options.UseHTTPS {
+		return errors.New("--https applies only when --remote is omitted")
+	}
+	if hasRemote &&
+		strings.TrimSpace(options.Repo) != "" &&
+		strings.TrimSpace(options.Repo) != defaultTeamAuditRepo {
+		return errors.New("--repo applies only when --remote is omitted")
+	}
+	return nil
+}
+
+func syncSharedAuditTarget(
+	config *syncpkg.Config,
+	options syncSharedAuditSetupOptions,
+) (string, error) {
+	if remoteURL := strings.TrimSpace(options.RemoteURL); remoteURL != "" {
+		candidate := syncpkg.TeamAuditConfig{
+			URL:                remoteURL,
+			SigningFingerprint: options.SigningFingerprint,
+		}
+		if err := validateTeamAuditCandidate(
+			config,
+			options.Mount,
+			candidate,
+		); err != nil {
+			return "", err
+		}
+		return remoteURL, nil
+	}
+	owner := strings.TrimSpace(options.Owner)
+	if owner == "" && config != nil {
+		owner = strings.TrimSpace(config.Owner)
+	}
+	repo := strings.TrimSpace(options.Repo)
+	if repo == "" {
+		repo = defaultTeamAuditRepo
+	}
+	if err := validateGitHubAuditComponent("owner", owner, 39); err != nil {
+		return "", err
+	}
+	if err := validateGitHubAuditComponent("repository", repo, 100); err != nil {
+		return "", err
+	}
+	return owner + "/" + repo, nil
+}
+
+func validateGitHubAuditComponent(
+	label string,
+	value string,
+	limit int,
+) error {
+	if value == "" || len(value) > limit ||
+		strings.HasPrefix(value, ".") ||
+		strings.HasSuffix(value, ".") ||
+		strings.HasPrefix(value, "-") ||
+		strings.HasSuffix(value, "-") ||
+		strings.Contains(value, "..") {
+		return fmt.Errorf("GitHub %s is invalid", label)
+	}
+	for _, character := range value {
+		valid := character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '-' ||
+			label == "repository" && (character == '_' || character == '.')
+		if !valid {
+			return fmt.Errorf("GitHub %s is invalid", label)
+		}
+	}
+	return nil
+}
+
+func ensureSyncSharedAuditRemote(
+	ctx context.Context,
+	runner syncpkg.Runner,
+	config *syncpkg.Config,
+	options syncSharedAuditSetupOptions,
+	fingerprint string,
+) (string, error) {
+	if remoteURL := strings.TrimSpace(options.RemoteURL); remoteURL != "" {
+		return ensureDirectSharedAuditRemote(
+			ctx,
+			runner,
+			config,
+			options.Mount,
+			remoteURL,
+			fingerprint,
+		)
+	}
+	return ensureManagedSharedAuditRemote(
+		ctx,
+		runner,
+		config,
+		options,
+		fingerprint,
+	)
+}
+
+func ensureManagedSharedAuditRemote(
+	ctx context.Context,
+	runner syncpkg.Runner,
+	config *syncpkg.Config,
+	options syncSharedAuditSetupOptions,
+	fingerprint string,
+) (string, error) {
+	owner := strings.TrimSpace(options.Owner)
+	if owner == "" && config != nil {
+		owner = strings.TrimSpace(config.Owner)
+	}
+	repo := strings.TrimSpace(options.Repo)
+	if repo == "" {
+		repo = defaultTeamAuditRepo
+	}
+	if err := validateGitHubAuditComponent("owner", owner, 39); err != nil {
+		return "", err
+	}
+	if err := validateGitHubAuditComponent("repository", repo, 100); err != nil {
+		return "", err
+	}
+	var style syncpkg.RemoteStyle
+	if options.UseHTTPS {
+		style = syncpkg.RemoteHTTPS
+	} else {
+		style = syncpkg.DetectRemoteStyle(ctx, runner)
+	}
+	remoteURL, err := syncpkg.BuildRemoteURL(style, owner, repo)
+	if err != nil {
+		return "", err
+	}
+	auditConfig := syncpkg.TeamAuditConfig{
+		URL:                remoteURL,
+		SigningFingerprint: fingerprint,
+	}
+	if err := validateTeamAuditCandidate(
+		config,
+		options.Mount,
+		auditConfig,
+	); err != nil {
+		return "", err
+	}
+	if err := ensurePrivateGitHubAuditRepo(
+		ctx,
+		runner,
+		owner,
+		repo,
+		true,
+	); err != nil {
+		return "", err
+	}
+	return remoteURL, nil
+}
+
+func ensureDirectSharedAuditRemote(
+	ctx context.Context,
+	runner syncpkg.Runner,
+	config *syncpkg.Config,
+	mount string,
+	remoteURL string,
+	fingerprint string,
+) (string, error) {
+	auditConfig := syncpkg.TeamAuditConfig{
+		URL:                remoteURL,
+		SigningFingerprint: fingerprint,
+	}
+	if err := validateTeamAuditCandidate(
+		config,
+		mount,
+		auditConfig,
+	); err != nil {
+		return "", err
+	}
+	owner, repo, isGitHub, err := parseGitHubAuditRemote(remoteURL)
+	if err != nil {
+		return "", err
+	}
+	if isGitHub {
+		if err := ensurePrivateGitHubAuditRepo(
+			ctx,
+			runner,
+			owner,
+			repo,
+			false,
+		); err != nil {
+			return "", err
+		}
+	}
+	return remoteURL, nil
+}
+
+func ensurePrivateGitHubAuditRepo(
+	ctx context.Context,
+	runner syncpkg.Runner,
+	owner string,
+	repo string,
+	create bool,
+) error {
+	visibility, exists, err := syncpkg.GhRepoVisibility(
+		ctx,
+		runner,
+		owner,
+		repo,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"check audit repository %s/%s: %w",
+			owner,
+			repo,
+			err,
+		)
+	}
+	if !exists {
+		visibility, err = createAndConfirmPrivateGitHubAuditRepo(
+			ctx,
+			runner,
+			owner,
+			repo,
+			create,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	if visibility != syncpkg.RepoVisibilityPrivate {
+		return fmt.Errorf(
+			"audit repository %s/%s must be PRIVATE, got %s",
+			owner,
+			repo,
+			visibility,
+		)
+	}
+	return nil
+}
+
+func createAndConfirmPrivateGitHubAuditRepo(
+	ctx context.Context,
+	runner syncpkg.Runner,
+	owner string,
+	repo string,
+	create bool,
+) (syncpkg.RepoVisibility, error) {
+	if !create {
+		return "", fmt.Errorf(
+			"check audit repository %s/%s: repository is unavailable",
+			owner,
+			repo,
+		)
+	}
+	if _, err := syncpkg.GhRepoCreate(ctx, runner, owner, repo); err != nil {
+		return "", fmt.Errorf(
+			"create private audit repository %s/%s: %w",
+			owner,
+			repo,
+			err,
+		)
+	}
+	visibility, exists, err := syncpkg.GhRepoVisibility(
+		ctx,
+		runner,
+		owner,
+		repo,
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"confirm private audit repository %s/%s: %w",
+			owner,
+			repo,
+			err,
+		)
+	}
+	if !exists {
+		return "", fmt.Errorf(
+			"confirm private audit repository %s/%s: repository is unavailable after creation",
+			owner,
+			repo,
+		)
+	}
+	return visibility, nil
+}
+
+func parseGitHubAuditRemote(
+	remoteURL string,
+) (owner string, repo string, isGitHub bool, err error) {
+	var remotePath string
+	if strings.HasPrefix(strings.ToLower(remoteURL), "git@github.com:") {
+		remotePath = remoteURL[len("git@github.com:"):]
+	} else {
+		parsed, parseErr := url.Parse(remoteURL)
+		if parseErr != nil || !strings.EqualFold(parsed.Hostname(), "github.com") {
+			return "", "", false, nil
+		}
+		remotePath = parsed.Path
+	}
+	segments := strings.Split(strings.Trim(remotePath, "/"), "/")
+	if len(segments) != 2 {
+		return "", "", true, errors.New(
+			"GitHub audit remote must identify exactly one owner and repository",
+		)
+	}
+	owner = segments[0]
+	repo = strings.TrimSuffix(segments[1], ".git")
+	if err := validateGitHubAuditComponent("owner", owner, 39); err != nil {
+		return "", "", true, err
+	}
+	if err := validateGitHubAuditComponent("repository", repo, 100); err != nil {
+		return "", "", true, err
+	}
+	return owner, repo, true, nil
+}
+
+func validateTeamAuditCandidate(
+	config *syncpkg.Config,
+	mount string,
+	auditConfig syncpkg.TeamAuditConfig,
+) error {
+	if config == nil {
+		return errors.New("sync config is unavailable")
+	}
+	candidate := *config
+	candidate.Remotes = append(
+		[]syncpkg.StoreRemote(nil),
+		config.Remotes...,
+	)
+	found := false
+	for index := range candidate.Remotes {
+		if candidate.Remotes[index].Mount != mount {
+			continue
+		}
+		copy := auditConfig
+		candidate.Remotes[index].TeamAudit = &copy
+		found = true
+		break
+	}
+	if !found {
+		return fmt.Errorf("shared mount %q is not configured", mount)
+	}
+	if err := candidate.Validate(); err != nil {
+		return fmt.Errorf("validate team audit target: %w", err)
+	}
+	return nil
+}
+
+func joinTeamAuditSetupError(
+	ctx context.Context,
+	localAudit *app.App,
+	detail caller.Detail,
+	mount string,
+	stage string,
+	operationErr error,
+) error {
+	auditErr := writeSyncAuditStrict(
+		ctx,
+		localAudit,
+		detail,
+		actionSyncSetup,
+		mount,
+		audit.ResultError,
+		stage,
+	)
+	return errors.Join(operationErr, auditErr)
 }
 
 func filterSharedMounts(orgs []string, cfg *syncpkg.Config) []string {

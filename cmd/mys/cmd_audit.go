@@ -145,7 +145,7 @@ func auditCmd() *cobra.Command {
 	verify.Flags().BoolVar(&checkSignatures, "signatures", false,
 		"verify Ed25519 hash-chain signatures (requires MYS_AUDIT_SIGN-written rows)")
 
-	root.AddCommand(tail, since, verify)
+	root.AddCommand(tail, since, verify, auditTeamCmd())
 	return root
 }
 

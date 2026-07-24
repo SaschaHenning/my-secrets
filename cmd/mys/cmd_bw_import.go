@@ -89,11 +89,13 @@ master password from the store). AI callers cannot invoke this command.`,
 			}
 			defer release()
 			if opts.Mount != "" {
-				releaseMount, lockErr := syncpkg.AcquireMountLock(ctx, opts.Mount)
+				lockedContext, releaseMount, lockErr :=
+					syncpkg.AcquireMountLockContext(ctx, opts.Mount)
 				if lockErr != nil {
 					return lockErr
 				}
 				defer func() { _ = releaseMount() }()
+				ctx = lockedContext
 				opts.SyncRunner = syncpkg.ExecRunner{}
 			}
 			a, err := app.Open(ctx, *requester)

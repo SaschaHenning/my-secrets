@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -312,7 +313,16 @@ func TestConfigRoundTrip(t *testing.T) {
 		Layout:  LayoutPerOrg,
 		Owner:   "alice",
 		Remotes: []StoreRemote{
-			{Mount: "jasp", URL: "git@github.com:alice/jasp-secrets.git", LastSync: now, Shared: true},
+			{
+				Mount:    "jasp",
+				URL:      "git@github.com:alice/jasp-secrets.git",
+				LastSync: now,
+				Shared:   true,
+				TeamAudit: &TeamAuditConfig{
+					URL:                "git@github.com:alice/jasp-audit.git",
+					SigningFingerprint: strings.Repeat("A", 40),
+				},
+			},
 			{Mount: "zuhause", URL: "https://github.com/alice/zuhause-secrets.git"},
 		},
 	}
@@ -342,12 +352,156 @@ func TestConfigRoundTrip(t *testing.T) {
 	if !out.Remotes[0].Shared {
 		t.Error("shared marker did not round-trip")
 	}
+	if out.Remotes[0].TeamAudit == nil ||
+		out.Remotes[0].TeamAudit.URL != in.Remotes[0].TeamAudit.URL ||
+		out.Remotes[0].TeamAudit.SigningFingerprint !=
+			in.Remotes[0].TeamAudit.SigningFingerprint {
+		t.Fatalf("team_audit did not round-trip: %+v", out.Remotes[0].TeamAudit)
+	}
 	if out.Remotes[1].Shared {
 		t.Error("personal remote unexpectedly became shared")
 	}
 }
 
+func TestNormalizeTeamAuditFingerprint(t *testing.T) {
+	const lower = "0123456789abcdef0123456789abcdef01234567"
+	got, err := NormalizeTeamAuditFingerprint("  " + lower + "  ")
+	if err != nil {
+		t.Fatalf("NormalizeTeamAuditFingerprint: %v", err)
+	}
+	if want := strings.ToUpper(lower); got != want {
+		t.Fatalf("fingerprint = %q, want %q", got, want)
+	}
+
+	for _, invalid := range []string{
+		"",
+		"1234",
+		strings.Repeat("G", 40),
+		strings.Repeat("A", 39),
+		strings.Repeat("A", 41),
+	} {
+		t.Run(invalid, func(t *testing.T) {
+			if _, err := NormalizeTeamAuditFingerprint(invalid); err == nil {
+				t.Fatalf("expected %q to be rejected", invalid)
+			}
+		})
+	}
+}
+
+func TestGhRepoVisibilityFailsClosed(t *testing.T) {
+	binaryDir := t.TempDir()
+	ghPath := filepath.Join(binaryDir, "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binaryDir)
+
+	tests := []struct {
+		name           string
+		response       scriptedResult
+		wantVisibility RepoVisibility
+		wantExists     bool
+		wantError      bool
+	}{
+		{
+			name:           "private",
+			response:       scriptedResult{out: []byte("PRIVATE\n")},
+			wantVisibility: RepoVisibilityPrivate,
+			wantExists:     true,
+		},
+		{
+			name:           "public",
+			response:       scriptedResult{out: []byte("PUBLIC\n")},
+			wantVisibility: RepoVisibilityPublic,
+			wantExists:     true,
+		},
+		{
+			name:           "internal",
+			response:       scriptedResult{out: []byte("INTERNAL\n")},
+			wantVisibility: RepoVisibilityInternal,
+			wantExists:     true,
+		},
+		{
+			name:     "not found",
+			response: scriptedResult{err: errors.New("HTTP 404")},
+		},
+		{
+			name:      "API error",
+			response:  scriptedResult{err: errors.New("API unavailable")},
+			wantError: true,
+		},
+		{
+			name:      "unexpected output",
+			response:  scriptedResult{out: []byte("UNKNOWN\n")},
+			wantError: true,
+		},
+		{
+			name:      "empty output",
+			response:  scriptedResult{},
+			wantError: true,
+		},
+	}
+	const command = "gh repo view jasp/mys-audit --json visibility --jq .visibility"
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &scriptedRunner{results: map[string]scriptedResult{
+				command: test.response,
+			}}
+			visibility, exists, err := GhRepoVisibility(
+				context.Background(),
+				runner,
+				"jasp",
+				"mys-audit",
+			)
+			if (err != nil) != test.wantError {
+				t.Fatalf("error = %v, wantError=%v", err, test.wantError)
+			}
+			if visibility != test.wantVisibility || exists != test.wantExists {
+				t.Fatalf(
+					"visibility = %q exists=%v, want %q exists=%v",
+					visibility,
+					exists,
+					test.wantVisibility,
+					test.wantExists,
+				)
+			}
+		})
+	}
+}
+
+func TestGhRepoCreateUsesPrivateNonInteractiveArguments(t *testing.T) {
+	binaryDir := t.TempDir()
+	ghPath := filepath.Join(binaryDir, "gh")
+	if err := os.WriteFile(ghPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binaryDir)
+
+	runner := &scriptedRunner{results: map[string]scriptedResult{
+		"gh repo create jasp/mys-audit --private": {
+			out: []byte("created\n"),
+		},
+	}}
+	if _, err := GhRepoCreate(
+		context.Background(),
+		runner,
+		"jasp",
+		"mys-audit",
+	); err != nil {
+		t.Fatalf("GhRepoCreate: %v", err)
+	}
+	if len(runner.calls) != 1 ||
+		strings.Join(runner.calls[0], " ") !=
+			"gh repo create jasp/mys-audit --private" {
+		t.Fatalf("create calls = %v", runner.calls)
+	}
+}
+
 func TestConfigValidation(t *testing.T) {
+	validAudit := &TeamAuditConfig{
+		URL:                "file:///tmp/jasp-audit.git",
+		SigningFingerprint: strings.Repeat("A", 40),
+	}
 	tests := []struct {
 		name string
 		cfg  *Config
@@ -385,6 +539,83 @@ func TestConfigValidation(t *testing.T) {
 			name: "valid shared mount",
 			cfg:  &Config{Remotes: []StoreRemote{{Mount: "jasp", Shared: true}}},
 		},
+		{
+			name: "team audit requires shared mount",
+			cfg: &Config{Remotes: []StoreRemote{{
+				Mount: "jasp", URL: "file:///tmp/store.git", TeamAudit: validAudit,
+			}}},
+			want: "team audit",
+		},
+		{
+			name: "root cannot have team audit",
+			cfg: &Config{Remotes: []StoreRemote{{
+				Mount: DefaultStoreMount, URL: "file:///tmp/store.git",
+				Shared: true, TeamAudit: validAudit,
+			}}},
+			want: "root",
+		},
+		{
+			name: "team audit url required",
+			cfg: &Config{Remotes: []StoreRemote{{
+				Mount: "jasp", URL: "file:///tmp/store.git", Shared: true,
+				TeamAudit: &TeamAuditConfig{
+					SigningFingerprint: strings.Repeat("A", 40),
+				},
+			}}},
+			want: "team audit",
+		},
+		{
+			name: "team audit fingerprint required",
+			cfg: &Config{Remotes: []StoreRemote{{
+				Mount: "jasp", URL: "file:///tmp/store.git", Shared: true,
+				TeamAudit: &TeamAuditConfig{URL: "file:///tmp/audit.git"},
+			}}},
+			want: "fingerprint",
+		},
+		{
+			name: "team audit fingerprint must be canonical uppercase",
+			cfg: &Config{Remotes: []StoreRemote{{
+				Mount: "jasp", URL: "file:///tmp/store.git", Shared: true,
+				TeamAudit: &TeamAuditConfig{
+					URL:                "file:///tmp/audit.git",
+					SigningFingerprint: strings.Repeat("a", 40),
+				},
+			}}},
+			want: "fingerprint",
+		},
+		{
+			name: "team audit repo differs from store repo",
+			cfg: &Config{Remotes: []StoreRemote{{
+				Mount: "jasp", URL: "file:///tmp/store.git", Shared: true,
+				TeamAudit: &TeamAuditConfig{
+					URL:                "file:///tmp/store.git",
+					SigningFingerprint: strings.Repeat("A", 40),
+				},
+			}}},
+			want: "must differ",
+		},
+		{
+			name: "team audit local repo differs across url styles",
+			cfg: &Config{Remotes: []StoreRemote{{
+				Mount: "jasp", URL: "file:///tmp/store.git", Shared: true,
+				TeamAudit: &TeamAuditConfig{
+					URL:                "/tmp/store.git",
+					SigningFingerprint: strings.Repeat("A", 40),
+				},
+			}}},
+			want: "must differ",
+		},
+		{
+			name: "team audit network repo differs across url styles",
+			cfg: &Config{Remotes: []StoreRemote{{
+				Mount: "jasp", URL: "git@github.com:jasp/audit.git", Shared: true,
+				TeamAudit: &TeamAuditConfig{
+					URL:                "ssh://git@github.com/jasp/audit",
+					SigningFingerprint: strings.Repeat("A", 40),
+				},
+			}}},
+			want: "must differ",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -402,8 +633,82 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+func TestTeamAuditURLValidation(t *testing.T) {
+	const fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567"
+	valid := []string{
+		"/tmp/jasp-audit.git",
+		"file:///tmp/jasp-audit.git",
+		"https://github.com/jasp/audit.git",
+		"ssh://git@github.com/jasp/audit.git",
+		"git@github.com:jasp/audit.git",
+	}
+	for _, auditURL := range valid {
+		t.Run("valid "+auditURL, func(t *testing.T) {
+			cfg := &Config{Remotes: []StoreRemote{{
+				Mount: "jasp", URL: "file:///tmp/jasp-store.git", Shared: true,
+				TeamAudit: &TeamAuditConfig{
+					URL: auditURL, SigningFingerprint: fingerprint,
+				},
+			}}}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate(%q): %v", auditURL, err)
+			}
+		})
+	}
+
+	invalid := []string{
+		"/",
+		"relative/audit.git",
+		"http://github.com/jasp/audit.git",
+		"https://token@github.com/jasp/audit.git",
+		"https://user:secret@github.com/jasp/audit.git",
+		"https://github.com/jasp/audit.git?token=secret",
+		"https://github.com/jasp/audit.git#fragment",
+		"https:///jasp/audit.git",
+		"ssh://git:secret@github.com/jasp/audit.git",
+		"ssh:///jasp/audit.git",
+		"ssh://bad$user@github.com/jasp/audit.git",
+		"ssh://git@github.com/jasp/../audit.git",
+		"file://remotehost/tmp/audit.git",
+		"file:///",
+		"file:audit.git",
+		"file:///tmp/../audit.git",
+		"ext::sh -c exploit",
+		"-upload-pack=exploit",
+		"git@github.com:",
+		"git@github.com:jasp/../audit.git",
+		"git@github.com:jasp/audit;touch-pwned.git",
+		"git@github.com:jasp/audit.git\n--upload-pack=exploit",
+	}
+	for _, auditURL := range invalid {
+		t.Run("invalid "+auditURL, func(t *testing.T) {
+			cfg := &Config{Remotes: []StoreRemote{{
+				Mount: "jasp", URL: "file:///tmp/jasp-store.git", Shared: true,
+				TeamAudit: &TeamAuditConfig{
+					URL: auditURL, SigningFingerprint: fingerprint,
+				},
+			}}}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected %q to be rejected", auditURL)
+			}
+			for _, sensitive := range []string{
+				auditURL, "token", "secret", "exploit",
+			} {
+				if sensitive != "" && strings.Contains(err.Error(), sensitive) {
+					t.Fatalf("error disclosed rejected input %q: %v", sensitive, err)
+				}
+			}
+		})
+	}
+}
+
 func TestMergeSharedFrom(t *testing.T) {
 	now := time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC)
+	audit := &TeamAuditConfig{
+		URL:                "file:///tmp/audit.git",
+		SigningFingerprint: strings.Repeat("A", 40),
+	}
 	tests := []struct {
 		name     string
 		current  *Config
@@ -424,7 +729,10 @@ func TestMergeSharedFrom(t *testing.T) {
 				Layout:   LayoutPerOrg,
 				Remotes: []StoreRemote{
 					{Mount: "old-personal", URL: "old.git"},
-					{Mount: "jasp", URL: "shared.git", Shared: true, LastSync: now},
+					{
+						Mount: "jasp", URL: "shared.git", Shared: true,
+						LastSync: now, TeamAudit: audit,
+					},
 				},
 			},
 			check: func(t *testing.T, got *Config) {
@@ -436,6 +744,24 @@ func TestMergeSharedFrom(t *testing.T) {
 				if !ok || !shared.Shared || shared.URL != "shared.git" ||
 					!shared.LastSync.Equal(now) {
 					t.Fatalf("preserved shared remote = %+v", shared)
+				}
+				if shared.TeamAudit == nil ||
+					shared.TeamAudit.URL != "file:///tmp/audit.git" {
+					t.Fatalf("preserved team audit = %+v", shared.TeamAudit)
+				}
+				var mergedAudit *TeamAuditConfig
+				for i := range got.Remotes {
+					if got.Remotes[i].Mount == "jasp" {
+						mergedAudit = got.Remotes[i].TeamAudit
+						break
+					}
+				}
+				if mergedAudit == nil {
+					t.Fatal("merged team audit was not retained")
+				}
+				mergedAudit.URL = "file:///tmp/mutated.git"
+				if audit.URL != "file:///tmp/audit.git" {
+					t.Fatal("MergeSharedFrom aliased the previous team-audit pointer")
 				}
 				if _, ok := got.Remote("old-personal"); ok {
 					t.Fatal("stale personal remote was preserved")
@@ -490,6 +816,39 @@ func TestMergeSharedFrom(t *testing.T) {
 	}
 }
 
+func TestRemoteReturnsDeepCopy(t *testing.T) {
+	cfg := &Config{Remotes: []StoreRemote{{
+		Mount: "jasp", URL: "file:///tmp/store.git", Shared: true,
+		TeamAudit: &TeamAuditConfig{
+			URL:                "file:///tmp/audit.git",
+			SigningFingerprint: strings.Repeat("A", 40),
+		},
+	}}}
+	remote, ok := cfg.Remote("jasp")
+	if !ok {
+		t.Fatal("Remote did not find configured mount")
+	}
+	remote.TeamAudit.URL = "file:///tmp/mutated.git"
+	if cfg.Remotes[0].TeamAudit.URL != "file:///tmp/audit.git" {
+		t.Fatal("Remote returned an aliased team-audit pointer")
+	}
+}
+
+func TestCloneStoreRemotesDeepCopiesTeamAudit(t *testing.T) {
+	original := []StoreRemote{{
+		Mount: "jasp", URL: "file:///tmp/store.git", Shared: true,
+		TeamAudit: &TeamAuditConfig{
+			URL:                "file:///tmp/audit.git",
+			SigningFingerprint: strings.Repeat("A", 40),
+		},
+	}}
+	cloned := cloneStoreRemotes(original)
+	cloned[0].TeamAudit.URL = "file:///tmp/mutated.git"
+	if original[0].TeamAudit.URL != "file:///tmp/audit.git" {
+		t.Fatal("cloneStoreRemotes aliased the team-audit pointer")
+	}
+}
+
 func TestLoadRejectsDuplicateMounts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.yaml")
 	body := []byte("version: 1\nlayout: per-org\nremotes:\n" +
@@ -502,6 +861,89 @@ func TestLoadRejectsDuplicateMounts(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("Load error = %v, want duplicate mount error", err)
 	}
+}
+
+func TestLoadRejectsUnsafeYAML(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unknown top-level field",
+			body: "version: 1\nlayout: per-org\nremotes: []\nlayuot: single\n",
+		},
+		{
+			name: "unknown nested field",
+			body: "version: 1\nremotes:\n" +
+				"  - mount: jasp\n    url: /tmp/store.git\n    shraed: true\n",
+		},
+		{
+			name: "unknown team audit field",
+			body: "version: 1\nremotes:\n" +
+				"  - mount: jasp\n    url: /tmp/store.git\n    shared: true\n" +
+				"    team_audit:\n      url: /tmp/audit.git\n" +
+				"      signing_fingeprint: " + strings.Repeat("A", 40) + "\n",
+		},
+		{
+			name: "duplicate key",
+			body: "version: 1\nversion: 1\nremotes: []\n",
+		},
+		{
+			name: "multiple documents",
+			body: "version: 1\nremotes: []\n---\nversion: 1\nremotes: []\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "sync.yaml")
+			if err := os.WriteFile(path, []byte(test.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("Load accepted %s", test.name)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnsafeFiles(t *testing.T) {
+	t.Run("oversized", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "sync.yaml")
+		if err := os.WriteFile(
+			path, make([]byte, maxSyncConfigBytes+1), 0o600,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil ||
+			!strings.Contains(err.Error(), "too large") {
+			t.Fatalf("Load oversized error = %v", err)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target.yaml")
+		link := filepath.Join(dir, "sync.yaml")
+		if err := os.WriteFile(
+			target, []byte("version: 1\nremotes: []\n"), 0o600,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(link); err == nil ||
+			!strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("Load symlink error = %v", err)
+		}
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		if _, err := Load(t.TempDir()); err == nil ||
+			!strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("Load directory error = %v", err)
+		}
+	})
 }
 
 func TestSaveUpgradesLegacyConfigWithoutRevision(t *testing.T) {
@@ -728,6 +1170,177 @@ func TestMarkSharedSyncedAndSaveFailsWhenMountChangedToPersonal(t *testing.T) {
 	remote, ok := persisted.Remote("jasp-shared")
 	if !ok || !remote.LastSync.IsZero() {
 		t.Fatalf("personal mount was stamped: %+v", persisted.Remotes)
+	}
+}
+
+func TestUpdateSharedTeamAuditAndSaveMergesFreshConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.yaml")
+	initial := &Config{
+		Version: 1,
+		Layout:  LayoutSingle,
+		Owner:   "initial-owner",
+		Remotes: []StoreRemote{
+			{
+				Mount: "jasp", URL: "file:///tmp/store.git", Shared: true,
+				LastSync: time.Date(2026, 7, 24, 8, 0, 0, 0, time.UTC),
+			},
+			{Mount: "personal", URL: "file:///tmp/personal.git"},
+		},
+	}
+	if err := Save(path, initial); err != nil {
+		t.Fatalf("save initial config: %v", err)
+	}
+
+	fresh, err := Load(path)
+	if err != nil {
+		t.Fatalf("load initial config: %v", err)
+	}
+	fresh.Owner = "concurrent-owner"
+	fresh.Layout = LayoutPerOrg
+	fresh.Remotes[1].URL = "file:///tmp/new-personal.git"
+	if err := Save(path, fresh); err != nil {
+		t.Fatalf("save concurrent config: %v", err)
+	}
+	beforeRevision := fresh.Revision
+
+	updated, err := UpdateSharedTeamAuditAndSave(
+		context.Background(),
+		path,
+		"jasp",
+		TeamAuditConfig{
+			URL:                "git@github.com:jasp/audit.git",
+			SigningFingerprint: "0123456789abcdef0123456789abcdef01234567",
+		},
+	)
+	if err != nil {
+		t.Fatalf("UpdateSharedTeamAuditAndSave: %v", err)
+	}
+	if updated.Revision != beforeRevision+1 {
+		t.Fatalf("revision = %d, want %d", updated.Revision, beforeRevision+1)
+	}
+	if updated.Owner != "concurrent-owner" || updated.Layout != LayoutPerOrg {
+		t.Fatalf("fresh config fields were lost: %+v", updated)
+	}
+	if remote, ok := updated.Remote("personal"); !ok ||
+		remote.URL != "file:///tmp/new-personal.git" {
+		t.Fatalf("fresh personal remote was lost: %+v", updated.Remotes)
+	}
+	remote, ok := updated.Remote("jasp")
+	if !ok || remote.TeamAudit == nil {
+		t.Fatalf("team audit missing: %+v", updated.Remotes)
+	}
+	if remote.TeamAudit.SigningFingerprint !=
+		"0123456789ABCDEF0123456789ABCDEF01234567" {
+		t.Fatalf("fingerprint was not normalized: %+v", remote.TeamAudit)
+	}
+	if !remote.LastSync.Equal(initial.Remotes[0].LastSync) {
+		t.Fatalf("LastSync was not preserved: %+v", remote)
+	}
+}
+
+func TestUpdateSharedTeamAuditAndSaveSerializesConcurrentUpdates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.yaml")
+	initial := &Config{Version: 1, Remotes: []StoreRemote{
+		{Mount: "jasp", URL: "/tmp/jasp-store.git", Shared: true},
+		{Mount: "sales", URL: "/tmp/sales-store.git", Shared: true},
+	}}
+	if err := Save(path, initial); err != nil {
+		t.Fatalf("save initial config: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, update := range []struct {
+		mount string
+		url   string
+		fpr   string
+	}{
+		{"jasp", "/tmp/jasp-audit.git", strings.Repeat("A", 40)},
+		{"sales", "/tmp/sales-audit.git", strings.Repeat("B", 40)},
+	} {
+		update := update
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := UpdateSharedTeamAuditAndSave(
+				context.Background(), path, update.mount,
+				TeamAuditConfig{
+					URL: update.url, SigningFingerprint: update.fpr,
+				},
+			)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent update: %v", err)
+		}
+	}
+
+	persisted, err := Load(path)
+	if err != nil {
+		t.Fatalf("load concurrent result: %v", err)
+	}
+	if persisted.Revision != initial.Revision+2 {
+		t.Fatalf("revision = %d, want %d", persisted.Revision, initial.Revision+2)
+	}
+	for _, mount := range []string{"jasp", "sales"} {
+		remote, ok := persisted.Remote(mount)
+		if !ok || remote.TeamAudit == nil {
+			t.Fatalf("%s audit update was lost: %+v", mount, persisted.Remotes)
+		}
+	}
+}
+
+func TestUpdateSharedTeamAuditAndSaveFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.yaml")
+	initial := &Config{Version: 1, Remotes: []StoreRemote{
+		{Mount: "personal", URL: "/tmp/personal.git"},
+		{Mount: "jasp", URL: "/tmp/jasp-store.git", Shared: true},
+	}}
+	if err := Save(path, initial); err != nil {
+		t.Fatalf("save initial config: %v", err)
+	}
+	valid := TeamAuditConfig{
+		URL: "/tmp/jasp-audit.git", SigningFingerprint: strings.Repeat("A", 40),
+	}
+	tests := []struct {
+		name  string
+		mount string
+		audit TeamAuditConfig
+	}{
+		{name: "personal mount", mount: "personal", audit: valid},
+		{name: "missing mount", mount: "missing", audit: valid},
+		{
+			name: "same repo", mount: "jasp",
+			audit: TeamAuditConfig{
+				URL:                "/tmp/jasp-store.git",
+				SigningFingerprint: strings.Repeat("A", 40),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			before, err := Load(path)
+			if err != nil {
+				t.Fatalf("load before update: %v", err)
+			}
+			if _, err := UpdateSharedTeamAuditAndSave(
+				context.Background(), path, test.mount, test.audit,
+			); err == nil {
+				t.Fatal("expected update to fail closed")
+			}
+			after, err := Load(path)
+			if err != nil {
+				t.Fatalf("load after update: %v", err)
+			}
+			if after.Revision != before.Revision {
+				t.Fatalf("failed update changed revision from %d to %d",
+					before.Revision, after.Revision)
+			}
+		})
 	}
 }
 

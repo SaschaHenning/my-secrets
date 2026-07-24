@@ -1,6 +1,6 @@
 //go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 
-package sync
+package teamaudit
 
 import (
 	"errors"
@@ -9,7 +9,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func tryLockFile(file *os.File) (bool, error) {
+func tryAuditFileLock(file *os.File) (bool, error) {
 	err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 	if err == nil {
 		return true, nil
@@ -20,6 +20,6 @@ func tryLockFile(file *os.File) (bool, error) {
 	return false, err
 }
 
-func unlockFile(file *os.File) error {
+func unlockAuditFile(file *os.File) error {
 	return unix.Flock(int(file.Fd()), unix.LOCK_UN)
 }
