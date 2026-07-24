@@ -345,7 +345,9 @@ mys key backup --status
 
 Diese Backups sind **persönlich**: sie rekonstruieren den Key, dem der
 ganze Store gehört. Niemals mit Kolleginnen teilen — für Team-Sharing
-gibt es `mys bw-export`. Metadaten jedes Backups landen in
+nutzt du einen expliziten Shared-Mount mit einem eigenen Public Key pro
+Person oder einen Tresor mit personalisiertem Login. Metadaten jedes
+Backups landen in
 `~/.local/share/my-secrets/backups.json` (niemals Key-Material) und als
 `action=key_backup`-Zeile im Audit-Log.
 
@@ -464,14 +466,15 @@ mys bw-export --org jasp --out jasp-backup.json
 Schreibt eine Bitwarden-kompatible JSON-Datei, die du bei Bedarf manuell
 in Bitwarden importieren kannst. Einseitig — kein Live-Sync.
 
-## Syncing across your own devices
+## Git-Sync: persönliche und explizit geteilte Mounts
 
-`my-secrets` ist ein **persönlicher** Credential-Manager. Der eingebaute
-Git-Sync dient ausschließlich der Redundanz zwischen deinen eigenen
-Geräten — **nicht** dem Teilen mit Kolleg:innen. Für Team-Secrets ist
-Bitwarden (oder ein vergleichbarer Tresor mit personalisiertem Login)
-das richtige Werkzeug; ein gemeinsam genutzter GPG-Key würde das
-Audit-Log unbrauchbar machen.
+### Persönlicher Store: nur deine eigenen Geräte
+
+`mys sync setup` richtet weiterhin ausschließlich die Redundanz deines
+**persönlichen** Stores zwischen deinen eigenen Geräten ein. Auch
+`mys recipient add` ohne `--mount` ist nur für deine eigenen zusätzlichen
+Geräte oder Hardware-Tokens gedacht. Füge dem persönlichen Store niemals
+den Key einer anderen Person hinzu.
 
 ```bash
 # Einmalig: GitHub-Repo anlegen, gopass-Remote setzen, initialer Push
@@ -499,6 +502,116 @@ gelesen direkt aus `sync.yaml`, ohne Netzwerk-Check beim Seitenaufruf
 (die Erreichbarkeitsprüfung bleibt `mys sync status` auf der CLI
 vorbehalten).
 
+### Shared-Mount: eigene GPG-Keys pro Teammitglied
+
+Ein Team-Store ist ein **zusätzlicher**, ausdrücklich als `shared`
+markierter gopass-Mount. Er verwendet keinen gemeinsam genutzten GPG-Key:
+Jedes Teammitglied steuert seinen eigenen Public Key bei, und die
+`.gpg-id` des Mounts enthält das exakte Team-Key-Set.
+
+Die bevorzugte, wiederverwendbare Quelle dafür ist `team-keys.yaml`.
+Sie wird zusammen mit optionalen armored Public-Key-Dateien im
+Shared-Repo versioniert:
+
+```yaml
+version: 1
+members:
+  - name: Alice Example
+    fingerprint: 0123456789ABCDEF0123456789ABCDEF01234567
+    email: alice@example.org
+    public_key: keys/alice.asc
+  - name: Bob Example
+    fingerprint: 89ABCDEF0123456789ABCDEF0123456789ABCDEF
+    email: bob@example.org
+    public_key: keys/bob.asc
+```
+
+`name`, `fingerprint` und `email` sind Pflichtfelder. `public_key` ist
+optional und muss relativ zum Verzeichnis der Manifestdatei liegen.
+Mindestens einer der aufgeführten Keys muss auf der ausführenden Maschine
+auch als Secret Key vorhanden sein, damit sie den neuen Mount benutzen
+kann.
+
+```bash
+# Shared-Mount aus einem Team-Key-Manifest provisionieren. Ohne --remote
+# wird das private GitHub-Repo über --owner/--repo angelegt oder angebunden.
+mys sync shared setup \
+  --mount jasp \
+  --team-keys ./team-keys.yaml \
+  --owner jasp \
+  --repo mys-store-shared
+
+# Alternativ einen vorhandenen Remote direkt angeben:
+mys sync shared setup \
+  --mount jasp \
+  --team-keys ./team-keys.yaml \
+  --remote /path/to/mys-store-shared.git
+
+# Bootstrap-Alternative, wenn alle Public Keys bereits importiert sind:
+mys sync shared setup \
+  --mount jasp \
+  --fingerprint 0123456789ABCDEF0123456789ABCDEF01234567 \
+  --fingerprint 89ABCDEF0123456789ABCDEF0123456789ABCDEF \
+  --remote /path/to/mys-store-shared.git
+```
+
+`--team-keys` und `--fingerprint` schließen einander aus. Die explizite
+Fingerprint-Variante ist für bereits importierte Keys gedacht und legt
+keine Identitäts-Map an; spätere Foreign-Team-Adds verlangen deshalb
+trotzdem eine gültige `team-keys.yaml` im Live-Mount. Optional stehen
+`--path`, `--https` und `--yes` zur Verfügung. Shared-Setup ist für
+AI-Caller hart gesperrt; `--yes` überspringt nur die Rückfrage einer
+menschlichen Ausführung. Der
+Provisioner importiert angegebene Public-Key-Dateien, hängt den Mount an,
+gleicht `.gpg-id` auf die gewählte Team-Key-Quelle ab, commitet ein
+vorhandenes Manifest samt Key-Dateien, pusht den Remote und speichert den
+Mount mit `shared: true` in
+`~/.config/my-secrets/sync.yaml`. Ein bereits als persönlich
+konfigurierter Mount lässt sich nicht stillschweigend in einen
+Shared-Mount umdeuten.
+
+Danach kann die Recipient-Verwaltung gezielt auf den Mount zeigen:
+
+```bash
+mys recipient list --mount jasp
+mys recipient add ./keys/carol.asc --mount jasp
+mys recipient remove <FINGERPRINT> --mount jasp
+```
+
+Ohne `--mount` bleibt das bisherige Verhalten für den persönlichen
+Default-Store unverändert; dort bleiben Warnung und Bestätigung die
+Schutzschranken für die Zusage des Menschen, nur einen eigenen Key
+hinzuzufügen. Der neue mount-spezifische Team-Pfad akzeptiert einen
+fremden Key dagegen nur für einen konfigurierten Shared-Mount. `add`
+zeigt vor der Änderung den Fingerprint und verlangt die menschliche
+Bestätigung; AI-Caller werden für `add` und `remove` weiterhin hart
+abgewiesen. Ist ein neuer Fingerprint noch nicht in `team-keys.yaml`
+enthalten, warnt der Befehl, statt die Aufnahme hart abzulehnen. Ergänze
+das Manifest zeitnah: Beim nächsten Provisionierungsabgleich ist es
+wieder die maßgebliche Quelle für das exakte Recipient-Set. Entsprechend
+muss ein dauerhaft entferntes Mitglied auch aus `team-keys.yaml`
+verschwinden; andernfalls fügt ein späterer Provisionierungsabgleich
+seinen Key wieder hinzu.
+
+### Trust Model und aktueller Ausbauzustand
+
+Shared-Mounts aus Tier A sind **advisory**, nicht erzwingbar auditiert.
+Jeder eingetragene Recipient kann die verschlüsselten Dateien lokal mit
+nacktem `gpg` oder `gopass` außerhalb von `mys` entschlüsseln; dabei
+entsteht keine Audit-Zeile. Das aktuelle Audit bleibt außerdem eine
+lokale SQLite-Datenbank pro Maschine. Das Shared-Repo schafft in dieser
+Ausbaustufe Team-Verfügbarkeit und eine Fingerprint-zu-Identität-Map,
+aber noch keinen zentralen oder beweisbaren „wer hat was gelesen"-Nachweis.
+
+In diesem Stand sind nur Tier-A-Phase 1 (Shared-Mount-Provisionierung)
+und Phase 2 (mount-spezifische Recipient-Verwaltung) umgesetzt.
+Bitwarden-Seeding, ein signiertes Team-Read-Audit, fail-closed
+Shared-Policy und der Revocation-/Rotations-Runbook aus den Phasen 3–6
+sind noch nicht implementiert. Beim Entfernen eines Team-Keys muss man
+weiterhin davon ausgehen, dass die Person alle bisher zugänglichen
+Secrets gelesen oder alte Ciphertext-Kopien behalten haben könnte;
+betroffene Secrets müssen deshalb rotiert werden.
+
 ### Auto-Sync nach Schreiboperationen
 
 Sobald `mys sync setup` einmal gelaufen ist, wird nach jedem
@@ -510,6 +623,12 @@ ist. Der Push läuft synchron mit 5 Sekunden Timeout; schlägt er fehl
 druckt eine Warnung auf stderr und schreibt eine Audit-Zeile mit
 `action=sync_push, result=error`. Der Exit-Code ist trotzdem `0`, weil
 die Schreiboperation selbst geglückt ist.
+
+Dieser schreibgekoppelte Auto-Sync gilt nur für persönliche Remotes.
+Shared-Mounts werden dabei bewusst übersprungen; ihre Provisionierung
+pusht ihre eigenen Änderungen, und `mys sync push` / `mys sync pull`
+lassen sich für einen expliziten manuellen Abgleich aller konfigurierten
+Remotes verwenden.
 
 Opt-out:
 
@@ -537,6 +656,9 @@ my-secrets/
 │   ├── policy/        # YAML-Scope-Policy
 │   ├── app/           # Orchestrator (caller → policy → store → audit)
 │   ├── history/       # Git-Log pro Eintrag (shellt zu `git`, mount-aware)
+│   ├── sync/          # Git-Remotes + Shared-Mount-Provisionierung
+│   ├── recipient/     # Mount-spezifische GPG-Recipients
+│   ├── teamkeys/      # Striktes `team-keys.yaml`-Manifest
 │   ├── mcp/           # JSON-RPC 2.0 über stdio
 │   └── web/           # Localhost HTTP UI (embed.FS)
 ├── skills/my-secrets/ # Claude-Code-Skill

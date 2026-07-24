@@ -2,7 +2,10 @@
 
 ## Threat model
 
-my-secrets is a single-user macOS tool. The threat model matches that:
+my-secrets is a single-user macOS tool by default. An explicitly marked
+shared mount can add separately owned team GPG keys, but it remains a
+client-side, advisory sharing model; it does not turn the local client
+into an authoritative access broker.
 
 | In scope                                                   | Out of scope                               |
 | ---------------------------------------------------------- | ------------------------------------------ |
@@ -10,6 +13,7 @@ my-secrets is a single-user macOS tool. The threat model matches that:
 | Casual exfiltration of the DB to another machine           | Supply-chain compromise of gopass upstream |
 | Local shell scripts that should not access `private/**`    | Kernel-level keylogging                    |
 | Audit-log tampering by careless tools                      | Side-channels on the CPU                   |
+| Foreign-team enrollment targeting a non-shared mount       | A team recipient bypassing `mys` with GPG  |
 
 The guarantees we try to uphold:
 
@@ -18,9 +22,15 @@ The guarantees we try to uphold:
 2. Every access through `mys` (CLI / MCP / Web) produces an audit row.
 3. Policy denials are hard failures — never warnings, never partial
    reveals.
-4. Copying the `~/.password-store` directory to another Mac does not
-   grant access to the secrets without the GPG private key, which is
-   Keychain-bound (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`).
+4. Copying a store directory to another Mac does not grant access to its
+   secrets without one of that store's recipient private keys. For the
+   personal store, that key is Keychain-bound
+   (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`).
+5. The mount-targeted foreign-team enrollment path accepts only a
+   non-root mount that is explicitly and unambiguously configured as
+   shared and has a valid `team-keys.yaml`. The backward-compatible
+   personal command still relies on its warning, human confirmation,
+   and the operator's assertion that the key is their own.
 
 ## Machine binding — what „locked to this Mac" really means
 
@@ -82,9 +92,10 @@ The audit DB (`~/.local/share/my-secrets/audit.sqlite`) uses:
     starts at `seq=1`, which is detectable when correlating with other
     systems (e.g. Claude session transcripts).
 
-For higher assurance we would need the signed hash-chain design from
-Ansatz B of the planning doc — deliberately deferred for the MVP because
-the single-user threat model does not require crypto-grade audit.
+These triggers are the baseline only. The optional signed-chain mode
+below makes local DB edits detectable without pretending that it
+aggregates or enforces team reads; the latter remains a separate,
+deferred design.
 
 ### Signed-Chain-Mode (opt-in)
 
@@ -117,6 +128,11 @@ macOS Keychain under service `com.jasp.my-secrets.audit-signing`,
 account `default`. The matching public key is written to
 `~/.local/share/my-secrets/audit-pub.key` (base64, 0644) so anyone with
 read access to the audit DB can verify offline.
+
+This mode signs the **local SQLite chain only**. It neither pushes
+per-user read events to a shared repository nor prevents a recipient
+from decrypting a shared-store ciphertext directly with `gpg` or
+`gopass`. Those are separate, not-yet-implemented guarantees.
 
 To verify:
 
@@ -273,30 +289,98 @@ server itself, which ignores the flag and enforces `actor_kind=ai`.
 ## Git-based sync
 
 `mys sync setup` optionally turns the local gopass store into a
-git-backed store pushed to a private GitHub repo. The feature is
-deliberately scoped to **personal device redundancy** — keeping your
-own secrets mirrored across your own machines.
+git-backed store pushed to a private GitHub repo. This default path is
+deliberately scoped to **personal device redundancy** — keeping your own
+secrets mirrored across your own machines. Likewise,
+`mys recipient add` without `--mount` is only for the same person's
+additional device or hardware-token keys. A colleague's key must never
+be added to that personal recipient set.
 
-Non-goals (explicitly): sharing credentials with colleagues. A gopass
-store encrypted to a single GPG key cannot distinguish between humans
-who hold that key, which means:
+### Explicit shared mounts
 
-- The audit log loses its „who accessed this secret" signal the moment
-  a second human shares the key.
-- Revocation would require rotating every credential in the store.
-- There is no per-user policy — the scope-policy YAML here only gates
-  machine-local callers (human vs. AI).
+`mys sync shared setup` provisions a separate, non-root gopass mount and
+persists `shared: true` for that mount in
+`~/.config/my-secrets/sync.yaml`. Its `.gpg-id` contains the distinct
+GPG fingerprints of all team members rather than one GPG key shared by
+several people.
 
-For team-shared credentials, use Bitwarden (or a comparable hosted
-vault) that enforces per-user identity. The setup wizard prints this
-scope anchor before any destructive step and requires explicit
-confirmation.
+The repository-local `team-keys.yaml` is the normal, reusable source of
+truth for provisioning:
+
+```yaml
+version: 1
+members:
+  - name: Alice Example
+    fingerprint: 0123456789ABCDEF0123456789ABCDEF01234567
+    email: alice@example.org
+    public_key: keys/alice.asc
+```
+
+The loader requires a valid name, email, and 40-hex-character
+fingerprint for every unique member. `public_key` is optional and is
+resolved as a repository-relative regular file without symlink or
+parent-directory traversal. Provisioning imports those public keys,
+checks that every fingerprint is available and at least one matching
+secret key is local, converges the exact `.gpg-id` set, commits the
+manifest/assets, and pushes the remote before persisting the shared
+configuration.
+
+As a bootstrap alternative, setup accepts a repeated `--fingerprint`
+list when all corresponding public keys are already imported. That path
+does not create an identity manifest; later foreign-team additions still
+fail closed until a valid `team-keys.yaml` exists in the live mount.
+Shared setup itself is hard-denied for AI callers; `--yes` only bypasses
+the interactive question for an invocation still classified as human.
+
+Mount-targeted recipient commands use
+`mys recipient add|list|remove --mount <name>`. A foreign-key add fails
+closed unless the live mount is non-root, its sync entry is explicitly
+shared, and its manifest validates. A fingerprint missing from the
+manifest produces a warning rather than a hard failure because the
+manifest may lag a newly added member; the manifest still wins on the
+next full provisioning reconciliation. The same applies to removal:
+leaving a removed member in the manifest causes a later provisioning run
+to add that fingerprint again. Recipient mutations remain hard-denied
+for AI callers, and adding requires explicit human confirmation (or the
+human-supplied `--yes`).
+
+Shared setup and recipient reconciliation are serialized per mount.
+Provisioning adds new recipients before removing stale ones, makes at
+most one reconcile-and-retry after a concurrent non-fast-forward push,
+and refuses path/mount collisions with the personal root store. The
+ordinary write-triggered auto-sync skips shared remotes; shared
+provisioning pushes its own changes, while explicit `mys sync push` and
+`mys sync pull` handle configured remotes.
+
+### Advisory guarantee
+
+Every recipient owns a private key that can decrypt every secret in the
+shared mount. Once enrolled, that person can call bare `gpg` or
+`gopass`, copy old ciphertext, and leave **no** `mys` audit row. The
+current audit database is local to each machine; the optional signed
+chain above protects one local log but is not an aggregated team-read
+audit. Scope policy also gates only compliant, machine-local callers.
+
+Therefore phases 1–2 provide shared availability, distinct recipient
+keys, and a reusable fingerprint-to-identity manifest, but not a
+provable „who read what" record or instant revocation. Removing a key
+prevents future decryption only after re-encryption and does not retract
+old copies; rotate every secret the departed recipient could access.
+For authoritative per-user access control, use a brokered/hosted vault
+such as Bitwarden rather than treating this client-side model as
+enforceable.
+
+Tier-A phases not present here are Bitwarden-to-shared seeding (phase 3),
+the signed shared read-audit and team aggregation (phase 4), fail-closed
+shared-read policy (phase 5), and an automated
+revocation/rotation runbook (phase 6).
 
 Sync-related subprocess calls (`gh`, `gopass git …`, `gopass sync`) are
 an explicit exception to the library-only rule. They run outside the
 hot secret-access path, do not read or write decrypted secret values,
-and every invocation writes an audit row with
-`action=sync_{setup,push,pull}`.
+and the corresponding CLI operation records an audit outcome with
+`action=sync_{setup,push,pull}`. Shared provisioning reuses
+`sync_setup`.
 
 ## Known limitations
 
