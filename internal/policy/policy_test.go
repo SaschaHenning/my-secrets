@@ -3,6 +3,7 @@ package policy
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,11 +104,188 @@ func TestLoadInvalidYAML(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsNonStrictYAML(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unknown root field",
+			body: "actors: {}\nunexpected: true\n",
+		},
+		{
+			name: "unknown rule field",
+			body: "actors:\n  ai:\n    allow: [\"jasp/**\"]\n    unexpected: true\n",
+		},
+		{
+			name: "duplicate root key",
+			body: "actors: {}\nactors: {}\n",
+		},
+		{
+			name: "duplicate nested key",
+			body: "actors:\n  ai:\n    allow: [\"jasp/**\"]\n    allow: [\"private/**\"]\n",
+		},
+		{
+			name: "multiple documents",
+			body: "actors: {}\n---\nactors: {}\n",
+		},
+		{
+			name: "null actors",
+			body: "actors: null\n",
+		},
+		{
+			name: "null rules",
+			body: "actors:\n  ai: null\n",
+		},
+		{
+			name: "non string actor",
+			body: "actors:\n  1:\n    allow: [\"jasp/**\"]\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "policy.yaml")
+			if err := os.WriteFile(p, []byte(tt.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(p); err == nil {
+				t.Fatal("expected strict policy parsing to fail")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnsafePolicyFile(t *testing.T) {
+	t.Run("symbolic link", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target.yaml")
+		link := filepath.Join(dir, "policy.yaml")
+		if err := os.WriteFile(target, []byte("actors: {}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(link); err == nil {
+			t.Fatal("expected symbolic-link policy to be rejected")
+		}
+	})
+
+	t.Run("non regular", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "policy.yaml")
+		if err := os.Mkdir(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); err == nil {
+			t.Fatal("expected directory policy to be rejected")
+		}
+	})
+
+	t.Run("oversize", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "policy.yaml")
+		body := strings.Repeat("#", policyFileSizeLimit+1)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); err == nil {
+			t.Fatal("expected oversized policy to be rejected")
+		}
+	})
+}
+
+func TestLoadValidatesActorNamesAndGlobs(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unicode actor",
+			body: "actors:\n  über-agent:\n    allow: [\"jasp/**\"]\n",
+		},
+		{
+			name: "control character actor",
+			body: "actors:\n  \"ai\\tbot\":\n    allow: [\"jasp/**\"]\n",
+		},
+		{
+			name: "control character glob",
+			body: "actors:\n  ai:\n    allow: [\"jasp/ok\\n/**\"]\n",
+		},
+		{
+			name: "invalid glob",
+			body: "actors:\n  ai:\n    allow: [\"jasp/[broken\"]\n",
+		},
+		{
+			name: "unsupported composite globstar",
+			body: "actors:\n  ai:\n    allow: [\"jasp/*/**\"]\n",
+		},
+		{
+			name: "traversing glob",
+			body: "actors:\n  ai:\n    allow: [\"../jasp/**\"]\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "policy.yaml")
+			if err := os.WriteFile(p, []byte(tt.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(p); err == nil {
+				t.Fatal("expected invalid policy to be rejected")
+			}
+		})
+	}
+}
+
+func TestLoadAllowsPrintableUnicodeGlob(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "policy.yaml")
+	body := "actors:\n  human:\n    allow: [\"jasp/über/**\"]\n"
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pol, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision := pol.Evaluate("human", "", "jasp/über/passwort"); !decision.Allowed {
+		t.Fatalf("printable Unicode glob should be supported: %v", decision)
+	}
+}
+
+func TestEvaluateRejectsUnsafeSecretPaths(t *testing.T) {
+	pol := &Policy{Actors: map[string]Rules{
+		"human": {Allow: []string{"**"}},
+	}}
+	paths := []string{
+		"",
+		"/absolute",
+		"jasp/../private",
+		"jasp/./secret",
+		"jasp//secret",
+		`jasp\secret`,
+		"jasp/secret\n",
+		" jasp/secret",
+		"jasp/\u2028secret",
+	}
+	for _, secretPath := range paths {
+		t.Run(secretPath, func(t *testing.T) {
+			if decision := pol.Evaluate(
+				"human",
+				"",
+				secretPath,
+			); decision.Allowed {
+				t.Fatalf("unsafe path %q was allowed: %v", secretPath, decision)
+			}
+		})
+	}
+}
+
 func TestLoadEmptyActors(t *testing.T) {
-	// A YAML without any `actors` key produces an empty (non-nil) map.
+	// An explicit empty actors mapping produces an empty (non-nil) map.
 	dir := t.TempDir()
 	p := filepath.Join(dir, "empty.yaml")
-	if err := os.WriteFile(p, []byte("# no actors\n"), 0o600); err != nil {
+	if err := os.WriteFile(p, []byte("actors: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	pol, err := Load(p)
@@ -175,6 +353,13 @@ func TestWriteDefault(t *testing.T) {
 	}
 	if _, err := os.Stat(p); err != nil {
 		t.Fatalf("policy file not created: %v", err)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("policy mode = %#o, want 0600", got)
 	}
 	// Calling it again should be a no-op (file exists).
 	p2, err := WriteDefault()
