@@ -228,31 +228,30 @@ func (manager *Manager) proveRemoteWrite(ctx context.Context) error {
 	defer cancelCleanup()
 
 	remoteCommit, exists, confirmErr := manager.remoteOID(cleanupCtx, branch)
+	var probeErr error
 	if confirmErr != nil {
-		cleanupErr := manager.deleteRemoteProbe(cleanupCtx, branch, commit)
-		return errors.Join(
-			fmt.Errorf("confirm team audit write probe: %w", confirmErr),
-			pushErr,
-			cleanupErr,
+		probeErr = fmt.Errorf(
+			"confirm team audit write probe: %w",
+			confirmErr,
+		)
+	} else if !exists {
+		probeErr = errors.New(
+			"team audit write probe did not reach the remote",
+		)
+	} else if remoteCommit != commit {
+		probeErr = errors.New(
+			"team audit write probe remote ownership mismatch",
 		)
 	}
-	if !exists || remoteCommit != commit {
-		if exists {
-			return errors.Join(
-				pushErr,
-				errors.New("team audit write probe remote ownership mismatch"),
-			)
-		}
-		return errors.Join(
-			pushErr,
-			errors.New("team audit write probe did not reach the remote"),
-		)
-	}
-	if cleanupErr := manager.deleteRemoteProbe(
+	cleanupErr := manager.deleteRemoteProbe(
 		cleanupCtx,
 		branch,
 		commit,
-	); cleanupErr != nil {
+	)
+	if probeErr != nil {
+		return errors.Join(probeErr, pushErr, cleanupErr)
+	}
+	if cleanupErr != nil {
 		return errors.Join(pushErr, cleanupErr)
 	}
 	return nil
