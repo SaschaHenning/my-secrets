@@ -99,30 +99,30 @@ automatisch beim nächsten Session-Start. Alle Zugriffe laufen dann über
 
 ```bash
 # Secret anlegen
-echo "ghp_xxx" | mys add jasp/github-token \
-  --kind api_key --user sascha --url https://github.com \
+echo "ghp_xxx" | mys add work/github-token \
+  --kind api_key --user you --url https://github.com \
   --github SaschaHenning/my-secrets --tags infra,ci
 
 # Suchen
 mys search github
 
 # Lesen (maskiert)
-mys get jasp/github-token
+mys get work/github-token
 
 # Lesen mit Klartext-Passwort
-mys get jasp/github-token --reveal
+mys get work/github-token --reveal
 
 # Nur ein Feld holen
-mys get jasp/github-token --field password --reveal
+mys get work/github-token --field password --reveal
 
 # Als ENV-Export
-mys get jasp/github-token --format env --reveal
+mys get work/github-token --format env --reveal
 
 # Rotieren
-echo "new-pw" | mys rotate jasp/github-token
+echo "new-pw" | mys rotate work/github-token
 
 # Löschen
-mys rm jasp/github-token
+mys rm work/github-token
 
 # Audit-Log
 mys audit tail --limit 30
@@ -140,10 +140,10 @@ Use one of the narrow output modes instead:
 
 ```bash
 # raw password value for a single process argument/env var
-TOKEN="$(mys get jasp/github-token --field password --reveal)"
+TOKEN="$(mys get work/github-token --field password --reveal)"
 
 # shell env assignments for source/eval workflows
-mys get jasp/github-token --format env --reveal
+mys get work/github-token --format env --reveal
 
 # machine-readable setup diagnostics
 mys doctor --json
@@ -164,23 +164,23 @@ lokalen Uhr.
 
 ```bash
 # Direkt aus dem QR-Code-URI hinzufügen (wie Google Authenticator ihn liest)
-mys totp add jasp/github \
-  "otpauth://totp/GitHub:sascha?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&algorithm=SHA1&digits=6&period=30"
+mys totp add work/github \
+  "otpauth://totp/GitHub:you?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&algorithm=SHA1&digits=6&period=30"
 
 # Oder nur ein Base32-Seed, Metadaten via Flags
-mys totp add jasp/aws JBSWY3DPEHPK3PXP --issuer AWS --label ops
+mys totp add work/aws JBSWY3DPEHPK3PXP --issuer AWS --label ops
 
 # Aktuellen Code holen
-mys totp jasp/github
+mys totp work/github
 #
-# jasp/github (GitHub:sascha)
+# work/github (GitHub:you)
 # 487 291     (19s left)
 
 # Watch-Modus: aktualisiert sekündlich, Abbruch mit Ctrl-C
-mys totp jasp/github --watch
+mys totp work/github --watch
 ```
 
-`mys get jasp/github` zeigt die TOTP-Metadaten (Issuer, Label,
+`mys get work/github` zeigt die TOTP-Metadaten (Issuer, Label,
 Algorithmus, Digits, Period) und maskiert den Seed. Nur `--reveal`
 druckt ihn im Klartext.
 
@@ -201,7 +201,7 @@ Fuzzy — damit auch Tippfehler und Teil-URLs den richtigen Eintrag finden.
 
 ```bash
 # Speichern mit Domain + zwei strukturierten Feldern
-mys add jasp/aws --domain aws.amazon.com \
+mys add work/aws --domain aws.amazon.com \
   --field account_id=123 --field region=eu-central-1
 
 # Subdomain-Treffer
@@ -214,7 +214,7 @@ mys ls --domain jazp.eu --similar      # schlägt jasp.eu als Typo-Korrektur vor
 mys ls --field region=eu-central-1     # AND-Filter über Fields-Map
 
 # Einzelnes Custom-Feld lesen
-mys get jasp/aws --field account_id    # druckt "123"
+mys get work/aws --field account_id    # druckt "123"
 ```
 
 Für KI-Caller liefert der MCP-Server zusätzlich ein `similar[]`-Array mit
@@ -289,7 +289,7 @@ Gedächtnisleistung.
 **Policy beim Anlegen setzen:**
 
 ```bash
-echo "ghp_xxx" | mys add jasp/github-token --rotate-after 90d
+echo "ghp_xxx" | mys add work/github-token --rotate-after 90d
 ```
 
 Erlaubt sind `Nd` (Tage), `Nw` (Wochen), `Nm` (Monate = 30 Tage) und
@@ -307,13 +307,13 @@ mys ls --stale --rotating-in 30d   # kombiniert (AND)
 `--stale` erweitert die Ausgabe um Alter und Policy:
 
 ```
-jasp/github-token  112d old  rotate_after=90d
+work/github-token  112d old  rotate_after=90d
 ```
 
 **Beim Rotieren wird der Zeitstempel automatisch gesetzt:**
 
 ```bash
-echo "new-pw" | mys rotate jasp/github-token
+echo "new-pw" | mys rotate work/github-token
 # rotate_after bleibt erhalten, rotated_at wird auf jetzt gesetzt.
 ```
 
@@ -433,10 +433,10 @@ actors:
   script:
     allow: ["**"]
   ai:
-    allow: ["jasp/**", "zuhause/**"]
+    allow: ["work/**", "home/**"]
     deny:  ["private/**"]
   claude-code:
-    allow: ["jasp/**", "zuhause/**"]
+    allow: ["work/**", "home/**"]
     deny:  ["private/**"]
 ```
 
@@ -515,7 +515,7 @@ Opt-out:
 
 ```bash
 # Für diesen einen Aufruf:
-mys add --no-sync jasp/foo
+mys add --no-sync work/foo
 
 # Global (z. B. beim Rollout oder im Offline-Modus):
 export MYS_AUTO_SYNC=0

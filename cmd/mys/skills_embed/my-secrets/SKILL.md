@@ -29,7 +29,7 @@ The MCP server enforces a scope policy (`~/.config/my-secrets/scope-policy.yaml`
 
 ## CLI fallback and consumer-safe output
 
-Use `/home/sascha/bin/mys` if `mys` is not on `PATH`.
+Use `~/bin/mys` if `mys` is not on `PATH`.
 
 `mys get <path>` is human-readable output: it prints a labelled record and
 masks the password by default. Do not pass that whole output into another
