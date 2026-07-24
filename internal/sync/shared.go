@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/SaschaHenning/my-secrets/internal/teamaudit"
 	"github.com/SaschaHenning/my-secrets/internal/teamkeys"
 )
 
@@ -345,6 +346,21 @@ func gpgOutputContainsFingerprint(out []byte, fingerprint string) bool {
 
 func ensureSharedRemote(ctx context.Context, runner Runner, opts SharedProvisionOptions) (string, error) {
 	if remote := strings.TrimSpace(opts.RemoteURL); remote != "" {
+		owner, repo, isGitHub, err := teamaudit.ParseGitHubRemote(remote)
+		if err != nil {
+			return "", fmt.Errorf("validate shared remote: %w", err)
+		}
+		if isGitHub {
+			if err := ensurePrivateSharedGitHubRepo(
+				ctx,
+				runner,
+				owner,
+				repo,
+				false,
+			); err != nil {
+				return "", err
+			}
+		}
 		return remote, nil
 	}
 	owner := strings.TrimSpace(opts.Owner)
@@ -363,16 +379,86 @@ func ensureSharedRemote(ctx context.Context, runner Runner, opts SharedProvision
 	if err != nil {
 		return "", err
 	}
-	exists, err := GhRepoExists(ctx, runner, owner, repo)
-	if err != nil {
-		return "", fmt.Errorf("check shared repo %s/%s: %w", owner, repo, err)
-	}
-	if !exists {
-		if _, err := GhRepoCreate(ctx, runner, owner, repo); err != nil {
-			return "", fmt.Errorf("create shared repo %s/%s: %w", owner, repo, err)
-		}
+	if err := ensurePrivateSharedGitHubRepo(
+		ctx,
+		runner,
+		owner,
+		repo,
+		true,
+	); err != nil {
+		return "", err
 	}
 	return url, nil
+}
+
+func ensurePrivateSharedGitHubRepo(
+	ctx context.Context,
+	runner Runner,
+	owner string,
+	repo string,
+	create bool,
+) error {
+	visibility, exists, err := GhRepoVisibility(
+		ctx,
+		runner,
+		owner,
+		repo,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"check shared repository %s/%s visibility: %w",
+			owner,
+			repo,
+			err,
+		)
+	}
+	if !exists {
+		if !create {
+			return fmt.Errorf(
+				"check shared repository %s/%s visibility: repository is unavailable",
+				owner,
+				repo,
+			)
+		}
+		if _, err := GhRepoCreate(ctx, runner, owner, repo); err != nil {
+			return fmt.Errorf(
+				"create private shared repository %s/%s: %w",
+				owner,
+				repo,
+				err,
+			)
+		}
+		visibility, exists, err = GhRepoVisibility(
+			ctx,
+			runner,
+			owner,
+			repo,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"confirm private shared repository %s/%s: %w",
+				owner,
+				repo,
+				err,
+			)
+		}
+		if !exists {
+			return fmt.Errorf(
+				"confirm private shared repository %s/%s: repository is unavailable after creation",
+				owner,
+				repo,
+			)
+		}
+	}
+	if visibility != RepoVisibilityPrivate {
+		return fmt.Errorf(
+			"shared repository %s/%s must be PRIVATE, got %s",
+			owner,
+			repo,
+			visibility,
+		)
+	}
+	return nil
 }
 
 func resolveSharedStorePath(ctx context.Context, runner Runner, mount, requested string) (string, bool, error) {

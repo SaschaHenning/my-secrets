@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	"github.com/SaschaHenning/my-secrets/internal/policy"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
+	"github.com/SaschaHenning/my-secrets/internal/teamaudit"
 	"github.com/spf13/cobra"
 )
 
@@ -1091,8 +1091,14 @@ func syncSharedAuditTarget(
 	options syncSharedAuditSetupOptions,
 ) (string, error) {
 	if remoteURL := strings.TrimSpace(options.RemoteURL); remoteURL != "" {
+		normalized, _, _, _, err := normalizeSyncSharedAuditRemote(
+			remoteURL,
+		)
+		if err != nil {
+			return "", err
+		}
 		candidate := syncpkg.TeamAuditConfig{
-			URL:                remoteURL,
+			URL:                normalized,
 			SigningFingerprint: options.SigningFingerprint,
 		}
 		if err := validateTeamAuditCandidate(
@@ -1102,7 +1108,7 @@ func syncSharedAuditTarget(
 		); err != nil {
 			return "", err
 		}
-		return remoteURL, nil
+		return normalized, nil
 	}
 	owner := strings.TrimSpace(options.Owner)
 	if owner == "" && config != nil {
@@ -1235,8 +1241,14 @@ func ensureDirectSharedAuditRemote(
 	remoteURL string,
 	fingerprint string,
 ) (string, error) {
+	normalized, owner, repo, isGitHub, err := normalizeSyncSharedAuditRemote(
+		remoteURL,
+	)
+	if err != nil {
+		return "", err
+	}
 	auditConfig := syncpkg.TeamAuditConfig{
-		URL:                remoteURL,
+		URL:                normalized,
 		SigningFingerprint: fingerprint,
 	}
 	if err := validateTeamAuditCandidate(
@@ -1244,10 +1256,6 @@ func ensureDirectSharedAuditRemote(
 		mount,
 		auditConfig,
 	); err != nil {
-		return "", err
-	}
-	owner, repo, isGitHub, err := parseGitHubAuditRemote(remoteURL)
-	if err != nil {
 		return "", err
 	}
 	if isGitHub {
@@ -1261,7 +1269,7 @@ func ensureDirectSharedAuditRemote(
 			return "", err
 		}
 	}
-	return remoteURL, nil
+	return normalized, nil
 }
 
 func ensurePrivateGitHubAuditRepo(
@@ -1357,31 +1365,39 @@ func createAndConfirmPrivateGitHubAuditRepo(
 func parseGitHubAuditRemote(
 	remoteURL string,
 ) (owner string, repo string, isGitHub bool, err error) {
-	var remotePath string
-	if strings.HasPrefix(strings.ToLower(remoteURL), "git@github.com:") {
-		remotePath = remoteURL[len("git@github.com:"):]
-	} else {
-		parsed, parseErr := url.Parse(remoteURL)
-		if parseErr != nil || !strings.EqualFold(parsed.Hostname(), "github.com") {
-			return "", "", false, nil
-		}
-		remotePath = parsed.Path
-	}
-	segments := strings.Split(strings.Trim(remotePath, "/"), "/")
-	if len(segments) != 2 {
-		return "", "", true, errors.New(
-			"GitHub audit remote must identify exactly one owner and repository",
+	return teamaudit.ParseGitHubRemote(remoteURL)
+}
+
+func normalizeSyncSharedAuditRemote(
+	remoteURL string,
+) (
+	normalized string,
+	owner string,
+	repo string,
+	isGitHub bool,
+	err error,
+) {
+	owner, repo, isGitHub, err = parseGitHubAuditRemote(remoteURL)
+	if err != nil {
+		return remoteURL, "", "", false, errors.New(
+			"invalid team audit remote URL",
 		)
 	}
-	owner = segments[0]
-	repo = strings.TrimSuffix(segments[1], ".git")
-	if err := validateGitHubAuditComponent("owner", owner, 39); err != nil {
-		return "", "", true, err
+	if !isGitHub {
+		return remoteURL, owner, repo, isGitHub, err
 	}
-	if err := validateGitHubAuditComponent("repository", repo, 100); err != nil {
-		return "", "", true, err
+	if strings.Contains(remoteURL, "://") {
+		return remoteURL, owner, repo, true, nil
 	}
-	return owner, repo, true, nil
+	hostPart, _, found := strings.Cut(remoteURL, ":")
+	if found && !strings.Contains(hostPart, "@") {
+		return fmt.Sprintf(
+			"git@github.com:%s/%s.git",
+			owner,
+			repo,
+		), owner, repo, true, nil
+	}
+	return remoteURL, owner, repo, true, nil
 }
 
 func validateTeamAuditCandidate(

@@ -63,6 +63,121 @@ func TestValidateURLCoversSupportedAndUnsafeForms(t *testing.T) {
 	}
 }
 
+func TestParseGitHubRemoteCoversEveryValidatedForm(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		remote    string
+		wantOwner string
+		wantRepo  string
+	}{
+		{
+			name:      "scp without username",
+			remote:    "github.com:jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
+		{
+			name:      "scp with git username",
+			remote:    "git@github.com:jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
+		{
+			name:      "HTTPS",
+			remote:    "https://github.com/jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
+		{
+			name:      "SSH URL",
+			remote:    "ssh://git@github.com/jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
+		{
+			name:      "GitHub SSH endpoint",
+			remote:    "ssh://git@ssh.github.com:443/jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			config := Config{
+				Mount:              "jasp-shared",
+				URL:                test.remote,
+				SigningFingerprint: testFingerprint,
+				StorePath:          "/tmp/store",
+				PolicyPath:         "/tmp/policy.yaml",
+				TeamKeysPath:       "/tmp/store/team-keys.yaml",
+				RecipientPath:      "/tmp/store/.gpg-id",
+				WorkDir:            "/tmp/audit-work",
+				StateDir:           "/tmp/audit-state",
+				DeviceIDPath:       "/tmp/device/device.id",
+			}
+			if err := config.Validate(); err != nil {
+				t.Fatalf("test remote is not accepted by Config.Validate: %v", err)
+			}
+			owner, repo, isGitHub, err := ParseGitHubRemote(test.remote)
+			if err != nil {
+				t.Fatalf("ParseGitHubRemote(%q): %v", test.remote, err)
+			}
+			if !isGitHub || owner != test.wantOwner || repo != test.wantRepo {
+				t.Fatalf(
+					"ParseGitHubRemote(%q) = %q, %q, %v; want %q, %q, true",
+					test.remote,
+					owner,
+					repo,
+					isGitHub,
+					test.wantOwner,
+					test.wantRepo,
+				)
+			}
+		})
+	}
+}
+
+func TestParseGitHubRemoteFailsClosedForMalformedGitHubTargets(t *testing.T) {
+	t.Parallel()
+
+	for _, remote := range []string{
+		"https://github.com/jasp/team/mys-audit.git",
+		"github.com:jasp/team/mys-audit.git",
+		"ssh://git@ssh.github.com:443/jasp",
+	} {
+		remote := remote
+		t.Run(remote, func(t *testing.T) {
+			t.Parallel()
+			_, _, isGitHub, err := ParseGitHubRemote(remote)
+			if !isGitHub || err == nil {
+				t.Fatalf(
+					"ParseGitHubRemote(%q) = isGitHub %v, error %v; want GitHub error",
+					remote,
+					isGitHub,
+					err,
+				)
+			}
+		})
+	}
+
+	owner, repo, isGitHub, err := ParseGitHubRemote(
+		"ssh://git@gitlab.example/jasp/mys-audit.git",
+	)
+	if err != nil || isGitHub || owner != "" || repo != "" {
+		t.Fatalf(
+			"non-GitHub remote = %q, %q, %v, %v; want empty, empty, false, nil",
+			owner,
+			repo,
+			isGitHub,
+			err,
+		)
+	}
+}
+
 func TestInputValidationRejectsEveryUnsafeField(t *testing.T) {
 	t.Parallel()
 

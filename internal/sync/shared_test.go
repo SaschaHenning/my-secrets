@@ -189,6 +189,46 @@ type sequenceSharedRunner struct {
 	calls    []string
 }
 
+type sharedPrivacyResponse struct {
+	out []byte
+	err error
+}
+
+type sharedPrivacyRunner struct {
+	responses map[string][]sharedPrivacyResponse
+	calls     []string
+}
+
+func (r *sharedPrivacyRunner) Run(
+	_ context.Context,
+	name string,
+	args ...string,
+) ([]byte, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.calls = append(r.calls, call)
+	responses := r.responses[call]
+	if len(responses) == 0 {
+		return nil, fmt.Errorf("unexpected call: %s", call)
+	}
+	response := responses[0]
+	r.responses[call] = responses[1:]
+	return response.out, response.err
+}
+
+func installSharedTestGH(t *testing.T) {
+	t.Helper()
+	binaryDir := t.TempDir()
+	ghPath := filepath.Join(binaryDir, "gh")
+	if err := os.WriteFile(
+		ghPath,
+		[]byte("#!/bin/sh\nexit 0\n"),
+		0o700,
+	); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binaryDir)
+}
+
 func (r *sequenceSharedRunner) Run(
 	_ context.Context,
 	name string,
@@ -209,6 +249,255 @@ func (r *sequenceSharedRunner) Run(
 		return response.out, response.errs[offset]
 	}
 	return response.out, nil
+}
+
+func TestEnsureSharedRemoteChecksEveryDirectGitHubForm(t *testing.T) {
+	remotes := []string{
+		"github.com:jasp/mys-store-shared.git",
+		"git@github.com:jasp/mys-store-shared.git",
+		"https://github.com/jasp/mys-store-shared.git",
+		"ssh://git@github.com/jasp/mys-store-shared.git",
+		"ssh://git@ssh.github.com:443/jasp/mys-store-shared.git",
+	}
+	for _, remote := range remotes {
+		remote := remote
+		t.Run(remote, func(t *testing.T) {
+			installSharedTestGH(t)
+			runner := &sharedPrivacyRunner{
+				responses: map[string][]sharedPrivacyResponse{
+					"gh repo view jasp/mys-store-shared --json visibility --jq .visibility": {
+						{out: []byte("PRIVATE\n")},
+					},
+				},
+			}
+			got, err := ensureSharedRemote(
+				context.Background(),
+				runner,
+				SharedProvisionOptions{RemoteURL: remote},
+			)
+			if err != nil {
+				t.Fatalf("ensureSharedRemote(%q): %v", remote, err)
+			}
+			if got != remote {
+				t.Fatalf("remote = %q, want unchanged %q", got, remote)
+			}
+			if len(runner.calls) != 1 {
+				t.Fatalf("calls = %v, want one visibility query", runner.calls)
+			}
+		})
+	}
+}
+
+func TestEnsureSharedRemoteRejectsUnprovenGitHubPrivacy(t *testing.T) {
+	tests := []struct {
+		name      string
+		response  sharedPrivacyResponse
+		wantError string
+	}{
+		{
+			name:      "public",
+			response:  sharedPrivacyResponse{out: []byte("PUBLIC\n")},
+			wantError: "must be PRIVATE",
+		},
+		{
+			name:      "internal",
+			response:  sharedPrivacyResponse{out: []byte("INTERNAL\n")},
+			wantError: "must be PRIVATE",
+		},
+		{
+			name:      "empty",
+			wantError: "unexpected response",
+		},
+		{
+			name:      "CLI error",
+			response:  sharedPrivacyResponse{err: errors.New("API unavailable")},
+			wantError: "API unavailable",
+		},
+		{
+			name:      "unavailable",
+			response:  sharedPrivacyResponse{err: errors.New("HTTP 404")},
+			wantError: "repository is unavailable",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			installSharedTestGH(t)
+			runner := &sharedPrivacyRunner{
+				responses: map[string][]sharedPrivacyResponse{
+					"gh repo view jasp/mys-store-shared --json visibility --jq .visibility": {
+						test.response,
+					},
+				},
+			}
+			_, err := ensureSharedRemote(
+				context.Background(),
+				runner,
+				SharedProvisionOptions{
+					RemoteURL: "github.com:jasp/mys-store-shared.git",
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("error = %v, want substring %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestEnsureSharedRemoteCreatesAndRechecksPrivateGitHubRepo(t *testing.T) {
+	installSharedTestGH(t)
+	const view = "gh repo view jasp/mys-store-shared --json visibility --jq .visibility"
+	runner := &sharedPrivacyRunner{
+		responses: map[string][]sharedPrivacyResponse{
+			view: {
+				{err: errors.New("HTTP 404")},
+				{out: []byte("PRIVATE\n")},
+			},
+			"gh repo create jasp/mys-store-shared --private": {
+				{out: []byte("created\n")},
+			},
+		},
+	}
+	remote, err := ensureSharedRemote(
+		context.Background(),
+		runner,
+		SharedProvisionOptions{
+			Owner:       "jasp",
+			Repo:        "mys-store-shared",
+			RemoteStyle: RemoteHTTPS,
+		},
+	)
+	if err != nil {
+		t.Fatalf("ensureSharedRemote: %v", err)
+	}
+	if remote != "https://github.com/jasp/mys-store-shared.git" {
+		t.Fatalf("remote = %q, want managed HTTPS remote", remote)
+	}
+	wantCalls := []string{
+		view,
+		"gh repo create jasp/mys-store-shared --private",
+		view,
+	}
+	if strings.Join(runner.calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("calls = %v, want create followed by privacy recheck", runner.calls)
+	}
+}
+
+func TestEnsureSharedRemoteRejectsUnconfirmedCreatedGitHubRepo(t *testing.T) {
+	tests := []struct {
+		name         string
+		confirmation sharedPrivacyResponse
+		wantError    string
+	}{
+		{
+			name:         "public",
+			confirmation: sharedPrivacyResponse{out: []byte("PUBLIC\n")},
+			wantError:    "must be PRIVATE",
+		},
+		{
+			name:         "internal",
+			confirmation: sharedPrivacyResponse{out: []byte("INTERNAL\n")},
+			wantError:    "must be PRIVATE",
+		},
+		{
+			name:      "empty",
+			wantError: "unexpected response",
+		},
+		{
+			name:         "CLI error",
+			confirmation: sharedPrivacyResponse{err: errors.New("API unavailable")},
+			wantError:    "API unavailable",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			installSharedTestGH(t)
+			const view = "gh repo view jasp/mys-store-shared --json visibility --jq .visibility"
+			runner := &sharedPrivacyRunner{
+				responses: map[string][]sharedPrivacyResponse{
+					view: {
+						{err: errors.New("HTTP 404")},
+						test.confirmation,
+					},
+					"gh repo create jasp/mys-store-shared --private": {
+						{out: []byte("created\n")},
+					},
+				},
+			}
+			_, err := ensureSharedRemote(
+				context.Background(),
+				runner,
+				SharedProvisionOptions{
+					Owner:       "jasp",
+					Repo:        "mys-store-shared",
+					RemoteStyle: RemoteHTTPS,
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("error = %v, want substring %q", err, test.wantError)
+			}
+			if len(runner.calls) != 3 || runner.calls[2] != view {
+				t.Fatalf("calls = %v, want post-create visibility recheck", runner.calls)
+			}
+		})
+	}
+}
+
+func TestProvisionSharedMountProvesPrivacyBeforeMountOrConfigMutation(
+	t *testing.T,
+) {
+	installSharedTestGH(t)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	storePath := filepath.Join(t.TempDir(), "shared")
+	config := &Config{
+		Version: 1,
+		Layout:  LayoutSingle,
+		Remotes: []StoreRemote{{
+			Mount: DefaultStoreMount,
+			URL:   "personal.git",
+		}},
+	}
+	runner := &sharedPrivacyRunner{
+		responses: map[string][]sharedPrivacyResponse{
+			"gpg --batch --with-colons --list-keys " + sharedFprBob: {
+				{out: []byte(gpgFingerprintFixture(sharedFprBob))},
+			},
+			"gpg --batch --with-colons --list-secret-keys " + sharedFprBob: {
+				{out: []byte(gpgFingerprintFixture(sharedFprBob))},
+			},
+			"gh repo view jasp/mys-store-shared --json visibility --jq .visibility": {
+				{out: []byte("PUBLIC\n")},
+			},
+		},
+	}
+
+	result, err := ProvisionSharedMount(
+		context.Background(),
+		SharedProvisionOptions{
+			Config:       config,
+			Mount:        "jasp",
+			StorePath:    storePath,
+			Fingerprints: []string{sharedFprBob},
+			RemoteURL:    "github.com:jasp/mys-store-shared.git",
+			Runner:       runner,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "must be PRIVATE") {
+		t.Fatalf("result = %v, error = %v; want PRIVATE refusal", result, err)
+	}
+	if len(config.Remotes) != 1 ||
+		config.Remotes[0].Mount != DefaultStoreMount ||
+		config.Remotes[0].Shared {
+		t.Fatalf("input config mutated before privacy proof: %+v", config.Remotes)
+	}
+	if _, statErr := os.Lstat(storePath); !os.IsNotExist(statErr) {
+		t.Fatalf("shared store path mutated before privacy proof: %v", statErr)
+	}
+	for _, call := range runner.calls {
+		if strings.HasPrefix(call, "gopass ") {
+			t.Fatalf("mount/store command ran before privacy proof: %s", call)
+		}
+	}
 }
 
 func (r *recipientReconcileRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {

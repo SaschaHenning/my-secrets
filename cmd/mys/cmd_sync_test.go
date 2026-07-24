@@ -231,6 +231,48 @@ func TestRunSyncSharedSetupPersistsAndAudits(t *testing.T) {
 	}
 }
 
+func TestRunSyncSharedSetupDoesNotPersistUnprovenRemote(t *testing.T) {
+	clearSyncAISignals(t)
+	auditPath := filepath.Join(t.TempDir(), "audit.sqlite")
+	var saveCalls int
+	deps := syncSharedSetupDeps{
+		Load: func(string) (*syncpkg.Config, error) {
+			return &syncpkg.Config{Version: 1}, nil
+		},
+		Save: func(string, *syncpkg.Config) error {
+			saveCalls++
+			return nil
+		},
+		Provision: func(
+			context.Context,
+			syncpkg.SharedProvisionOptions,
+		) (*syncpkg.SharedProvisionResult, error) {
+			return nil, errors.New(
+				"shared repository jasp/mys-store-shared must be PRIVATE",
+			)
+		},
+		OpenAudit: testSyncAuditOpener(t, auditPath),
+	}
+	err := runSyncSharedSetupAs(
+		context.Background(),
+		newSyncTestCommand(&bytes.Buffer{}, &bytes.Buffer{}),
+		humanSyncDetail(),
+		syncSharedSetupOptions{
+			Mount:        "jasp",
+			Fingerprints: []string{syncSharedTestFingerprint},
+			RemoteURL:    "github.com:jasp/mys-store-shared.git",
+			Yes:          true,
+		},
+		deps,
+	)
+	if err == nil || !strings.Contains(err.Error(), "must be PRIVATE") {
+		t.Fatalf("error = %v, want privacy refusal", err)
+	}
+	if saveCalls != 0 {
+		t.Fatalf("sync config persisted %d times after privacy failure", saveCalls)
+	}
+}
+
 func TestRunSyncSharedSetupStopsBeforeMutation(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -1783,6 +1825,15 @@ func TestEnsureSyncSharedAuditRemoteRejectsUnconfirmedCreatedRepo(t *testing.T) 
 			wantError:    "must be PRIVATE",
 		},
 		{
+			name:         "created internal",
+			confirmation: stubResp{out: []byte("INTERNAL\n")},
+			wantError:    "must be PRIVATE",
+		},
+		{
+			name:      "empty confirmation",
+			wantError: "unexpected response",
+		},
+		{
 			name:         "confirmation query failed",
 			confirmation: stubResp{err: errors.New("API unavailable")},
 			wantError:    "API unavailable",
@@ -1826,6 +1877,7 @@ func TestRunSyncSharedAuditSetupRejectsVisibilityBeforeMutation(t *testing.T) {
 	}{
 		{name: "public", response: stubResp{out: []byte("PUBLIC\n")}},
 		{name: "internal", response: stubResp{out: []byte("INTERNAL\n")}},
+		{name: "empty", response: stubResp{}},
 		{name: "malformed", response: stubResp{out: []byte("UNKNOWN\n")}},
 		{name: "query error", response: stubResp{err: errors.New("API unavailable")}},
 	}
@@ -1844,8 +1896,8 @@ func TestRunSyncSharedAuditSetupRejectsVisibilityBeforeMutation(t *testing.T) {
 				syncSharedAuditSetupOptions{
 					Mount:              "jasp",
 					SigningFingerprint: syncSharedTestFingerprint,
+					RemoteURL:          "github.com:jasp/mys-audit.git",
 					Repo:               defaultTeamAuditRepo,
-					UseHTTPS:           true,
 					Yes:                true,
 				},
 				syncSharedAuditSetupDeps{
@@ -1972,6 +2024,68 @@ func TestEnsureSyncSharedAuditRemoteChecksDirectGitHubRepo(t *testing.T) {
 	}
 }
 
+func TestEnsureSyncSharedAuditRemoteChecksEveryDirectGitHubForm(t *testing.T) {
+	remotes := []struct {
+		remote string
+		want   string
+	}{
+		{
+			remote: "github.com:jasp/mys-audit.git",
+			want:   "git@github.com:jasp/mys-audit.git",
+		},
+		{
+			remote: "git@github.com:jasp/mys-audit.git",
+			want:   "git@github.com:jasp/mys-audit.git",
+		},
+		{
+			remote: "https://github.com/jasp/mys-audit.git",
+			want:   "https://github.com/jasp/mys-audit.git",
+		},
+		{
+			remote: "ssh://git@github.com/jasp/mys-audit.git",
+			want:   "ssh://git@github.com/jasp/mys-audit.git",
+		},
+		{
+			remote: "ssh://git@ssh.github.com:443/jasp/mys-audit.git",
+			want:   "ssh://git@ssh.github.com:443/jasp/mys-audit.git",
+		},
+	}
+	for _, test := range remotes {
+		test := test
+		t.Run(test.remote, func(t *testing.T) {
+			installSyncTestGH(t)
+			runner := &stubRunner{handlers: map[string]stubResp{
+				"gh repo view jasp/mys-audit --json visibility --jq .visibility": {
+					out: []byte("PRIVATE\n"),
+				},
+			}}
+			got, err := ensureSyncSharedAuditRemote(
+				context.Background(),
+				runner,
+				sharedAuditGitHubTestConfig(),
+				syncSharedAuditSetupOptions{
+					Mount:              "jasp",
+					SigningFingerprint: syncSharedTestFingerprint,
+					RemoteURL:          test.remote,
+					Repo:               defaultTeamAuditRepo,
+				},
+				syncSharedTestFingerprint,
+			)
+			if err != nil {
+				t.Fatalf("ensure direct GitHub audit remote: %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("remote URL = %q, want %q", got, test.want)
+			}
+			if len(runner.calls) != 1 ||
+				runner.calls[0] !=
+					"gh repo view jasp/mys-audit --json visibility --jq .visibility" {
+				t.Fatalf("visibility calls = %v, want one GitHub query", runner.calls)
+			}
+		})
+	}
+}
+
 func TestParseGitHubAuditRemote(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -1981,6 +2095,13 @@ func TestParseGitHubAuditRemote(t *testing.T) {
 		wantGitHub bool
 		wantError  bool
 	}{
+		{
+			name:       "scp without username",
+			remote:     "github.com:jasp/mys-audit.git",
+			wantOwner:  "jasp",
+			wantRepo:   "mys-audit",
+			wantGitHub: true,
+		},
 		{
 			name:       "scp SSH",
 			remote:     "git@github.com:jasp/mys-audit.git",
@@ -1998,6 +2119,13 @@ func TestParseGitHubAuditRemote(t *testing.T) {
 		{
 			name:       "HTTPS URL",
 			remote:     "https://github.com/jasp/mys-audit.git",
+			wantOwner:  "jasp",
+			wantRepo:   "mys-audit",
+			wantGitHub: true,
+		},
+		{
+			name:       "GitHub SSH endpoint",
+			remote:     "ssh://git@ssh.github.com:443/jasp/mys-audit.git",
 			wantOwner:  "jasp",
 			wantRepo:   "mys-audit",
 			wantGitHub: true,

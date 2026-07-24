@@ -279,6 +279,102 @@ func ValidateURL(raw string) error {
 	return nil
 }
 
+// ParseGitHubRemote maps every GitHub URL form accepted by ValidateURL to the
+// owner/repository slug used by the GitHub CLI. A malformed target on a
+// recognized GitHub host remains a GitHub target and fails closed.
+func ParseGitHubRemote(
+	raw string,
+) (owner string, repo string, isGitHub bool, err error) {
+	if err := ValidateURL(raw); err != nil {
+		return "", "", false, err
+	}
+	if filepath.IsAbs(raw) {
+		return "", "", false, nil
+	}
+
+	var host string
+	var remotePath string
+	if strings.Contains(raw, "://") {
+		parsed, parseErr := url.Parse(raw)
+		if parseErr != nil {
+			return "", "", false, fmt.Errorf(
+				"parse GitHub remote: %w",
+				parseErr,
+			)
+		}
+		if parsed.Scheme == "file" {
+			return "", "", false, nil
+		}
+		host = parsed.Hostname()
+		remotePath = parsed.Path
+	} else {
+		colon := strings.IndexByte(raw, ':')
+		if colon < 1 {
+			return "", "", false, nil
+		}
+		host = raw[:colon]
+		if at := strings.LastIndexByte(host, '@'); at >= 0 {
+			host = host[at+1:]
+		}
+		remotePath = raw[colon+1:]
+	}
+	if !isGitHubRemoteHost(host) {
+		return "", "", false, nil
+	}
+
+	segments := strings.Split(strings.Trim(remotePath, "/"), "/")
+	if len(segments) != 2 {
+		return "", "", true, errors.New(
+			"GitHub remote must identify exactly one owner and repository",
+		)
+	}
+	owner = segments[0]
+	repo = strings.TrimSuffix(segments[1], ".git")
+	if err := validateGitHubRemoteComponent("owner", owner, 39); err != nil {
+		return "", "", true, err
+	}
+	if err := validateGitHubRemoteComponent(
+		"repository",
+		repo,
+		100,
+	); err != nil {
+		return "", "", true, err
+	}
+	return owner, repo, true, nil
+}
+
+func isGitHubRemoteHost(host string) bool {
+	return strings.EqualFold(host, "github.com") ||
+		strings.EqualFold(host, "ssh.github.com")
+}
+
+func validateGitHubRemoteComponent(
+	label string,
+	value string,
+	limit int,
+) error {
+	if value == "" || len(value) > limit ||
+		strings.HasPrefix(value, ".") ||
+		strings.HasSuffix(value, ".") ||
+		strings.HasPrefix(value, "-") ||
+		strings.HasSuffix(value, "-") ||
+		strings.Contains(value, "..") {
+		return fmt.Errorf("GitHub %s is invalid", label)
+	}
+	for _, character := range value {
+		valid := character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '-' ||
+			label == "repository" &&
+				(character == '_' || character == '.')
+		if !valid {
+			return fmt.Errorf("GitHub %s is invalid", label)
+		}
+	}
+	return nil
+}
+
 func validatedLocalAuditPath(raw string) (string, bool) {
 	if filepath.IsAbs(raw) {
 		return raw, true
