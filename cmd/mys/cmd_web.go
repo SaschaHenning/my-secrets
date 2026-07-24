@@ -35,7 +35,7 @@ func webCmd() *cobra.Command {
 			return web.Serve(ctx, a, port, cmd.OutOrStdout())
 		},
 	}
-	c.Flags().IntVar(&port, "port", 7823, "listen port")
-	c.AddCommand(webInstallCmd(), webUninstallCmd(), webStatusCmd())
+	c.Flags().IntVar(&port, "port", defaultWebPort, "listen port")
+	c.AddCommand(webInstallCmd(), webUninstallCmd(), webStatusCmd(), webOpenCmd())
 	return c
 }

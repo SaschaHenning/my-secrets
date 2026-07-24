@@ -16,6 +16,17 @@ import (
 // project's Keychain service names (com.jasp.my-secrets.audit-signing).
 const launchAgentLabel = "com.jasp.my-secrets.web"
 
+// defaultWebPort is the single source of truth for the port `mys web`,
+// `mys web install`, and `mys web open` default to. The web UI binds
+// 127.0.0.1 only (internal/web), so this is a loopback-local port.
+const defaultWebPort = 7823
+
+// webURL renders the loopback URL the web UI is reachable at. Kept in one
+// place so install/open/status all print an identical, correct address.
+func webURL(port int) string {
+	return fmt.Sprintf("http://127.0.0.1:%d", port)
+}
+
 // launchctlRun is the subprocess indirection `mys web install/uninstall/
 // status` use for every launchctl call. A package-level var (same
 // pattern as internal/web's requireTouchIDFunc and internal/history's
@@ -110,6 +121,46 @@ func renderLaunchAgentPlist(binPath string, port int, logPath, path string) stri
 `, launchAgentLabel, xmlEscape(binPath), port, xmlEscape(path), xmlEscape(logPath), xmlEscape(logPath))
 }
 
+// installWebAgent writes the LaunchAgent plist for `mys web --port <port>`
+// and (re)loads it via launchctl, returning the plist path on success. It
+// holds the full install sequence so both `mys web install` and the
+// auto-install path of `mys web open` share exactly one implementation.
+func installWebAgent(port int) (plistPath string, err error) {
+	bin, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("eigenen Binary-Pfad ermitteln: %w", err)
+	}
+	if resolved, err := filepath.EvalSymlinks(bin); err == nil {
+		bin = resolved
+	}
+	plistPath, err = launchAgentPlistPath()
+	if err != nil {
+		return "", err
+	}
+	logPath, err := webLogPath()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return "", fmt.Errorf("log-Verzeichnis anlegen: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(plistPath), 0o700); err != nil {
+		return "", fmt.Errorf("LaunchAgents-Verzeichnis anlegen: %w", err)
+	}
+	plist := renderLaunchAgentPlist(bin, port, logPath, os.Getenv("PATH"))
+	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
+		return "", fmt.Errorf("plist schreiben: %w", err)
+	}
+	// Unload first so a re-install (e.g. after --port changed) actually
+	// picks up the new definition; ignore the error, since "not currently
+	// loaded" is the common case and is not itself a failure.
+	_, _ = launchctlRun("unload", plistPath)
+	if out, err := launchctlRun("load", plistPath); err != nil {
+		return "", fmt.Errorf("launchctl load: %w\n%s", err, out)
+	}
+	return plistPath, nil
+}
+
 // webInstallCmd builds `mys web install`.
 func webInstallCmd() *cobra.Command {
 	var port int
@@ -124,46 +175,17 @@ Server-Prozess selbst schläft nie dauerhaft ein. Ein installiertes
 PWA-Icon trifft danach immer auf einen laufenden Server statt auf
 "Verbindung abgelehnt".`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			bin, err := os.Executable()
-			if err != nil {
-				return fmt.Errorf("eigenen Binary-Pfad ermitteln: %w", err)
-			}
-			if resolved, err := filepath.EvalSymlinks(bin); err == nil {
-				bin = resolved
-			}
-			plistPath, err := launchAgentPlistPath()
+			plistPath, err := installWebAgent(port)
 			if err != nil {
 				return err
-			}
-			logPath, err := webLogPath()
-			if err != nil {
-				return err
-			}
-			if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-				return fmt.Errorf("log-Verzeichnis anlegen: %w", err)
-			}
-			if err := os.MkdirAll(filepath.Dir(plistPath), 0o700); err != nil {
-				return fmt.Errorf("LaunchAgents-Verzeichnis anlegen: %w", err)
-			}
-			plist := renderLaunchAgentPlist(bin, port, logPath, os.Getenv("PATH"))
-			if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
-				return fmt.Errorf("plist schreiben: %w", err)
-			}
-			// Unload first so a re-install (e.g. after --port changed)
-			// actually picks up the new definition; ignore the error,
-			// since "not currently loaded" is the common case and is not
-			// itself a failure.
-			_, _ = launchctlRun("unload", plistPath)
-			if out, err := launchctlRun("load", plistPath); err != nil {
-				return fmt.Errorf("launchctl load: %w\n%s", err, out)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(),
-				"installiert: %s\nmys web läuft künftig dauerhaft auf http://127.0.0.1:%d — auch nach Neustart oder Idle-Shutdown\n",
-				plistPath, port)
+				"installiert: %s\nmys web läuft künftig dauerhaft auf %s — auch nach Neustart oder Idle-Shutdown\nÖffnen mit: mys web open\n",
+				plistPath, webURL(port))
 			return nil
 		},
 	}
-	c.Flags().IntVar(&port, "port", 7823, "Port für den Autostart-Server")
+	c.Flags().IntVar(&port, "port", defaultWebPort, "Port für den Autostart-Server")
 	return c
 }
 
