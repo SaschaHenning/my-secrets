@@ -196,10 +196,95 @@ later entry fails, while the command and summary audit remain failed.
 config lock. Persistent audit reasons contain stage/count metadata,
 never raw Git or Bitwarden subprocess errors.
 
-This is Tier-A phases 1–3. It does not add shared signed read events,
-team-log aggregation, fail-closed read policy, or revocation automation
-(phases 4–6). All current read auditing remains machine-local and
-bypassable by any holder of a recipient private key.
+### Shared-read policy and signed audit data plane
+
+Each configured shared remote may carry an independent `team_audit`
+configuration:
+
+```yaml
+remotes:
+  - mount: jasp
+    url: git@github.com:jasp/mys-store-shared.git
+    shared: true
+    team_audit:
+      url: git@github.com:jasp/mys-store-shared-audit.git
+      signing_fingerprint: 0123456789ABCDEF0123456789ABCDEF01234567
+```
+
+`mys sync shared audit setup` resolves the candidate remote before taking the
+global cooperative `mys` lock on a validated, stable home-directory inode. It
+creates or validates the restrictive shared policy monotonically, then
+provisions the audit dependency. GitHub-backed
+repositories must report `PRIVATE`, including immediately after creation.
+Provisioning validates the signer against the current `team-keys.yaml` and
+`.gpg-id`, verifies the full audit repository, pushes a unique empty probe
+branch, confirms its exact OID, deletes it with a lease, and confirms that
+deletion. A query, push, confirmation, cleanup, or visibility uncertainty
+leaves `sync.yaml` unchanged. A valid policy already materialized by that
+attempt is deliberately retained and reused by the next idempotent setup; the
+code never races another process to delete policy state.
+
+`internal/app` creates one fresh `accessOperation` per public operation. It
+reloads global policy, sync config, and the mount policy. The bound Store opener
+takes the same global cooperative lock, captures each team-audited mount's real
+path and directory identity, opens the gopass Store, and post-verifies every
+captured inode under an in-process open gate. The lock remains held until that
+operation closes its Store. The operation uses only the frozen resolver, which
+rechecks directory identity before returning a path; drift closes the Store and
+fails closed. Shared access is the logical AND of global and mount-local
+decisions. Before decrypting, `teamaudit.Preflight` records:
+
+1. the published shared-store Git commit;
+2. SHA-256 of the exact parsed shared-policy bytes;
+3. SHA-256 of `team-keys.yaml`; and
+4. SHA-256 of the canonical `.gpg-id` set.
+
+The same snapshot is passed back to `AppendBatch` after decrypt. Immediately
+before signing, the manager repeats preflight, reloads signer identity and
+membership, then repeats preflight again. Any difference rejects the append.
+Caller-generated UUID event IDs remain stable across the manager's ambiguous
+push/confirmation handling, so a remotely present batch is confirmed instead
+of duplicated.
+
+```text
+authorize(global AND shared)
+        │
+        ▼
+Preflight(store, policy, team keys, recipients)
+        │
+        ▼
+decrypt requested values
+        │
+        ▼
+AppendBatch(exact preflight snapshot, caller UUIDs)
+        │
+        ├─ AI failure ──▶ return no plaintext / no partial result
+        └─ human/script backend failure ──▶ generic advisory warning
+```
+
+Successful events are strict version-1 NDJSON records. Each contains
+attribution, host/device identity, all four snapshot fields, a per-branch
+sequence, previous-row hash, row hash, and a detached GPG signature. Devices
+append only to
+`audit/v1/<mount>/<primary-fingerprint>/<device-uuid>`. Aggregation:
+
+- validates branch names and trees;
+- verifies each row hash, chain, and detached signature;
+- confirms the signer was both a manifest member and recipient at the
+  recorded store commit;
+- rejects duplicate event IDs across branches; and
+- advances local rollback watermarks only after complete verification.
+
+The watermarks detect later branch deletion, truncation, history rewrite, or
+prefix divergence. A new verifier has no pre-existing remote observation, so
+its first successful aggregation establishes—not retroactively proves—the
+rollback baseline.
+
+Phases 1–6 remain an application-layer guarantee. A recipient private-key
+holder can bypass `mys` with raw `gpg`/`gopass`; that read is neither blocked
+by the policies nor represented in the signed repository. Operational
+revocation, rotation, historical-key retention, and watermark recovery are
+defined in `docs/SHARED-TEAM-RUNBOOK.md`.
 
 ## Metadata model
 
@@ -426,12 +511,15 @@ never touch the real, global launchd session.
 
 ## Trade-offs documented in plan.html
 
-- The optional signed chain protects one machine's SQLite audit history;
-  it is not the per-user, Git-aggregated shared-read audit planned for a
-  later Tier-A phase.
+- The optional signed chain still protects one machine's SQLite audit history.
+  Shared reads performed through `mys` are additionally recorded in signed,
+  per-device Git branches and aggregated across team members with historical
+  authorization and rollback-watermark verification.
 - No native Swift daemon (Ansatz A) — machine binding comes from
   gopass's GPG key in the Keychain with `AccessibleWhenUnlockedThisDeviceOnly`,
   which is strong enough for the single-user threat model.
-- Audit coverage for human CLI users relies on them going through `mys`
-  and not invoking `gopass` directly. For AI, the MCP-only path makes
-  this guarantee tight.
+- Both audit paths remain application-layer evidence. A recipient private-key
+  holder can bypass `mys` with raw `gpg` or `gopass`; those reads are neither
+  blocked nor recorded in the signed team-audit repository. For AI
+  integrations that expose only MCP, that interface keeps normal reads on the
+  audited path, but it does not provide OS-level enforcement.

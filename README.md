@@ -627,25 +627,120 @@ Subprozessfehler erscheinen vollständig nur im aktuellen CLI-Fehler;
 das persistente Audit speichert ausschließlich Stufe und Zähler.
 `bw-import` bleibt für AI-Caller hart gesperrt, auch mit `--yes`.
 
+#### Signiertes Team-Read-Audit und Shared-Policy
+
+Jeder Shared-Mount kann ein **separates privates Audit-Repo** erhalten.
+Jedes Gerät schreibt ausschließlich auf seinen eigenen Branch
+`audit/v1/<mount>/<signer-fingerprint>/<device-id>`. Ein Ereignis enthält
+keinen Secret-Wert, bindet aber Pfad, Aktion und Actor kryptografisch an:
+
+- den veröffentlichten Commit des Shared-Stores,
+- die exakten Bytes der Shared-Policy,
+- `team-keys.yaml`,
+- das kanonische `.gpg-id`-Recipient-Set und
+- das vorherige Ereignis desselben Geräte-Branches.
+
+Vor dem Setup muss der Signing-Key als aktueller Team-Recipient im Manifest
+stehen. Bei GitHub prüft `mys` ein vorhandenes Repo explizit auf Sichtbarkeit
+`PRIVATE`; bei einem neu erzeugten Repo wird die Sichtbarkeit erneut gelesen.
+Ein temporärer, inhaltsleerer Probe-Branch beweist echte Schreib- und
+Löschrechte und wird vor dem Speichern der Konfiguration wieder entfernt.
+
+```bash
+# Pro Gerät einmalig; der Fingerprint ist der primäre GPG-Key-Fingerprint.
+mys sync shared audit setup \
+  --mount jasp \
+  --fingerprint 0123456789ABCDEF0123456789ABCDEF01234567 \
+  --owner jasp \
+  --repo mys-store-shared-audit
+
+# Alternativ ein vorhandenes credential-freies Remote oder lokales Bare-Repo:
+mys sync shared audit setup \
+  --mount jasp \
+  --fingerprint 0123456789ABCDEF0123456789ABCDEF01234567 \
+  --remote /path/to/mys-store-shared-audit.git
+```
+
+Der Befehl ist ausschließlich für menschliche Caller freigegeben. `--yes`
+überspringt nur die Bestätigung, nicht die Caller-Klassifizierung. Nach Erfolg
+enthält der Remote-Eintrag in `sync.yaml` zusätzlich:
+
+```yaml
+team_audit:
+  url: git@github.com:jasp/mys-store-shared-audit.git
+  signing_fingerprint: 0123456789ABCDEF0123456789ABCDEF01234567
+```
+
+Beim Setup entsteht
+`~/.config/my-secrets/shared-policies/jasp.yaml` mit Modus `0600`. Sie wird
+bei jedem Zugriff zusammen mit der globalen `scope-policy.yaml` frisch
+geladen; **beide** Policies müssen den Pfad erlauben:
+
+```yaml
+version: 1
+actors:
+  human:
+    allow: ["jasp/**"]
+  script:
+    allow: ["jasp/**"]
+  ai:
+    allow: ["jasp/**"]
+  claude-code:
+    allow: ["jasp/**"]
+```
+
+Die Policy ist monotone, restriktive Sicherheitskonfiguration: Ein
+Cross-Process-Lock serialisiert parallele Setup-Läufe. Scheitert die
+Remote-Provisionierung oder die anschließende Config-Prüfung, bleibt eine
+bereits erzeugte gültige Policy bestehen; `sync.yaml` wird erst nach
+erneutem Laden des tatsächlich persistierten Zielzustands akzeptiert. Der
+nächste Setup-Lauf verwendet die Policy idempotent weiter.
+
+Fehlen Policy, Config, Mount, Preflight oder Signing-Voraussetzungen, liefert
+ein AI-Aufruf keinen Plaintext und kein Teilergebnis. Bei einem Fehler erst
+nach der Entschlüsselung – etwa einem Netzwerkausfall beim Append – wird der
+bereits gelesene Wert ebenfalls nicht an den AI-Caller zurückgegeben.
+Menschliche und Script-Caller dürfen bei einem reinen Audit-Backend-Fehler
+mit einer generischen Warnung fortfahren; eine Policy-Verweigerung bleibt
+für alle Caller bindend.
+
+Teamweit verifizieren und filtern:
+
+```bash
+mys audit team
+mys audit team --mount jasp --since 2026-07-01
+mys audit team --mount jasp --user alice@example.org --path jasp/prod
+mys audit team --mount jasp --actor claude-code --format json
+```
+
+Die Aggregation verifiziert Branchschema, Hashkette, GPG-Signatur,
+historische Team-Mitgliedschaft und Recipient-Autorisierung am aufgezeichneten
+Store-Commit. Lokale Watermarks erkennen danach gelöschte, verkürzte oder
+umgeschriebene Remote-Historie.
+
 ### Trust Model und aktueller Ausbauzustand
 
 Shared-Mounts aus Tier A sind **advisory**, nicht erzwingbar auditiert.
 Jeder eingetragene Recipient kann die verschlüsselten Dateien lokal mit
 nacktem `gpg` oder `gopass` außerhalb von `mys` entschlüsseln; dabei
-entsteht keine Audit-Zeile. Das aktuelle Audit bleibt außerdem eine
-lokale SQLite-Datenbank pro Maschine. Das Shared-Repo schafft in dieser
-Ausbaustufe Team-Verfügbarkeit und eine Fingerprint-zu-Identität-Map,
-aber noch keinen zentralen oder beweisbaren „wer hat was gelesen"-Nachweis.
+entsteht keine Team-Audit-Zeile. Das signierte Repo beweist deshalb
+erfolgreiche Reads durch kooperative `mys`-Clients, nicht die Abwesenheit
+anderer Reads. Die lokale SQLite-Datenbank bleibt für allgemeine CLI-/Web-/
+MCP-Aktionen bestehen; das Team-Repo ergänzt sie nur für Shared-Reads.
 
-In diesem Stand sind Tier-A-Phase 1 (Shared-Mount-Provisionierung),
-Phase 2 (mount-spezifische Recipient-Verwaltung) und Phase 3
-(Bitwarden-Seeding in einen expliziten Shared-Mount) umgesetzt.
-Ein signiertes Team-Read-Audit, fail-closed Shared-Policy und der
-Revocation-/Rotations-Runbook aus den Phasen 4–6 sind noch nicht
-implementiert. Beim Entfernen eines Team-Keys muss man
-weiterhin davon ausgehen, dass die Person alle bisher zugänglichen
-Secrets gelesen oder alte Ciphertext-Kopien behalten haben könnte;
-betroffene Secrets müssen deshalb rotiert werden.
+Tier-A-Phase 1 (Shared-Mount), Phase 2 (Recipients), Phase 3
+(Bitwarden-Seeding), Phase 4 (signierte Geräte-Branches und Aggregation),
+Phase 5 (kombinierte fail-closed Read-Policy) und Phase 6
+(Revocation-/Rotation-Runbook) sind umgesetzt. Der vollständige
+Betriebsablauf für Onboarding, Geräte-/Key-Wechsel, Revocation,
+Watermark-Recovery und historische Public Keys steht in
+[`docs/SHARED-TEAM-RUNBOOK.md`](docs/SHARED-TEAM-RUNBOOK.md).
+
+Beim Entfernen eines Team-Keys muss weiterhin davon ausgegangen werden,
+dass die Person alle bisher zugänglichen Secrets gelesen oder alte
+Ciphertext-Kopien behalten hat. Entfernen und Re-Encryption verhindern
+nur zukünftige Entschlüsselung des neuen Stands; alle möglicherweise
+zugänglichen Secret-Werte müssen anschließend rotiert werden.
 
 ### Auto-Sync nach Schreiboperationen
 

@@ -129,10 +129,11 @@ account `default`. The matching public key is written to
 `~/.local/share/my-secrets/audit-pub.key` (base64, 0644) so anyone with
 read access to the audit DB can verify offline.
 
-This mode signs the **local SQLite chain only**. It neither pushes
-per-user read events to a shared repository nor prevents a recipient
-from decrypting a shared-store ciphertext directly with `gpg` or
-`gopass`. Those are separate, not-yet-implemented guarantees.
+This mode signs the **local SQLite chain only**. The separate Tier-A
+team-audit described below pushes GPG-signed shared-read events to
+per-device Git branches; enabling one mode does not enable or verify the
+other. Neither mode prevents a recipient from decrypting a shared-store
+ciphertext directly with `gpg` or `gopass`.
 
 To verify:
 
@@ -371,28 +372,73 @@ loaded `sync.yaml` under a separate config lock, so concurrent setup
 changes are not overwritten. Raw subprocess errors and remote URLs are
 never copied into the persistent audit reason.
 
-### Advisory guarantee
+### Signed shared-read audit
 
 Every recipient owns a private key that can decrypt every secret in the
 shared mount. Once enrolled, that person can call bare `gpg` or
 `gopass`, copy old ciphertext, and leave **no** `mys` audit row. The
-current audit database is local to each machine; the optional signed
-chain above protects one local log but is not an aggregated team-read
-audit. Scope policy also gates only compliant, machine-local callers.
+local SQLite database is still machine-local. An optional, independent
+team-audit repository now adds signed per-device read events for
+cooperative `mys` clients; it does **not** interpose on raw decryption.
 
-Therefore phases 1–3 provide shared availability, distinct recipient
-keys, a reusable fingerprint-to-identity manifest, and a guarded
-Bitwarden-to-shared seed path, but not a provable „who read what" record
-or instant revocation. Removing a key prevents future decryption only
-after re-encryption and does not retract old copies; rotate every secret
-the departed recipient could access.
+`mys sync shared audit setup` is human-only and persists configuration
+only after all of these checks succeed:
+
+1. the mount is live, non-root, and explicitly shared;
+2. the configured primary signing fingerprint has a local secret key and
+   is present in both `team-keys.yaml` and `.gpg-id`;
+3. an existing GitHub audit repository reports visibility `PRIVATE`
+   (new repositories are queried again after creation);
+4. every existing audit branch, event chain, signature, historical
+   membership, and local rollback watermark verifies; and
+5. a unique empty probe branch can be pushed, confirmed by exact OID,
+   lease-deleted, and confirmed absent.
+
+The probe contains no secret path or value. Any inability to confirm or
+clean it up fails closed before sync configuration is accepted. A restrictive
+shared policy may already have been created under the stable global
+cross-process `mys` lock; it is intentionally retained as monotonic security
+state and reused by a later setup rather than deleted through a racy rollback.
+
+Every compliant shared decrypt loads a fresh global policy, sync config, and
+shared policy. The bound opener takes the same cooperative global lock,
+captures each audited mount's real path and directory identity, opens the
+gopass Store, and post-verifies the captured inodes under an in-process gate.
+It holds the lock until the operation closes the Store. Preflight uses only
+the frozen resolver, which rechecks directory identity; drift fails closed.
+Both policies must allow the path.
+Preflight happens before decrypt and hashes the exact shared-policy
+bytes, current published store commit, `team-keys.yaml`, and canonical
+recipient set. The caller passes that same snapshot and caller-generated
+UUID event IDs into the post-decrypt append. The manager revalidates the
+snapshot before and after loading signer identity, then signs strict
+NDJSON rows on a per-device branch.
+
+For AI callers, preflight/policy failure prevents decryption. If the
+post-decrypt append or remote confirmation fails, no plaintext or partial
+result is returned. Human and script callers may continue only when the
+audit backend itself is unavailable, and see a generic warning without
+remote paths or subprocess output. Policy denials remain binding for all
+callers.
+
+`mys audit team` fetches and verifies all configured device branches.
+Local watermarks detect deletion, truncation, prefix changes, and
+non-descendant rewrites after the verifier's first successful
+observation. A brand-new client cannot prove that no rewrite happened
+before its first watermark; restore trusted watermarks when rebuilding
+an existing verifier.
+
+Removing a key prevents future decryption only after gopass re-encrypts
+and publishes the mount. It cannot retract copied ciphertext or values
+read earlier, so rotate every secret the departed recipient could
+access. Keep departed signers' public keys, old audit branches, shared
+store history, and verifier watermarks: historical verification depends
+on them. The exact response procedure is
+`docs/SHARED-TEAM-RUNBOOK.md`.
+
 For authoritative per-user access control, use a brokered/hosted vault
 such as Bitwarden rather than treating this client-side model as
 enforceable.
-
-Tier-A phases not present here are the signed shared read-audit and team
-aggregation (phase 4), fail-closed shared-read policy (phase 5), and the
-revocation/rotation runbook (phase 6).
 
 Sync-related subprocess calls (`gh`, `gopass git …`, `gopass sync`) are
 an explicit exception to the library-only rule. They run outside the
@@ -404,6 +450,12 @@ and the corresponding CLI operation records an audit outcome with
 ## Known limitations
 
 - No secure-enclave signing of audit entries (Ansatz A/B feature).
+- A recipient can bypass App policy and signed read-audit with direct
+  `gpg`, `pass`, or `gopass`.
+- First aggregation on a new client establishes its rollback watermark;
+  it cannot detect a rewrite that predates that observation.
+- Revocation cannot invalidate plaintext or ciphertext copies already
+  held by the departed recipient; affected secret values require rotation.
 - No rate-limiting on MCP calls — a runaway AI could flood the audit log.
 - `mys get --format env` writes to stdout in the clear; piping to a file
   is the user's responsibility.
