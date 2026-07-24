@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -219,6 +220,51 @@ func TestAutoSync_NoRemotes(t *testing.T) {
 	}
 }
 
+func TestAutoSync_SkipsSharedRemotes(t *testing.T) {
+	t.Setenv("MYS_AUTO_SYNC", "")
+	writeTempSyncConfig(t, &Config{
+		Version: 1,
+		Remotes: []StoreRemote{
+			{Mount: "jasp", URL: "shared", Shared: true},
+			{Mount: DefaultStoreMount, URL: "personal"},
+		},
+	})
+	r := &scriptedRunner{results: map[string]scriptedResult{
+		"gopass sync": {out: []byte("ok")},
+	}}
+	skipped, err := AutoSync(context.Background(), r, "add private/example")
+	if err != nil {
+		t.Fatalf("AutoSync: %v", err)
+	}
+	if skipped {
+		t.Fatal("expected the personal remote to be synced")
+	}
+	if len(r.calls) != 1 || strings.Join(r.calls[0], " ") != "gopass sync" {
+		t.Fatalf("calls = %v, want only the personal root sync", r.calls)
+	}
+}
+
+func TestAutoSync_OnlySharedRemoteIsSkipped(t *testing.T) {
+	t.Setenv("MYS_AUTO_SYNC", "")
+	writeTempSyncConfig(t, &Config{
+		Version: 1,
+		Remotes: []StoreRemote{
+			{Mount: "jasp", URL: "shared", Shared: true},
+		},
+	})
+	r := &scriptedRunner{}
+	skipped, err := AutoSync(context.Background(), r, "add private/example")
+	if err != nil {
+		t.Fatalf("AutoSync: %v", err)
+	}
+	if !skipped {
+		t.Fatal("expected shared-only auto-sync to be skipped")
+	}
+	if len(r.calls) != 0 {
+		t.Fatalf("shared remote must not auto-sync after a personal write: %v", r.calls)
+	}
+}
+
 func TestAutoSync_NoConfigFile(t *testing.T) {
 	t.Setenv("MYS_AUTO_SYNC", "")
 	// Point HOME at a tempdir that has no sync.yaml.
@@ -266,7 +312,7 @@ func TestConfigRoundTrip(t *testing.T) {
 		Layout:  LayoutPerOrg,
 		Owner:   "alice",
 		Remotes: []StoreRemote{
-			{Mount: "jasp", URL: "git@github.com:alice/jasp-secrets.git", LastSync: now},
+			{Mount: "jasp", URL: "git@github.com:alice/jasp-secrets.git", LastSync: now, Shared: true},
 			{Mount: "zuhause", URL: "https://github.com/alice/zuhause-secrets.git"},
 		},
 	}
@@ -292,6 +338,187 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 	if !out.Remotes[0].LastSync.Equal(now) {
 		t.Errorf("last_sync round-trip: got %v want %v", out.Remotes[0].LastSync, now)
+	}
+	if !out.Remotes[0].Shared {
+		t.Error("shared marker did not round-trip")
+	}
+	if out.Remotes[1].Shared {
+		t.Error("personal remote unexpectedly became shared")
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want string
+	}{
+		{
+			name: "duplicate mount",
+			cfg: &Config{Remotes: []StoreRemote{
+				{Mount: "jasp", URL: "one"},
+				{Mount: "jasp", URL: "two"},
+			}},
+			want: "duplicate",
+		},
+		{
+			name: "empty mount",
+			cfg:  &Config{Remotes: []StoreRemote{{Mount: " ", URL: "one"}}},
+			want: "empty",
+		},
+		{
+			name: "padded mount",
+			cfg:  &Config{Remotes: []StoreRemote{{Mount: " jasp", URL: "one"}}},
+			want: "whitespace",
+		},
+		{
+			name: "root cannot be shared",
+			cfg:  &Config{Remotes: []StoreRemote{{Mount: DefaultStoreMount, Shared: true}}},
+			want: "root",
+		},
+		{
+			name: "shared mount cannot escape top level",
+			cfg:  &Config{Remotes: []StoreRemote{{Mount: "../jasp", Shared: true}}},
+			want: "invalid character",
+		},
+		{
+			name: "valid shared mount",
+			cfg:  &Config{Remotes: []StoreRemote{{Mount: "jasp", Shared: true}}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.cfg.Validate()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestMergeSharedFrom(t *testing.T) {
+	now := time.Date(2026, 7, 24, 17, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name     string
+		current  *Config
+		previous *Config
+		wantErr  string
+		check    func(*testing.T, *Config)
+	}{
+		{
+			name: "preserves only shared remotes",
+			current: &Config{
+				Version: 1,
+				Layout:  LayoutSingle,
+				Remotes: []StoreRemote{{Mount: DefaultStoreMount, URL: "new-personal.git"}},
+			},
+			previous: &Config{
+				Version: 1,
+				Layout:  LayoutPerOrg,
+				Remotes: []StoreRemote{
+					{Mount: "old-personal", URL: "old.git"},
+					{Mount: "jasp", URL: "shared.git", Shared: true, LastSync: now},
+				},
+			},
+			check: func(t *testing.T, got *Config) {
+				t.Helper()
+				if len(got.Remotes) != 2 {
+					t.Fatalf("remotes = %+v, want personal plus shared", got.Remotes)
+				}
+				shared, ok := got.Remote("jasp")
+				if !ok || !shared.Shared || shared.URL != "shared.git" ||
+					!shared.LastSync.Equal(now) {
+					t.Fatalf("preserved shared remote = %+v", shared)
+				}
+				if _, ok := got.Remote("old-personal"); ok {
+					t.Fatal("stale personal remote was preserved")
+				}
+			},
+		},
+		{
+			name: "conflicting personal result fails closed",
+			current: &Config{
+				Version: 1,
+				Remotes: []StoreRemote{{Mount: "jasp", URL: "personal.git"}},
+			},
+			previous: &Config{
+				Version: 1,
+				Remotes: []StoreRemote{{Mount: "jasp", URL: "shared.git", Shared: true}},
+			},
+			wantErr: "conflicts",
+		},
+		{
+			name: "invalid previous config fails closed",
+			current: &Config{
+				Version: 1,
+			},
+			previous: &Config{
+				Version: 1,
+				Remotes: []StoreRemote{
+					{Mount: "jasp", URL: "one.git", Shared: true},
+					{Mount: "jasp", URL: "two.git", Shared: true},
+				},
+			},
+			wantErr: "duplicate",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.current.MergeSharedFrom(test.previous)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %v, want substring %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("MergeSharedFrom: %v", err)
+			}
+			test.check(t, test.current)
+		})
+	}
+}
+
+func TestLoadRejectsDuplicateMounts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.yaml")
+	body := []byte("version: 1\nlayout: per-org\nremotes:\n" +
+		"  - mount: jasp\n    url: one\n" +
+		"  - mount: jasp\n    url: two\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("Load error = %v, want duplicate mount error", err)
+	}
+}
+
+func TestIsSharedMountFailsClosed(t *testing.T) {
+	tests := []struct {
+		name  string
+		cfg   *Config
+		mount string
+		want  bool
+	}{
+		{"shared", &Config{Remotes: []StoreRemote{{Mount: "jasp", Shared: true}}}, "jasp", true},
+		{"personal", &Config{Remotes: []StoreRemote{{Mount: "jasp"}}}, "jasp", false},
+		{"root", &Config{Remotes: []StoreRemote{{Mount: DefaultStoreMount, Shared: true}}}, DefaultStoreMount, false},
+		{"duplicate", &Config{Remotes: []StoreRemote{{Mount: "jasp", Shared: true}, {Mount: "jasp", Shared: true}}}, "jasp", false},
+		{"nil", nil, "jasp", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cfg.IsSharedMount(tc.mount); got != tc.want {
+				t.Fatalf("IsSharedMount(%q) = %v, want %v", tc.mount, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -443,9 +670,9 @@ func TestReconcile_EmptyRemote(t *testing.T) {
 func TestReconcile_LocalAhead(t *testing.T) {
 	// origin/main is an ancestor of HEAD — push will FF, nothing to do.
 	r := runnerFor(map[string]scriptedResult{
-		"gopass git fetch origin":                                      {},
-		"gopass git rev-parse --quiet --verify origin/main":            {},
-		"gopass git merge-base --is-ancestor origin/main HEAD":         {},
+		"gopass git fetch origin":                              {},
+		"gopass git rev-parse --quiet --verify origin/main":    {},
+		"gopass git merge-base --is-ancestor origin/main HEAD": {},
 	})
 	if err := ReconcileWithRemote(context.Background(), r, "root", "ABCD"); err != nil {
 		t.Fatalf("local-ahead path failed: %v", err)
@@ -482,7 +709,7 @@ func TestReconcile_Divergent_Pristine_Adopts(t *testing.T) {
 		"gopass git merge-base --is-ancestor HEAD origin/main": {err: errors.New("diverged")},
 		"gopass git ls-files":                                  {out: pristineFiles},
 		"gopass git reset --hard origin/main":                  {},
-		"gopass recipients add ABCD":                           {},
+		"gopass --yes recipients add ABCD":                     {},
 	})
 	if err := ReconcileWithRemote(context.Background(), r, "root", "ABCD"); err != nil {
 		t.Fatalf("pristine adopt path failed: %v", err)
@@ -490,7 +717,7 @@ func TestReconcile_Divergent_Pristine_Adopts(t *testing.T) {
 	if !keyStartsWith(r.calls, "gopass", "git", "reset", "--hard", "origin/main") {
 		t.Errorf("expected reset --hard on adopt path: %+v", r.calls)
 	}
-	if !keyStartsWith(r.calls, "gopass", "recipients", "add", "ABCD") {
+	if !keyStartsWith(r.calls, "gopass", "--yes", "recipients", "add", "ABCD") {
 		t.Errorf("expected recipients add on adopt path: %+v", r.calls)
 	}
 }
@@ -530,16 +757,16 @@ func TestReconcile_PristineAdopt_NoFingerprint_SkipsRecipientsAdd(t *testing.T) 
 	if err := ReconcileWithRemote(context.Background(), r, "root", ""); err != nil {
 		t.Fatalf("pristine adopt without fpr failed: %v", err)
 	}
-	if keyStartsWith(r.calls, "gopass", "recipients", "add") {
+	if keyStartsWith(r.calls, "gopass", "--yes", "recipients", "add") {
 		t.Errorf("must not call recipients add without fingerprint: %+v", r.calls)
 	}
 }
 
 func TestIsMountPristine(t *testing.T) {
 	cases := []struct {
-		name    string
-		output  string
-		want    bool
+		name   string
+		output string
+		want   bool
 	}{
 		{"empty", "", true},
 		{"fresh init", ".gitattributes\n.gpg-id\n.public-keys/abc.pub\n", true},
@@ -610,5 +837,79 @@ func TestGopassGitPull_DetachedHeadError(t *testing.T) {
 		if len(c) >= 4 && c[2] == "git" && c[3] == "pull" {
 			t.Errorf("must not issue any `git pull` on detached HEAD: %v", c)
 		}
+	}
+}
+
+func TestGopassRecipientMutationArgs(t *testing.T) {
+	tests := []struct {
+		name  string
+		mount string
+		call  func(context.Context, Runner, string, string) ([]byte, error)
+		want  string
+	}{
+		{"add default empty", "", GopassRecipientsAdd, "gopass recipients add ABCD"},
+		{"add default root", DefaultStoreMount, GopassRecipientsAdd, "gopass recipients add ABCD"},
+		{"add shared", "jasp", GopassRecipientsAdd, "gopass recipients add --store jasp ABCD"},
+		{"remove default", DefaultStoreMount, GopassRecipientsRemove, "gopass recipients remove ABCD"},
+		{"remove shared", "jasp", GopassRecipientsRemove, "gopass recipients remove --store jasp ABCD"},
+		{"confirmed add shared", "jasp", GopassRecipientsAddConfirmed, "gopass --yes recipients add --store jasp ABCD"},
+		{"confirmed remove shared", "jasp", GopassRecipientsRemoveConfirmed, "gopass --yes recipients remove --store jasp ABCD"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &scriptedRunner{}
+			if _, err := tc.call(context.Background(), r, tc.mount, "ABCD"); err != nil {
+				t.Fatalf("mutation: %v", err)
+			}
+			if len(r.calls) != 1 || strings.Join(r.calls[0], " ") != tc.want {
+				t.Fatalf("calls = %v, want %q", r.calls, tc.want)
+			}
+		})
+	}
+}
+
+func TestGopassMountPath(t *testing.T) {
+	dir := t.TempDir()
+	tests := []struct {
+		name  string
+		mount string
+		key   string
+	}{
+		{"root empty", "", "gopass config mounts.path"},
+		{"root explicit", DefaultStoreMount, "gopass config mounts.path"},
+		{"shared", "jasp", "gopass config mounts.jasp.path"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runnerFor(map[string]scriptedResult{
+				tc.key: {out: []byte(dir + "\n")},
+			})
+			got, err := GopassMountPath(context.Background(), r, tc.mount)
+			if err != nil {
+				t.Fatalf("GopassMountPath: %v", err)
+			}
+			want, err := filepath.EvalSymlinks(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Fatalf("path = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestGopassMountPathRejectsSymlink(t *testing.T) {
+	target := t.TempDir()
+	link := filepath.Join(t.TempDir(), "mount-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	r := runnerFor(map[string]scriptedResult{
+		"gopass config mounts.jasp.path": {out: []byte(link)},
+	})
+	_, err := GopassMountPath(context.Background(), r, "jasp")
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error = %v, want symlink rejection", err)
 	}
 }

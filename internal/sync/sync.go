@@ -3,11 +3,12 @@
 // remotes to a YAML state file under ~/.config/my-secrets/sync.yaml and
 // provides helpers to run `gopass sync`/`gopass git pull` as subprocesses.
 //
-// SCOPE ANCHOR: my-secrets is a personal credential manager. Git sync is
-// intended to keep a single user's secrets redundant across their own
-// devices. It is NOT a sharing mechanism for teams — gopass cannot
-// distinguish between humans who share a GPG key. For team credentials,
-// use Bitwarden or a hosted vault with per-user identity.
+// By default, sync keeps a single user's personal secrets redundant
+// across their own devices. A remote explicitly marked Shared is the
+// narrow exception: every team member keeps a distinct GPG key and the
+// mount's team-keys.yaml records the fingerprint-to-person mapping.
+// Local decryption can still bypass client-side audit, so shared mounts
+// provide advisory accountability rather than an enforceable read log.
 //
 // The `gopass` and `gh` binaries are invoked as subprocesses in this
 // package. This is an explicit, documented exception to the project's
@@ -18,6 +19,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -55,6 +57,10 @@ type StoreRemote struct {
 	// LastSync records the last successful push/pull timestamp. Zero
 	// value means „never synced".
 	LastSync time.Time `yaml:"last_sync,omitempty"`
+	// Shared marks a mount whose recipients are distinct team-member
+	// keys described by team-keys.yaml in that mount's repository.
+	// The default/root store is never allowed to be shared.
+	Shared bool `yaml:"shared,omitempty"`
 }
 
 // Config is the persisted sync state.
@@ -99,12 +105,18 @@ func Load(path string) (*Config, error) {
 	if c.Version == 0 {
 		c.Version = 1
 	}
+	if err := c.Validate(); err != nil {
+		return nil, fmt.Errorf("validate sync config: %w", err)
+	}
 	return &c, nil
 }
 
 // Save writes the state file with 0o600 permissions. Creates the parent
 // directory with 0o700 if needed.
 func Save(path string, c *Config) error {
+	if c == nil {
+		return fmt.Errorf("save sync config: nil config")
+	}
 	if path == "" {
 		var err error
 		path, err = DefaultPath()
@@ -118,14 +130,92 @@ func Save(path string, c *Config) error {
 	if c.Version == 0 {
 		c.Version = 1
 	}
+	if err := c.Validate(); err != nil {
+		return fmt.Errorf("validate sync config: %w", err)
+	}
 	b, err := yaml.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("marshal sync config: %w", err)
 	}
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		return fmt.Errorf("write sync config: %w", err)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".sync-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create sync config temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod sync config temp file: %w", err)
+	}
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write sync config temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync sync config temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close sync config temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace sync config: %w", err)
 	}
 	return nil
+}
+
+// Validate checks invariants that security-sensitive shared-mount
+// decisions rely on. In particular, duplicate mount entries are rejected
+// rather than letting list order decide whether a mount is shared.
+func (c *Config) Validate() error {
+	if c == nil {
+		return errors.New("nil config")
+	}
+	seen := make(map[string]struct{}, len(c.Remotes))
+	for i, remote := range c.Remotes {
+		mount := strings.TrimSpace(remote.Mount)
+		if mount == "" {
+			return fmt.Errorf("remote %d has an empty mount", i)
+		}
+		if mount != remote.Mount {
+			return fmt.Errorf("remote %d mount %q contains surrounding whitespace", i, remote.Mount)
+		}
+		if _, ok := seen[mount]; ok {
+			return fmt.Errorf("duplicate mount %q", mount)
+		}
+		seen[mount] = struct{}{}
+		if remote.Shared {
+			if err := ValidateSharedMountName(mount); err != nil {
+				return fmt.Errorf("remote %d: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
+// Remote returns the uniquely configured remote for mount.
+func (c *Config) Remote(mount string) (StoreRemote, bool) {
+	if c == nil || c.Validate() != nil {
+		return StoreRemote{}, false
+	}
+	mount = strings.TrimSpace(mount)
+	for _, remote := range c.Remotes {
+		if remote.Mount == mount {
+			return remote, true
+		}
+	}
+	return StoreRemote{}, false
+}
+
+// IsSharedMount reports whether mount is explicitly and unambiguously
+// configured as shared. Root and invalid configs always fail closed.
+func (c *Config) IsSharedMount(mount string) bool {
+	mount = strings.TrimSpace(mount)
+	if mount == "" || mount == DefaultStoreMount {
+		return false
+	}
+	remote, ok := c.Remote(mount)
+	return ok && remote.Shared
 }
 
 // RemoteStyle picks the URL flavour the wizard should emit.
@@ -224,6 +314,74 @@ func (c *Config) UpdateRemote(mount, url string) {
 	c.Remotes = append(c.Remotes, StoreRemote{Mount: mount, URL: url})
 }
 
+// UpdateSharedRemote replaces (or appends) the remote entry for a shared
+// non-root mount while preserving its LastSync timestamp.
+func (c *Config) UpdateSharedRemote(mount, url string) error {
+	if err := ValidateSharedMountName(mount); err != nil {
+		return err
+	}
+	for i := range c.Remotes {
+		if c.Remotes[i].Mount == mount {
+			if !c.Remotes[i].Shared {
+				return fmt.Errorf("mount %q is already configured as personal", mount)
+			}
+			c.Remotes[i].URL = url
+			c.Remotes[i].Shared = true
+			return nil
+		}
+	}
+	c.Remotes = append(c.Remotes, StoreRemote{Mount: mount, URL: url, Shared: true})
+	return nil
+}
+
+// MergeSharedFrom retains shared remotes when a personal sync wizard
+// rebuilds the personal portion of the configuration.
+func (c *Config) MergeSharedFrom(previous *Config) error {
+	if c == nil || previous == nil {
+		return nil
+	}
+	if err := previous.Validate(); err != nil {
+		return err
+	}
+	for _, remote := range previous.Remotes {
+		if !remote.Shared {
+			continue
+		}
+		if existing, ok := c.Remote(remote.Mount); ok {
+			if !existing.Shared || existing.URL != remote.URL {
+				return fmt.Errorf("shared mount %q conflicts with wizard result", remote.Mount)
+			}
+			continue
+		}
+		c.Remotes = append(c.Remotes, remote)
+	}
+	return c.Validate()
+}
+
+// ValidateSharedMountName rejects aliases that could address the default
+// store or escape the top-level path segment used for an org mount.
+func ValidateSharedMountName(mount string) error {
+	if mount == "" || strings.TrimSpace(mount) != mount {
+		return fmt.Errorf("shared mount name is empty or padded")
+	}
+	if mount == DefaultStoreMount {
+		return fmt.Errorf("mount %q cannot be shared", DefaultStoreMount)
+	}
+	if len(mount) > 64 {
+		return fmt.Errorf("shared mount name is too long")
+	}
+	for i, r := range mount {
+		valid := r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			(i > 0 && (r == '-' || r == '_' || r == '.'))
+		if !valid {
+			return fmt.Errorf("shared mount %q contains invalid character %q", mount, r)
+		}
+	}
+	return nil
+}
+
 // MarkSynced stamps LastSync=now on the remote for the given mount.
 // No-op if the mount is unknown.
 func (c *Config) MarkSynced(mount string, at time.Time) {
@@ -281,7 +439,11 @@ func PushAll(ctx context.Context, r Runner) error {
 	if len(cfg.Remotes) == 0 {
 		return nil
 	}
-	for _, rem := range cfg.Remotes {
+	return pushRemotes(ctx, r, cfg.Remotes)
+}
+
+func pushRemotes(ctx context.Context, r Runner, remotes []StoreRemote) error {
+	for _, rem := range remotes {
 		if _, err := GopassSync(ctx, r, rem.Mount); err != nil {
 			return fmt.Errorf("sync %s: %w", rem.Mount, err)
 		}
@@ -334,7 +496,16 @@ func AutoSync(ctx context.Context, r Runner, trigger string) (skipped bool, err 
 	if cfg == nil || len(cfg.Remotes) == 0 {
 		return true, nil
 	}
-	if err := PushAll(ctx, r); err != nil {
+	personal := make([]StoreRemote, 0, len(cfg.Remotes))
+	for _, remote := range cfg.Remotes {
+		if !remote.Shared {
+			personal = append(personal, remote)
+		}
+	}
+	if len(personal) == 0 {
+		return true, nil
+	}
+	if err := pushRemotes(ctx, r, personal); err != nil {
 		return false, err
 	}
 	return false, nil
@@ -455,6 +626,96 @@ func GopassRecipientsAdd(ctx context.Context, r Runner, mount, fingerprint strin
 	return r.Run(ctx, "gopass", args...)
 }
 
+// GopassRecipientsRemove runs
+// `gopass recipients remove --store <mount> <fpr>`.
+func GopassRecipientsRemove(ctx context.Context, r Runner, mount, fingerprint string) ([]byte, error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	args := []string{"recipients", "remove"}
+	if mount != "" && mount != DefaultStoreMount {
+		args = append(args, "--store", mount)
+	}
+	args = append(args, fingerprint)
+	return r.Run(ctx, "gopass", args...)
+}
+
+// GopassRecipientsAddConfirmed is the non-interactive counterpart used
+// only after mys has already obtained explicit human confirmation.
+// gopass's --yes is a global flag and must precede the subcommand.
+func GopassRecipientsAddConfirmed(ctx context.Context, r Runner, mount, fingerprint string) ([]byte, error) {
+	return gopassRecipientsConfirmed(ctx, r, "add", mount, fingerprint)
+}
+
+// GopassRecipientsRemoveConfirmed is the non-interactive counterpart
+// used by an already-confirmed exact-set reconciliation.
+func GopassRecipientsRemoveConfirmed(ctx context.Context, r Runner, mount, fingerprint string) ([]byte, error) {
+	return gopassRecipientsConfirmed(ctx, r, "remove", mount, fingerprint)
+}
+
+func gopassRecipientsConfirmed(ctx context.Context, r Runner, action, mount, fingerprint string) ([]byte, error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	args := []string{"--yes", "recipients", action}
+	if mount != "" && mount != DefaultStoreMount {
+		args = append(args, "--store", mount)
+	}
+	args = append(args, fingerprint)
+	return r.Run(ctx, "gopass", args...)
+}
+
+// GopassMountPath resolves the live on-disk path reported by gopass for
+// mount. The configured path must be a real directory, not a symlink.
+// Callers use this instead of trusting a stale path in sync.yaml.
+func GopassMountPath(ctx context.Context, r Runner, mount string) (string, error) {
+	configured, err := gopassConfiguredMountPath(ctx, r, mount)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(configured)
+	if err != nil {
+		return "", fmt.Errorf("stat gopass mount %q: %w", mountLabel(mount), err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("gopass mount %q path must not be a symlink", mountLabel(mount))
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("gopass mount %q path is not a directory", mountLabel(mount))
+	}
+	resolved, err := filepath.EvalSymlinks(configured)
+	if err != nil {
+		return "", fmt.Errorf("resolve gopass mount %q path: %w", mountLabel(mount), err)
+	}
+	return filepath.Abs(resolved)
+}
+
+func gopassConfiguredMountPath(ctx context.Context, r Runner, mount string) (string, error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	key := "mounts.path"
+	if mount != "" && mount != DefaultStoreMount {
+		key = "mounts." + mount + ".path"
+	}
+	out, err := r.Run(ctx, "gopass", "config", key)
+	if err != nil {
+		return "", fmt.Errorf("read gopass mount %q path: %w", mountLabel(mount), err)
+	}
+	configured := strings.TrimSpace(string(out))
+	if configured == "" {
+		return "", fmt.Errorf("gopass mount %q has no configured path", mountLabel(mount))
+	}
+	return filepath.Abs(configured)
+}
+
+func mountLabel(mount string) string {
+	if mount == "" {
+		return DefaultStoreMount
+	}
+	return mount
+}
+
 // GopassGitRemoteAdd runs `gopass git remote add <name> <url>` on the
 // given mount.
 //
@@ -541,7 +802,7 @@ func ReconcileWithRemote(ctx context.Context, r Runner, mount, fingerprint strin
 			// Add this key as a reader on top of whatever recipients
 			// the remote store already had. gopass writes a commit
 			// for this, so the push below has fresh local content.
-			if _, err := GopassRecipientsAdd(ctx, r, mount, fingerprint); err != nil {
+			if _, err := GopassRecipientsAddConfirmed(ctx, r, mount, fingerprint); err != nil {
 				return fmt.Errorf("add recipient %s after adopt: %w", fingerprint, err)
 			}
 		}

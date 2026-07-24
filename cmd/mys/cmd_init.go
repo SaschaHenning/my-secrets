@@ -719,12 +719,19 @@ func stepSync(ctx context.Context, opts *initOptions, state *initState) error {
 		return nil
 	}
 	// Errors from here on are fatal — the user asked for sync.
+	previous, err := syncpkg.Load("")
+	if err != nil {
+		return err
+	}
 	cfg, err := syncpkg.RunWizard(ctx, syncpkg.WizardIO{In: opts.In, Out: opts.Out},
 		syncpkg.WizardOptions{
 			NonInteractive: opts.Yes,
 			KeyFingerprint: state.KeyFingerprint,
 		})
 	if err != nil {
+		return err
+	}
+	if err := cfg.MergeSharedFrom(previous); err != nil {
 		return err
 	}
 	if cfg != nil && len(cfg.Remotes) > 0 {
