@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -66,6 +67,58 @@ func TestInstalledWebPort_DefaultPort(t *testing.T) {
 	}
 	if !installed || port != defaultWebPort {
 		t.Errorf("want (%d, true), got (%d, %v)", defaultWebPort, port, installed)
+	}
+}
+
+// writePlist places a raw plist body at the LaunchAgent path for the
+// current (test-isolated) $HOME, creating the directory as needed. Used to
+// stage malformed/edge-case agents that installForTest can't produce.
+func writePlist(t *testing.T, body string) {
+	t.Helper()
+	p := mustPlistPath(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatalf("write plist: %v", err)
+	}
+}
+
+// TestInstalledWebPort_PresentButPortUnparsable covers the fallback where a
+// plist exists but portArgRe matches nothing (here: no --port pair at all,
+// e.g. a hand-edited or future-format agent). Must report installed=true at
+// the default port rather than erroring or claiming not-installed.
+func TestInstalledWebPort_PresentButPortUnparsable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writePlist(t, `<?xml version="1.0"?><plist version="1.0"><dict>
+	<key>ProgramArguments</key><array>
+		<string>/usr/local/bin/mys</string>
+		<string>web</string>
+	</array>
+</dict></plist>`)
+
+	port, installed, err := installedWebPort()
+	if err != nil {
+		t.Fatalf("installedWebPort: %v", err)
+	}
+	if !installed || port != defaultWebPort {
+		t.Errorf("unparsable port: want (%d, true), got (%d, %v)", defaultWebPort, port, installed)
+	}
+}
+
+// TestInstalledWebPort_PresentButPortOutOfRange covers the other fallback:
+// the --port value parses as an int but is outside 1..65535, so it must be
+// rejected in favour of the default rather than opening a nonsense port.
+func TestInstalledWebPort_PresentButPortOutOfRange(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writePlist(t, renderLaunchAgentPlist("/usr/local/bin/mys", 99999, "/tmp/web.log", "/usr/bin:/bin"))
+
+	port, installed, err := installedWebPort()
+	if err != nil {
+		t.Fatalf("installedWebPort: %v", err)
+	}
+	if !installed || port != defaultWebPort {
+		t.Errorf("out-of-range port: want (%d, true), got (%d, %v)", defaultWebPort, port, installed)
 	}
 }
 
