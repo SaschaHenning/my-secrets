@@ -344,7 +344,11 @@ func ParseGitHubRemote(
 }
 
 func isGitHubRemoteHost(host string) bool {
+	// DNS absolute names have exactly one trailing root label. Strip only that
+	// label so malformed or lookalike suffixes cannot enter the GitHub path.
+	host = strings.TrimSuffix(host, ".")
 	return strings.EqualFold(host, "github.com") ||
+		strings.EqualFold(host, "www.github.com") ||
 		strings.EqualFold(host, "ssh.github.com")
 }
 

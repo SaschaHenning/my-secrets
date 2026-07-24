@@ -258,6 +258,11 @@ func TestEnsureSharedRemoteChecksEveryDirectGitHubForm(t *testing.T) {
 		"https://github.com/jasp/mys-store-shared.git",
 		"ssh://git@github.com/jasp/mys-store-shared.git",
 		"ssh://git@ssh.github.com:443/jasp/mys-store-shared.git",
+		"WWW.GITHUB.COM.:jasp/mys-store-shared.git",
+		"git@WWW.GITHUB.COM.:jasp/mys-store-shared.git",
+		"https://GITHUB.COM./jasp/mys-store-shared.git",
+		"https://www.github.com/jasp/mys-store-shared.git",
+		"ssh://git@SSH.GITHUB.COM.:443/jasp/mys-store-shared.git",
 	}
 	for _, remote := range remotes {
 		remote := remote
@@ -445,58 +450,70 @@ func TestEnsureSharedRemoteRejectsUnconfirmedCreatedGitHubRepo(t *testing.T) {
 func TestProvisionSharedMountProvesPrivacyBeforeMountOrConfigMutation(
 	t *testing.T,
 ) {
-	installSharedTestGH(t)
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	storePath := filepath.Join(t.TempDir(), "shared")
-	config := &Config{
-		Version: 1,
-		Layout:  LayoutSingle,
-		Remotes: []StoreRemote{{
-			Mount: DefaultStoreMount,
-			URL:   "personal.git",
-		}},
-	}
-	runner := &sharedPrivacyRunner{
-		responses: map[string][]sharedPrivacyResponse{
-			"gpg --batch --with-colons --list-keys " + sharedFprBob: {
-				{out: []byte(gpgFingerprintFixture(sharedFprBob))},
-			},
-			"gpg --batch --with-colons --list-secret-keys " + sharedFprBob: {
-				{out: []byte(gpgFingerprintFixture(sharedFprBob))},
-			},
-			"gh repo view jasp/mys-store-shared --json visibility --jq .visibility": {
-				{out: []byte("PUBLIC\n")},
-			},
-		},
-	}
+	for _, remoteURL := range []string{
+		"github.com:jasp/mys-store-shared.git",
+		"https://github.com./jasp/mys-store-shared.git",
+		"https://www.github.com/jasp/mys-store-shared.git",
+	} {
+		remoteURL := remoteURL
+		t.Run(remoteURL, func(t *testing.T) {
+			installSharedTestGH(t)
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			storePath := filepath.Join(t.TempDir(), "shared")
+			config := &Config{
+				Version: 1,
+				Layout:  LayoutSingle,
+				Remotes: []StoreRemote{{
+					Mount: DefaultStoreMount,
+					URL:   "personal.git",
+				}},
+			}
+			runner := &sharedPrivacyRunner{
+				responses: map[string][]sharedPrivacyResponse{
+					"gpg --batch --with-colons --list-keys " + sharedFprBob: {
+						{out: []byte(gpgFingerprintFixture(sharedFprBob))},
+					},
+					"gpg --batch --with-colons --list-secret-keys " + sharedFprBob: {
+						{out: []byte(gpgFingerprintFixture(sharedFprBob))},
+					},
+					"gh repo view jasp/mys-store-shared --json visibility --jq .visibility": {
+						{out: []byte("PUBLIC\n")},
+					},
+				},
+			}
 
-	result, err := ProvisionSharedMount(
-		context.Background(),
-		SharedProvisionOptions{
-			Config:       config,
-			Mount:        "jasp",
-			StorePath:    storePath,
-			Fingerprints: []string{sharedFprBob},
-			RemoteURL:    "github.com:jasp/mys-store-shared.git",
-			Runner:       runner,
-		},
-	)
-	if err == nil || !strings.Contains(err.Error(), "must be PRIVATE") {
-		t.Fatalf("result = %v, error = %v; want PRIVATE refusal", result, err)
-	}
-	if len(config.Remotes) != 1 ||
-		config.Remotes[0].Mount != DefaultStoreMount ||
-		config.Remotes[0].Shared {
-		t.Fatalf("input config mutated before privacy proof: %+v", config.Remotes)
-	}
-	if _, statErr := os.Lstat(storePath); !os.IsNotExist(statErr) {
-		t.Fatalf("shared store path mutated before privacy proof: %v", statErr)
-	}
-	for _, call := range runner.calls {
-		if strings.HasPrefix(call, "gopass ") {
-			t.Fatalf("mount/store command ran before privacy proof: %s", call)
-		}
+			result, err := ProvisionSharedMount(
+				context.Background(),
+				SharedProvisionOptions{
+					Config:       config,
+					Mount:        "jasp",
+					StorePath:    storePath,
+					Fingerprints: []string{sharedFprBob},
+					RemoteURL:    remoteURL,
+					Runner:       runner,
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), "must be PRIVATE") {
+				t.Fatalf("result = %v, error = %v; want PRIVATE refusal", result, err)
+			}
+			if len(config.Remotes) != 1 ||
+				config.Remotes[0].Mount != DefaultStoreMount ||
+				config.Remotes[0].Shared {
+				t.Fatalf(
+					"input config mutated before privacy proof: %+v",
+					config.Remotes,
+				)
+			}
+			if _, statErr := os.Lstat(storePath); !os.IsNotExist(statErr) {
+				t.Fatalf("shared store path mutated before privacy proof: %v", statErr)
+			}
+			for _, call := range runner.calls {
+				if strings.HasPrefix(call, "gopass ") {
+					t.Fatalf("mount/store command ran before privacy proof: %s", call)
+				}
+			}
+		})
 	}
 }
 

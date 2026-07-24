@@ -102,6 +102,36 @@ func TestParseGitHubRemoteCoversEveryValidatedForm(t *testing.T) {
 			wantOwner: "jasp",
 			wantRepo:  "mys-audit",
 		},
+		{
+			name:      "HTTPS FQDN",
+			remote:    "https://GITHUB.COM./jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
+		{
+			name:      "HTTPS www alias",
+			remote:    "https://www.github.com/jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
+		{
+			name:      "scp www FQDN alias",
+			remote:    "git@WWW.GITHUB.COM.:jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
+		{
+			name:      "scp www FQDN alias without username",
+			remote:    "WWW.GITHUB.COM.:jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
+		{
+			name:      "SSH endpoint FQDN",
+			remote:    "ssh://git@SSH.GITHUB.COM.:443/jasp/mys-audit.git",
+			wantOwner: "jasp",
+			wantRepo:  "mys-audit",
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -175,6 +205,27 @@ func TestParseGitHubRemoteFailsClosedForMalformedGitHubTargets(t *testing.T) {
 			isGitHub,
 			err,
 		)
+	}
+
+	for _, remote := range []string{
+		"https://github.com.evil/jasp/mys-audit.git",
+		"https://evilgithub.com/jasp/mys-audit.git",
+		"https://github.com../jasp/mys-audit.git",
+		"git@github.com.evil:jasp/mys-audit.git",
+		"git@evilgithub.com:jasp/mys-audit.git",
+		"ssh://git@www.github.com.evil:443/jasp/mys-audit.git",
+	} {
+		owner, repo, isGitHub, err := ParseGitHubRemote(remote)
+		if err != nil || isGitHub || owner != "" || repo != "" {
+			t.Errorf(
+				"lookalike %q = %q, %q, %v, %v; want empty, empty, false, nil",
+				remote,
+				owner,
+				repo,
+				isGitHub,
+				err,
+			)
+		}
 	}
 }
 
