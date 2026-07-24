@@ -28,6 +28,26 @@ type runtimeCoverageStore struct {
 	order            *[]string
 }
 
+type runtimeContractAuditManager struct {
+	preflightCalls int
+	preflightErr   error
+}
+
+func (manager *runtimeContractAuditManager) Preflight(
+	context.Context,
+) (teamaudit.Snapshot, error) {
+	manager.preflightCalls++
+	return teamaudit.Snapshot{}, manager.preflightErr
+}
+
+func (*runtimeContractAuditManager) AppendBatch(
+	context.Context,
+	teamaudit.Snapshot,
+	[]teamaudit.Input,
+) ([]teamaudit.Event, error) {
+	return nil, errors.New("append must not run after failed preflight")
+}
+
 func (store *runtimeCoverageStore) Close(ctx context.Context) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -46,26 +66,30 @@ func (store *runtimeCoverageStore) closeState() (int, error, bool) {
 	return store.closeCalls, store.closeCtxErr, store.closeHasDeadline
 }
 
-func TestRuntimeContractProductionDependenciesWireOnlyLocalFactories(t *testing.T) {
+func TestRuntimeContractProductionAuditFactoryAndCloser(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("MYS_AUDIT_SIGN", "")
 	dependencies := productionAppOpenDependencies()
-	if dependencies.openStore == nil || dependencies.openAudit == nil ||
-		dependencies.loadPolicy == nil || dependencies.closeAudit == nil ||
-		dependencies.teamReads == nil {
-		t.Fatal("production dependencies are incomplete")
-	}
-
-	log, err := audit.Open(filepath.Join(t.TempDir(), "audit.sqlite"))
+	log, err := dependencies.openAudit()
 	if err != nil {
-		t.Fatalf("open temporary audit log: %v", err)
+		t.Fatalf("production audit factory: %v", err)
+	}
+	if _, err := log.Write(context.Background(), audit.Entry{
+		Action:     audit.ActionGet,
+		SecretPath: "jasp/runtime-contract",
+		Result:     audit.ResultOK,
+	}); err != nil {
+		t.Fatalf("write through production audit factory: %v", err)
 	}
 	if err := dependencies.closeAudit(context.Background(), log); err != nil {
 		t.Fatalf("production audit closer: %v", err)
 	}
-
-	runtime := dependencies.teamReads()
-	if runtime == nil || runtime.openStore == nil ||
-		runtime.resolveMountPath == nil || runtime.newAuditManager == nil {
-		t.Fatal("production team-read runtime is incomplete")
+	if _, err := log.Write(context.Background(), audit.Entry{
+		Action:     audit.ActionGet,
+		SecretPath: "jasp/after-close",
+		Result:     audit.ResultOK,
+	}); err == nil {
+		t.Fatal("production audit closer left the log writable")
 	}
 }
 
@@ -114,6 +138,113 @@ func TestRuntimeContractBoundRuntimeUsesInjectedBoundStore(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("invalid team audit configuration was accepted")
+	}
+}
+
+func TestRuntimeContractProductionAdapterFailsPreflightBeforeDecrypt(
+	t *testing.T,
+) {
+	const secretSentinel = "runtime-contract-secret-must-not-decrypt"
+	backing := fake.NewWithEntries(&store.Entry{
+		Path:     "jasp/production",
+		Password: secretSentinel,
+	})
+	runtime := productionTeamReadRuntimeWithBoundStore(boundStoreDependencies{
+		openSession: func(
+			_ context.Context,
+			mounts []string,
+		) (*accessStoreSession, error) {
+			if !reflect.DeepEqual(mounts, []string{"jasp"}) {
+				return nil, errors.New("production adapter received wrong mounts")
+			}
+			return &accessStoreSession{
+				store: backing,
+				resolveMountPath: func(context.Context, string) (string, error) {
+					return "/bound/store", nil
+				},
+			}, nil
+		},
+		resolveMountPath: func(context.Context, string) (string, error) {
+			return "/bound/store", nil
+		},
+	})
+	allowAll := &policy.Policy{Actors: map[string]policy.Rules{
+		"ai": {Allow: []string{"**"}},
+	}}
+	runtime.loadGlobalPolicy = func() (*policy.Policy, error) {
+		return allowAll, nil
+	}
+	runtime.loadSyncConfig = func() (*syncpkg.Config, error) {
+		return &syncpkg.Config{
+			Version: 1,
+			Layout:  syncpkg.LayoutPerOrg,
+			Remotes: []syncpkg.StoreRemote{{
+				Mount:  "jasp",
+				URL:    "file:///tmp/jasp-store.git",
+				Shared: true,
+				TeamAudit: &syncpkg.TeamAuditConfig{
+					URL: "file:///tmp/jasp-audit.git",
+					SigningFingerprint: strings.Repeat(
+						"A",
+						40,
+					),
+				},
+			}},
+		}, nil
+	}
+	runtime.loadSharedPolicy = func(
+		string,
+	) (*policy.Policy, string, error) {
+		return allowAll, strings.Repeat("b", 64), nil
+	}
+	runtime.acquireAnchor = func(
+		ctx context.Context,
+	) (context.Context, func() error, error) {
+		return ctx, func() error { return nil }, nil
+	}
+	manager := &runtimeContractAuditManager{
+		preflightErr: errors.New("audit remote unavailable"),
+	}
+	runtime.newAuditManager = func(
+		string,
+		syncpkg.TeamAuditConfig,
+		string,
+	) (teamAuditManager, error) {
+		return manager, nil
+	}
+	runtime.identifyCaller = func(string) caller.Detail {
+		return caller.Detail{Kind: caller.KindAI, AgentLabel: "codex"}
+	}
+
+	log, err := audit.Open(filepath.Join(t.TempDir(), "audit.sqlite"))
+	if err != nil {
+		t.Fatalf("open temporary audit log: %v", err)
+	}
+	t.Cleanup(func() { _ = log.Close() })
+	application := &App{
+		Store:     backing,
+		Audit:     log,
+		Policy:    allowAll,
+		Override:  "codex",
+		teamReads: runtime,
+	}
+
+	entry, err := application.Get(context.Background(), "jasp/production")
+
+	if entry != nil || !errors.Is(err, ErrTeamAuditUnavailable) {
+		t.Fatalf("entry/error = %#v/%v, want generic audit failure", entry, err)
+	}
+	if manager.preflightCalls != 1 {
+		t.Fatalf("preflight calls = %d, want 1", manager.preflightCalls)
+	}
+	if backing.GetCallCount() != 0 {
+		t.Fatalf(
+			"production adapter decrypted %d entries after failed preflight",
+			backing.GetCallCount(),
+		)
+	}
+	if strings.Contains(err.Error(), secretSentinel) {
+		t.Fatalf("preflight error leaked credential content: %v", err)
 	}
 }
 

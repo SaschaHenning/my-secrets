@@ -695,7 +695,32 @@ func TestReadBoundSharedPolicyValidatesDescriptorAndPath(t *testing.T) {
 }
 
 func TestSharedPolicyTransactionHelperProcess(t *testing.T) {
-	if os.Getenv(sharedPolicyHelperModeEnv) == "" {
+	mode := os.Getenv(sharedPolicyHelperModeEnv)
+	if mode == "" {
+		return
+	}
+	mount := requireSharedPolicyHelperEnv(t, sharedPolicyHelperMountEnv)
+	if mode == "timeout" {
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			250*time.Millisecond,
+		)
+		defer cancel()
+		writeSharedPolicyHelperSignal(
+			t,
+			requireSharedPolicyHelperEnv(t, sharedPolicyHelperAttemptEnv),
+		)
+		transaction, err := BeginSharedDefaultContext(ctx, mount)
+		if transaction != nil {
+			_ = transaction.Rollback()
+			t.Fatal("shared policy waiter acquired while holder was active")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf(
+				"shared policy waiter error = %v, want deadline exceeded",
+				err,
+			)
+		}
 		return
 	}
 	writeSharedPolicyHelperSignal(
@@ -704,7 +729,7 @@ func TestSharedPolicyTransactionHelperProcess(t *testing.T) {
 	)
 	transaction, err := BeginSharedDefaultContext(
 		context.Background(),
-		requireSharedPolicyHelperEnv(t, sharedPolicyHelperMountEnv),
+		mount,
 	)
 	if err != nil {
 		t.Fatalf("begin shared policy: %v", err)
@@ -717,7 +742,7 @@ func TestSharedPolicyTransactionHelperProcess(t *testing.T) {
 		t,
 		requireSharedPolicyHelperEnv(t, sharedPolicyHelperReleaseEnv),
 	)
-	switch os.Getenv(sharedPolicyHelperModeEnv) {
+	switch mode {
 	case "commit":
 		if err := transaction.Commit(); err != nil {
 			t.Fatalf("commit shared policy: %v", err)
@@ -729,7 +754,7 @@ func TestSharedPolicyTransactionHelperProcess(t *testing.T) {
 	default:
 		t.Fatalf(
 			"unknown shared policy helper mode %q",
-			os.Getenv(sharedPolicyHelperModeEnv),
+			mode,
 		)
 	}
 }
@@ -755,24 +780,25 @@ func TestSharedDefaultTransactionsSerializeAcrossProcesses(t *testing.T) {
 	second := startSharedPolicyHelper(
 		t,
 		home,
-		"commit",
+		"timeout",
 		secondAttempt,
 		secondReady,
 		secondRelease,
 	)
 	waitForSharedPolicyHelperSignal(t, secondAttempt)
-	time.Sleep(150 * time.Millisecond)
-	if _, err := os.Stat(secondReady); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("second transaction acquired before first abort: %v", err)
-	}
+	waitSharedPolicyHelper(t, second)
 
 	writeSharedPolicyHelperSignal(t, firstRelease)
 	waitSharedPolicyHelper(t, first)
-	waitForSharedPolicyHelperSignal(t, secondReady)
-	writeSharedPolicyHelperSignal(t, secondRelease)
-	waitSharedPolicyHelper(t, second)
 
 	t.Setenv("HOME", home)
+	postRelease, err := BeginSharedDefault("jasp-shared")
+	if err != nil {
+		t.Fatalf("begin shared policy after release: %v", err)
+	}
+	if err := postRelease.Commit(); err != nil {
+		t.Fatalf("commit shared policy after release: %v", err)
+	}
 	if _, _, _, err := LoadShared("jasp-shared"); err != nil {
 		t.Fatalf("serialized abort/adopt/commit left invalid policy: %v", err)
 	}
@@ -861,29 +887,32 @@ func TestSharedDefaultTransactionsRemainSerializedAfterPathReplacement(
 			second := startSharedPolicyHelper(
 				t,
 				home,
-				"commit",
+				"timeout",
 				secondAttempt,
 				secondReady,
 				secondRelease,
 			)
 			waitForSharedPolicyHelperSignal(t, secondAttempt)
-			time.Sleep(150 * time.Millisecond)
-			if _, err := os.Stat(secondReady); !errors.Is(
-				err,
-				os.ErrNotExist,
-			) {
+			waitSharedPolicyHelper(t, second)
+
+			writeSharedPolicyHelperSignal(t, firstRelease)
+			waitSharedPolicyHelper(t, first)
+
+			postRelease, err := BeginSharedDefault("jasp-shared")
+			if err != nil {
 				t.Fatalf(
-					"second transaction bypassed active lock after %s replacement: %v",
+					"begin shared policy after %s replacement release: %v",
 					test.name,
 					err,
 				)
 			}
-
-			writeSharedPolicyHelperSignal(t, firstRelease)
-			waitSharedPolicyHelper(t, first)
-			waitForSharedPolicyHelperSignal(t, secondReady)
-			writeSharedPolicyHelperSignal(t, secondRelease)
-			waitSharedPolicyHelper(t, second)
+			if err := postRelease.Rollback(); err != nil {
+				t.Fatalf(
+					"rollback shared policy after %s replacement release: %v",
+					test.name,
+					err,
+				)
+			}
 		})
 	}
 }

@@ -1244,15 +1244,18 @@ func TestHandleReveal_JSONMode_Denied(t *testing.T) {
 	}
 }
 
-func TestHandleReveal_JSONMode_AuditUnavailableDoesNotLeakPlaintext(t *testing.T) {
+func TestHandleReveal_JSONMode_PropagatesAppErrorWithoutCredentialContent(
+	t *testing.T,
+) {
 	secretSentinel := "sentinel-" + "secret-must-not-leak"
 	entryPath := "jasp/" + "production"
 	entryURL := "https://credentials.invalid/" + secretSentinel
 	a, fakeStore := newFakeApp(t, "human", &store.Entry{
 		Path: entryPath, URL: entryURL, Password: secretSentinel,
 	})
-	// The app-level matrix establishes the preflight source of this error.
-	// This HTTP test makes the response boundary fail closed as well.
+	// This transport-only test injects the exact App error at Store.Get.
+	// The App runtime contract separately proves that a real team-audit
+	// preflight failure returns it before Store.Get.
 	fakeStore.GetErr = app.ErrTeamAuditUnavailable
 
 	r := httptest.NewRequest("POST", "/entries/jasp/production", nil)
@@ -1271,6 +1274,12 @@ func TestHandleReveal_JSONMode_AuditUnavailableDoesNotLeakPlaintext(t *testing.T
 		strings.Contains(w.Body.String(), entryURL) ||
 		strings.Contains(w.Body.String(), entryPath) {
 		t.Fatalf("reveal response leaked plaintext, URL, or path: %q", w.Body.String())
+	}
+	if fakeStore.GetCallCount() != 1 {
+		t.Fatalf(
+			"transport injection Store.Get calls = %d, want 1",
+			fakeStore.GetCallCount(),
+		)
 	}
 }
 

@@ -323,16 +323,18 @@ func TestToolsCall_CredsGet_Denied(t *testing.T) {
 	}
 }
 
-func TestToolsCall_CredsGet_AuditUnavailableDoesNotLeakPlaintext(t *testing.T) {
+func TestToolsCall_CredsGet_PropagatesAppErrorWithoutCredentialContent(
+	t *testing.T,
+) {
 	secretSentinel := "sentinel-" + "secret-must-not-leak"
 	entryPath := "jasp/" + "production"
 	entryURL := "https://credentials.invalid/" + secretSentinel
 	a, fakeStore := newFakeApp(t, &store.Entry{
 		Path: entryPath, URL: entryURL, Password: secretSentinel,
 	})
-	// The app-level matrix proves that a shared-audit preflight produces this
-	// error before any decrypt. This focused transport test pins the MCP
-	// boundary: it must not turn that failure into credential content.
+	// This transport-only test injects the exact App error at Store.Get.
+	// The App runtime contract separately proves that a real team-audit
+	// preflight failure returns it before Store.Get.
 	fakeStore.GetErr = app.ErrTeamAuditUnavailable
 
 	lines := sendAndReceive(t, a, []string{
@@ -360,6 +362,12 @@ func TestToolsCall_CredsGet_AuditUnavailableDoesNotLeakPlaintext(t *testing.T) {
 		strings.Contains(lines[0], entryURL) ||
 		strings.Contains(lines[0], entryPath) {
 		t.Fatalf("MCP response leaked plaintext, URL, or path: %s", lines[0])
+	}
+	if fakeStore.GetCallCount() != 1 {
+		t.Fatalf(
+			"transport injection Store.Get calls = %d, want 1",
+			fakeStore.GetCallCount(),
+		)
 	}
 }
 

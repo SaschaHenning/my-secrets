@@ -170,12 +170,12 @@ func TestConfigLockHelperProcess(t *testing.T) {
 		// kernel lock even when application cleanup did not run.
 		runtime.KeepAlive(release)
 	case "timeout":
-		signalSyncLockHelper(t)
 		ctx, cancel := context.WithTimeout(
 			context.Background(),
-			100*time.Millisecond,
+			250*time.Millisecond,
 		)
 		defer cancel()
+		signalSyncLockHelper(t)
 		_, err := UpdateSharedTeamAuditAndSave(
 			ctx,
 			requireSyncLockHelperEnv(t, syncLockHelperPathEnv),
@@ -253,7 +253,7 @@ func TestConfigLockSerializesCrossProcessMountUpdates(t *testing.T) {
 
 	waiterReady := filepath.Join(tempDir, "waiter-ready")
 	waiter, waiterOutput := startSyncLockHelper(t, map[string]string{
-		syncLockHelperModeEnv:        "update",
+		syncLockHelperModeEnv:        "timeout",
 		syncLockHelperPathEnv:        path,
 		syncLockHelperMountEnv:       "beta",
 		syncLockHelperRemoteEnv:      "/remotes/beta-audit.git",
@@ -268,21 +268,12 @@ func TestConfigLockSerializesCrossProcessMountUpdates(t *testing.T) {
 		}
 	})
 	waitForSyncLockHelperFile(t, waiterReady)
-
-	waiterDone := make(chan error, 1)
-	go func() {
-		waiterDone <- waiter.Wait()
-	}()
-	select {
-	case err := <-waiterDone:
-		_ = os.WriteFile(holderRelease, []byte("release"), 0o600)
-		_ = holder.Wait()
+	if err := waiter.Wait(); err != nil {
 		t.Fatalf(
-			"second update did not wait for cross-process lock: %v\n%s",
+			"blocked update helper: %v\n%s",
 			err,
 			waiterOutput.String(),
 		)
-	case <-time.After(150 * time.Millisecond):
 	}
 
 	if err := os.WriteFile(holderRelease, []byte("release"), 0o600); err != nil {
@@ -291,8 +282,16 @@ func TestConfigLockSerializesCrossProcessMountUpdates(t *testing.T) {
 	if err := holder.Wait(); err != nil {
 		t.Fatalf("locked update helper: %v\n%s", err, holderOutput.String())
 	}
-	if err := <-waiterDone; err != nil {
-		t.Fatalf("waiting update helper: %v\n%s", err, waiterOutput.String())
+	if _, err := UpdateSharedTeamAuditAndSave(
+		context.Background(),
+		path,
+		"beta",
+		TeamAuditConfig{
+			URL:                "/remotes/beta-audit.git",
+			SigningFingerprint: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+		},
+	); err != nil {
+		t.Fatalf("update after holder release: %v", err)
 	}
 
 	config, err := Load(path)
