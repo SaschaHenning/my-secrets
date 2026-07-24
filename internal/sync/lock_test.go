@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -21,7 +23,35 @@ const (
 	syncLockHelperFingerprintEnv = "MYS_TEST_SYNC_LOCK_FINGERPRINT"
 	syncLockHelperReadyEnv       = "MYS_TEST_SYNC_LOCK_READY"
 	syncLockHelperReleaseEnv     = "MYS_TEST_SYNC_LOCK_RELEASE"
+
+	syncLockHelperWaitLimit      = time.Minute
+	syncLockHelperCleanupReserve = 2 * time.Second
+	syncLockHelperStopLimit      = 2 * time.Second
 )
+
+type syncLockHelperOutput struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (output *syncLockHelperOutput) Write(data []byte) (int, error) {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	return output.buffer.Write(data)
+}
+
+func (output *syncLockHelperOutput) String() string {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	return output.buffer.String()
+}
+
+type syncLockHelperProcess struct {
+	command *exec.Cmd
+	output  syncLockHelperOutput
+	done    chan struct{}
+	waitErr error
+}
 
 func TestAcquireMountLockSerializesAndReleases(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -225,6 +255,33 @@ func TestConfigLockHelperProcess(t *testing.T) {
 	}
 }
 
+func TestWaitForSyncLockHelperReadinessReportsEarlyExit(t *testing.T) {
+	tempDir := t.TempDir()
+	readyPath := filepath.Join(tempDir, "never-ready")
+	helper := startSyncLockHelper(t, map[string]string{
+		syncLockHelperModeEnv:  "invalid-mode",
+		syncLockHelperReadyEnv: readyPath,
+		"HOME":                 tempDir,
+		"XDG_CONFIG_HOME":      tempDir,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := waitForSyncLockHelperSignal(ctx, helper, readyPath)
+	if err == nil {
+		t.Fatal("readiness wait succeeded after helper exited without signaling")
+	}
+	for _, expected := range []string{
+		"helper exited before signaling",
+		"exit status 1",
+		`unknown sync lock helper mode "invalid-mode"`,
+	} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("readiness error %q does not contain %q", err, expected)
+		}
+	}
+}
+
 func TestConfigLockSerializesCrossProcessMountUpdates(t *testing.T) {
 	tempDir := t.TempDir()
 	path := filepath.Join(tempDir, "sync.yaml")
@@ -232,7 +289,7 @@ func TestConfigLockSerializesCrossProcessMountUpdates(t *testing.T) {
 
 	holderReady := filepath.Join(tempDir, "holder-ready")
 	holderRelease := filepath.Join(tempDir, "holder-release")
-	holder, holderOutput := startSyncLockHelper(t, map[string]string{
+	holder := startSyncLockHelper(t, map[string]string{
 		syncLockHelperModeEnv:        "locked-update",
 		syncLockHelperPathEnv:        path,
 		syncLockHelperMountEnv:       "alpha",
@@ -245,14 +302,11 @@ func TestConfigLockSerializesCrossProcessMountUpdates(t *testing.T) {
 	})
 	t.Cleanup(func() {
 		_ = os.WriteFile(holderRelease, []byte("release"), 0o600)
-		if holder.Process != nil && holder.ProcessState == nil {
-			_ = holder.Process.Kill()
-		}
 	})
-	waitForSyncLockHelperFile(t, holderReady)
+	waitForSyncLockHelperReadiness(t, holder, holderReady)
 
 	waiterReady := filepath.Join(tempDir, "waiter-ready")
-	waiter, waiterOutput := startSyncLockHelper(t, map[string]string{
+	waiter := startSyncLockHelper(t, map[string]string{
 		syncLockHelperModeEnv:        "timeout",
 		syncLockHelperPathEnv:        path,
 		syncLockHelperMountEnv:       "beta",
@@ -262,25 +316,20 @@ func TestConfigLockSerializesCrossProcessMountUpdates(t *testing.T) {
 		"HOME":                       tempDir,
 		"XDG_CONFIG_HOME":            tempDir,
 	})
-	t.Cleanup(func() {
-		if waiter.Process != nil && waiter.ProcessState == nil {
-			_ = waiter.Process.Kill()
-		}
-	})
-	waitForSyncLockHelperFile(t, waiterReady)
-	if err := waiter.Wait(); err != nil {
+	waitForSyncLockHelperReadiness(t, waiter, waiterReady)
+	if output, err := waitForSyncLockHelperExit(t, waiter); err != nil {
 		t.Fatalf(
 			"blocked update helper: %v\n%s",
 			err,
-			waiterOutput.String(),
+			output,
 		)
 	}
 
 	if err := os.WriteFile(holderRelease, []byte("release"), 0o600); err != nil {
 		t.Fatalf("release locked update helper: %v", err)
 	}
-	if err := holder.Wait(); err != nil {
-		t.Fatalf("locked update helper: %v\n%s", err, holderOutput.String())
+	if output, err := waitForSyncLockHelperExit(t, holder); err != nil {
+		t.Fatalf("locked update helper: %v\n%s", err, output)
 	}
 	if _, err := UpdateSharedTeamAuditAndSave(
 		context.Background(),
@@ -309,7 +358,7 @@ func TestConfigLockContextCancellationAndReleaseAfterChildExit(t *testing.T) {
 
 	holderReady := filepath.Join(tempDir, "holder-ready")
 	holderRelease := filepath.Join(tempDir, "holder-release")
-	holder, holderOutput := startSyncLockHelper(t, map[string]string{
+	holder := startSyncLockHelper(t, map[string]string{
 		syncLockHelperModeEnv:    "hold",
 		syncLockHelperPathEnv:    path,
 		syncLockHelperReadyEnv:   holderReady,
@@ -319,14 +368,11 @@ func TestConfigLockContextCancellationAndReleaseAfterChildExit(t *testing.T) {
 	})
 	t.Cleanup(func() {
 		_ = os.WriteFile(holderRelease, []byte("release"), 0o600)
-		if holder.Process != nil && holder.ProcessState == nil {
-			_ = holder.Process.Kill()
-		}
 	})
-	waitForSyncLockHelperFile(t, holderReady)
+	waitForSyncLockHelperReadiness(t, holder, holderReady)
 
 	waiterReady := filepath.Join(tempDir, "waiter-ready")
-	waiter, waiterOutput := startSyncLockHelper(t, map[string]string{
+	waiter := startSyncLockHelper(t, map[string]string{
 		syncLockHelperModeEnv:        "timeout",
 		syncLockHelperPathEnv:        path,
 		syncLockHelperMountEnv:       "beta",
@@ -336,14 +382,9 @@ func TestConfigLockContextCancellationAndReleaseAfterChildExit(t *testing.T) {
 		"HOME":                       tempDir,
 		"XDG_CONFIG_HOME":            tempDir,
 	})
-	t.Cleanup(func() {
-		if waiter.Process != nil && waiter.ProcessState == nil {
-			_ = waiter.Process.Kill()
-		}
-	})
-	waitForSyncLockHelperFile(t, waiterReady)
-	if err := waiter.Wait(); err != nil {
-		t.Fatalf("timeout helper: %v\n%s", err, waiterOutput.String())
+	waitForSyncLockHelperReadiness(t, waiter, waiterReady)
+	if output, err := waitForSyncLockHelperExit(t, waiter); err != nil {
+		t.Fatalf("timeout helper: %v\n%s", err, output)
 	}
 
 	config, err := Load(path)
@@ -357,8 +398,8 @@ func TestConfigLockContextCancellationAndReleaseAfterChildExit(t *testing.T) {
 	if err := os.WriteFile(holderRelease, []byte("release"), 0o600); err != nil {
 		t.Fatalf("end holder helper: %v", err)
 	}
-	if err := holder.Wait(); err != nil {
-		t.Fatalf("holder helper: %v\n%s", err, holderOutput.String())
+	if output, err := waitForSyncLockHelperExit(t, holder); err != nil {
+		t.Fatalf("holder helper: %v\n%s", err, output)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -420,7 +461,7 @@ func TestConfigLockRemainsSerializedAfterPathReplacement(t *testing.T) {
 
 			holderReady := filepath.Join(tempDir, "holder-ready")
 			holderRelease := filepath.Join(tempDir, "holder-release")
-			holder, holderOutput := startSyncLockHelper(t, map[string]string{
+			holder := startSyncLockHelper(t, map[string]string{
 				syncLockHelperModeEnv:    "hold",
 				syncLockHelperPathEnv:    path,
 				syncLockHelperReadyEnv:   holderReady,
@@ -430,15 +471,12 @@ func TestConfigLockRemainsSerializedAfterPathReplacement(t *testing.T) {
 			})
 			t.Cleanup(func() {
 				_ = os.WriteFile(holderRelease, []byte("release"), 0o600)
-				if holder.Process != nil && holder.ProcessState == nil {
-					_ = holder.Process.Kill()
-				}
 			})
-			waitForSyncLockHelperFile(t, holderReady)
+			waitForSyncLockHelperReadiness(t, holder, holderReady)
 			test.replace(t, path)
 
 			waiterReady := filepath.Join(tempDir, "waiter-ready")
-			waiter, waiterOutput := startSyncLockHelper(
+			waiter := startSyncLockHelper(
 				t,
 				map[string]string{
 					syncLockHelperModeEnv:        "timeout",
@@ -451,12 +489,12 @@ func TestConfigLockRemainsSerializedAfterPathReplacement(t *testing.T) {
 					"XDG_CONFIG_HOME":            tempDir,
 				},
 			)
-			waitForSyncLockHelperFile(t, waiterReady)
-			if err := waiter.Wait(); err != nil {
+			waitForSyncLockHelperReadiness(t, waiter, waiterReady)
+			if output, err := waitForSyncLockHelperExit(t, waiter); err != nil {
 				t.Fatalf(
 					"canceled waiter bypassed replaced config path: %v\n%s",
 					err,
-					waiterOutput.String(),
+					output,
 				)
 			}
 
@@ -467,8 +505,8 @@ func TestConfigLockRemainsSerializedAfterPathReplacement(t *testing.T) {
 			); err != nil {
 				t.Fatalf("release config holder: %v", err)
 			}
-			if err := holder.Wait(); err != nil {
-				t.Fatalf("config holder: %v\n%s", err, holderOutput.String())
+			if output, err := waitForSyncLockHelperExit(t, holder); err != nil {
+				t.Fatalf("config holder: %v\n%s", err, output)
 			}
 			release, err := acquireConfigLock(context.Background(), path)
 			if err != nil {
@@ -494,7 +532,7 @@ func TestMountLockRemainsSerializedAfterLegacyPathReplacement(t *testing.T) {
 
 	holderReady := filepath.Join(tempDir, "holder-ready")
 	holderRelease := filepath.Join(tempDir, "holder-release")
-	holder, holderOutput := startSyncLockHelper(t, map[string]string{
+	holder := startSyncLockHelper(t, map[string]string{
 		syncLockHelperModeEnv:    "hold-mount",
 		syncLockHelperMountEnv:   "jasp",
 		syncLockHelperReadyEnv:   holderReady,
@@ -504,35 +542,32 @@ func TestMountLockRemainsSerializedAfterLegacyPathReplacement(t *testing.T) {
 	})
 	t.Cleanup(func() {
 		_ = os.WriteFile(holderRelease, []byte("release"), 0o600)
-		if holder.Process != nil && holder.ProcessState == nil {
-			_ = holder.Process.Kill()
-		}
 	})
-	waitForSyncLockHelperFile(t, holderReady)
+	waitForSyncLockHelperReadiness(t, holder, holderReady)
 	replaceSyncLockTestFile(t, lockPath)
 
 	waiterReady := filepath.Join(tempDir, "waiter-ready")
-	waiter, waiterOutput := startSyncLockHelper(t, map[string]string{
+	waiter := startSyncLockHelper(t, map[string]string{
 		syncLockHelperModeEnv:  "timeout-mount",
 		syncLockHelperMountEnv: "jasp",
 		syncLockHelperReadyEnv: waiterReady,
 		"HOME":                 tempDir,
 		"XDG_CONFIG_HOME":      tempDir,
 	})
-	waitForSyncLockHelperFile(t, waiterReady)
-	if err := waiter.Wait(); err != nil {
+	waitForSyncLockHelperReadiness(t, waiter, waiterReady)
+	if output, err := waitForSyncLockHelperExit(t, waiter); err != nil {
 		t.Fatalf(
 			"canceled waiter bypassed replaced mount lock path: %v\n%s",
 			err,
-			waiterOutput.String(),
+			output,
 		)
 	}
 
 	if err := os.WriteFile(holderRelease, []byte("release"), 0o600); err != nil {
 		t.Fatalf("release mount holder: %v", err)
 	}
-	if err := holder.Wait(); err != nil {
-		t.Fatalf("mount holder: %v\n%s", err, holderOutput.String())
+	if output, err := waitForSyncLockHelperExit(t, holder); err != nil {
+		t.Fatalf("mount holder: %v\n%s", err, output)
 	}
 	release, err := AcquireMountLock(context.Background(), "jasp")
 	if err != nil {
@@ -625,24 +660,121 @@ func requireSyncLockHelperEnv(t *testing.T, name string) string {
 
 func waitForSyncLockHelperFile(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	ctx, cancel := syncLockHelperWaitContext(t)
+	defer cancel()
+	if err := waitForSyncLockHelperSignal(ctx, nil, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForSyncLockHelperReadiness(
+	t *testing.T,
+	helper *syncLockHelperProcess,
+	path string,
+) {
+	t.Helper()
+	ctx, cancel := syncLockHelperWaitContext(t)
+	defer cancel()
+	if err := waitForSyncLockHelperSignal(ctx, helper, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForSyncLockHelperExit(
+	t *testing.T,
+	helper *syncLockHelperProcess,
+) (string, error) {
+	t.Helper()
+	ctx, cancel := syncLockHelperWaitContext(t)
+	defer cancel()
+	return helper.wait(ctx)
+}
+
+func syncLockHelperWaitContext(
+	t *testing.T,
+) (context.Context, context.CancelFunc) {
+	t.Helper()
+	deadline := time.Now().Add(syncLockHelperWaitLimit)
+	if testDeadline, ok := t.Deadline(); ok {
+		safeTestDeadline := testDeadline.Add(-syncLockHelperCleanupReserve)
+		if safeTestDeadline.Before(deadline) {
+			deadline = safeTestDeadline
+		}
+	}
+	return context.WithDeadline(context.Background(), deadline)
+}
+
+func waitForSyncLockHelperSignal(
+	ctx context.Context,
+	helper *syncLockHelperProcess,
+	path string,
+) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	var helperDone <-chan struct{}
+	if helper != nil {
+		helperDone = helper.done
+	}
 	for {
 		if _, err := os.Stat(path); err == nil {
-			return
+			return nil
 		} else if !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("inspect helper signal %s: %v", path, err)
+			return fmt.Errorf("inspect helper signal %s: %w", path, err)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for helper signal %s", path)
+
+		select {
+		case <-helperDone:
+			if _, err := os.Stat(path); err == nil {
+				return nil
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("inspect helper signal %s: %w", path, err)
+			}
+			output, waitErr, _ := helper.completedResult()
+			return fmt.Errorf(
+				"helper exited before signaling %s: wait error: %v\n%s",
+				path,
+				waitErr,
+				output,
+			)
+		case <-ctx.Done():
+			if helper == nil {
+				return fmt.Errorf(
+					"timed out waiting for helper signal %s: %w",
+					path,
+					ctx.Err(),
+				)
+			}
+			stopErr := helper.stop()
+			output, waitErr, completed := helper.completedResult()
+			if !completed {
+				return fmt.Errorf(
+					"timed out waiting for helper signal %s: %w; "+
+						"stop error: %v\n%s",
+					path,
+					ctx.Err(),
+					stopErr,
+					output,
+				)
+			}
+			return fmt.Errorf(
+				"timed out waiting for helper signal %s: %w; "+
+					"child wait error: %v; stop error: %v\n%s",
+				path,
+				ctx.Err(),
+				waitErr,
+				stopErr,
+				output,
+			)
+		case <-ticker.C:
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func startSyncLockHelper(
 	t *testing.T,
 	environment map[string]string,
-) (*exec.Cmd, *bytes.Buffer) {
+) *syncLockHelperProcess {
 	t.Helper()
 	command := exec.Command(
 		os.Args[0],
@@ -657,13 +789,101 @@ func startSyncLockHelper(
 	for name, value := range environment {
 		command.Env = append(command.Env, name+"="+value)
 	}
-	var output bytes.Buffer
-	command.Stdout = &output
-	command.Stderr = &output
+	helper := &syncLockHelperProcess{
+		command: command,
+		done:    make(chan struct{}),
+	}
+	command.Stdout = &helper.output
+	command.Stderr = &helper.output
 	if err := command.Start(); err != nil {
 		t.Fatalf("start config lock helper: %v", err)
 	}
-	return command, &output
+	go func() {
+		helper.waitErr = command.Wait()
+		close(helper.done)
+	}()
+	t.Cleanup(func() {
+		if err := helper.stop(); err != nil {
+			t.Errorf(
+				"stop config lock helper: %v\n%s",
+				err,
+				helper.output.String(),
+			)
+		}
+	})
+	return helper
+}
+
+func (helper *syncLockHelperProcess) wait(
+	ctx context.Context,
+) (string, error) {
+	select {
+	case <-helper.done:
+		output, waitErr, _ := helper.completedResult()
+		return output, waitErr
+	case <-ctx.Done():
+		select {
+		case <-helper.done:
+			output, waitErr, _ := helper.completedResult()
+			return output, waitErr
+		default:
+		}
+
+		stopErr := helper.stop()
+		output, waitErr, completed := helper.completedResult()
+		if !completed {
+			return output, fmt.Errorf(
+				"wait for helper process: %w; stop error: %v",
+				ctx.Err(),
+				stopErr,
+			)
+		}
+		return output, fmt.Errorf(
+			"wait for helper process: %w; child wait error: %v; "+
+				"stop error: %v",
+			ctx.Err(),
+			waitErr,
+			stopErr,
+		)
+	}
+}
+
+func (helper *syncLockHelperProcess) completedResult() (
+	string,
+	error,
+	bool,
+) {
+	select {
+	case <-helper.done:
+		return helper.output.String(), helper.waitErr, true
+	default:
+		return helper.output.String(), nil, false
+	}
+}
+
+func (helper *syncLockHelperProcess) stop() error {
+	select {
+	case <-helper.done:
+		return nil
+	default:
+	}
+
+	killErr := helper.command.Process.Kill()
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	timer := time.NewTimer(syncLockHelperStopLimit)
+	defer timer.Stop()
+	select {
+	case <-helper.done:
+		return killErr
+	case <-timer.C:
+		return fmt.Errorf(
+			"helper did not exit within %s after kill: %v",
+			syncLockHelperStopLimit,
+			killErr,
+		)
+	}
 }
 
 func saveTwoSharedMountConfig(t *testing.T, path string) {
