@@ -14,7 +14,6 @@ import (
 
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
-	"github.com/SaschaHenning/my-secrets/internal/lockanchor"
 	"github.com/SaschaHenning/my-secrets/internal/policy"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	"github.com/SaschaHenning/my-secrets/internal/store/fake"
@@ -1357,25 +1356,138 @@ func TestSharedReadGate_HumanAndScriptAuditFailureIsAdvisory(t *testing.T) {
 	}
 }
 
-func TestSharedReadGate_ConfigAndMountErrorsFollowActorMode(t *testing.T) {
+func TestSharedReadGate_ConfigUnavailableFailsClosedForAllActors(t *testing.T) {
+	actors := []caller.Detail{
+		aiActor(),
+		{Kind: caller.KindHuman},
+		{Kind: caller.KindScript},
+	}
+	configFailures := []struct {
+		name string
+		load func() (*syncpkg.Config, error)
+	}{
+		{
+			name: "load error",
+			load: func() (*syncpkg.Config, error) {
+				return nil, errors.New("file:///private/audit.git TOPSECRET")
+			},
+		},
+		{
+			name: "missing config",
+			load: func() (*syncpkg.Config, error) {
+				return nil, nil
+			},
+		},
+		{
+			name: "validation error",
+			load: func() (*syncpkg.Config, error) {
+				return &syncpkg.Config{
+					Version: 1,
+					Layout:  syncpkg.LayoutPerOrg,
+					Remotes: []syncpkg.StoreRemote{
+						sharedRemote("jasp"),
+						sharedRemote("jasp"),
+					},
+				}, nil
+			},
+		},
+	}
+
+	for _, actor := range actors {
+		for _, configFailure := range configFailures {
+			t.Run(string(actor.Kind)+"/"+configFailure.name, func(t *testing.T) {
+				app, fakeStore, _, stderr := gatedApp(
+					t,
+					actor,
+					&store.Entry{Path: "jasp/one", Password: "TOPSECRET"},
+				)
+				releaseCalls := 0
+				app.teamReads.acquireAnchor = func(
+					ctx context.Context,
+				) (context.Context, func() error, error) {
+					return ctx, func() error {
+						releaseCalls++
+						return nil
+					}, nil
+				}
+				openCalls := 0
+				app.teamReads.openStore = func(
+					context.Context,
+					[]string,
+				) (*accessStoreSession, error) {
+					openCalls++
+					return nil, errors.New("store opener must not run")
+				}
+				app.teamReads.loadSyncConfig = configFailure.load
+
+				entry, err := app.Get(context.Background(), "jasp/one")
+
+				want := ErrPolicyUnavailable
+				if actor.Kind == caller.KindAI {
+					want = ErrTeamAuditUnavailable
+				}
+				if !errors.Is(err, want) || entry != nil {
+					t.Fatalf("entry=%+v error=%v, want %v without plaintext", entry, err, want)
+				}
+				if fakeStore.GetCallCount() != 0 || openCalls != 0 {
+					t.Fatalf(
+						"store access = get:%d open:%d, want 0/0",
+						fakeStore.GetCallCount(),
+						openCalls,
+					)
+				}
+				if releaseCalls != 1 {
+					t.Fatalf("outer anchor releases = %d, want 1", releaseCalls)
+				}
+				if stderr.Len() != 0 {
+					t.Fatalf("config failure emitted advisory warning: %q", stderr.String())
+				}
+				if strings.Contains(err.Error(), "TOPSECRET") ||
+					strings.Contains(err.Error(), "private") {
+					t.Fatalf("config error leaked internal detail: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestSharedReadGate_MissingConfigLoaderFailsClosed(t *testing.T) {
+	app, fakeStore, _, _ := gatedApp(
+		t,
+		aiActor(),
+		&store.Entry{Path: "jasp/one", Password: "TOPSECRET"},
+	)
+	app.teamReads.loadSyncConfig = nil
+	storeOpens := 0
+	app.teamReads.openStore = func(
+		context.Context,
+		[]string,
+	) (*accessStoreSession, error) {
+		storeOpens++
+		return nil, errors.New("store opener must not run")
+	}
+
+	entry, err := app.Get(context.Background(), "jasp/one")
+
+	if !errors.Is(err, ErrTeamAuditUnavailable) || entry != nil {
+		t.Fatalf("entry=%+v error=%v, want generic failure without plaintext", entry, err)
+	}
+	if fakeStore.GetCallCount() != 0 || storeOpens != 0 {
+		t.Fatalf(
+			"store access = get:%d open:%d, want 0/0",
+			fakeStore.GetCallCount(),
+			storeOpens,
+		)
+	}
+}
+
+func TestSharedReadGate_AuditBackendErrorsFollowActorMode(t *testing.T) {
 	cases := []struct {
 		name      string
 		actor     caller.Detail
 		configure func(*App)
 		wantError bool
 	}{
-		{
-			name:  "AI config error",
-			actor: aiActor(),
-			configure: func(app *App) {
-				app.teamReads.loadSyncConfig = func() (*syncpkg.Config, error) {
-					return nil, errors.New(
-						"file:///private/audit.git TOPSECRET",
-					)
-				}
-			},
-			wantError: true,
-		},
 		{
 			name:  "AI mount error",
 			actor: aiActor(),
@@ -1390,17 +1502,6 @@ func TestSharedReadGate_ConfigAndMountErrorsFollowActorMode(t *testing.T) {
 				}
 			},
 			wantError: true,
-		},
-		{
-			name:  "human config error",
-			actor: caller.Detail{Kind: caller.KindHuman},
-			configure: func(app *App) {
-				app.teamReads.loadSyncConfig = func() (*syncpkg.Config, error) {
-					return nil, errors.New(
-						"file:///private/audit.git TOPSECRET",
-					)
-				}
-			},
 		},
 		{
 			name:  "script mount error",
@@ -1907,17 +2008,6 @@ func TestSharedReadGate_HoldsOuterAnchorAcrossConfigSnapshotAndBoundOpen(
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, writerRelease, err := lockanchor.AcquireContext(ctx)
-	if err != nil {
-		t.Fatalf("acquire concurrent writer anchor: %v", err)
-	}
-	writerHeld := true
-	defer func() {
-		if writerHeld {
-			_ = writerRelease()
-		}
-	}()
-
 	personal := &syncpkg.Config{
 		Version: 1,
 		Layout:  syncpkg.LayoutPerOrg,
@@ -1933,8 +2023,13 @@ func TestSharedReadGate_HoldsOuterAnchorAcrossConfigSnapshotAndBoundOpen(
 	}
 	var configMu sync.Mutex
 	currentConfig := personal
-	configLoaded := make(chan struct{})
-	var loadOnce sync.Once
+	configReached := make(chan struct{})
+	var configOnce sync.Once
+	acquireAttempted := make(chan struct{})
+	var acquireOnce sync.Once
+	acquireGate := make(chan struct{})
+	storeOpened := make(chan struct{})
+	var storeOnce sync.Once
 	manager := &fakeTeamAuditManager{
 		snapshot:     testSnapshot,
 		preflightErr: errors.New("audit preflight failed"),
@@ -1944,11 +2039,21 @@ func TestSharedReadGate_HoldsOuterAnchorAcrossConfigSnapshotAndBoundOpen(
 		personal,
 		map[string]*fakeTeamAuditManager{"jasp": manager},
 	)
-	runtime.acquireAnchor = lockanchor.AcquireContext
+	runtime.acquireAnchor = func(
+		operationCtx context.Context,
+	) (context.Context, func() error, error) {
+		acquireOnce.Do(func() { close(acquireAttempted) })
+		select {
+		case <-acquireGate:
+			return operationCtx, func() error { return nil }, nil
+		case <-operationCtx.Done():
+			return nil, nil, operationCtx.Err()
+		}
+	}
 	runtime.loadSyncConfig = func() (*syncpkg.Config, error) {
 		configMu.Lock()
 		defer configMu.Unlock()
-		loadOnce.Do(func() { close(configLoaded) })
+		configOnce.Do(func() { close(configReached) })
 		snapshot := *currentConfig
 		snapshot.Remotes = append([]syncpkg.StoreRemote(nil), currentConfig.Remotes...)
 		return &snapshot, nil
@@ -1958,19 +2063,10 @@ func TestSharedReadGate_HoldsOuterAnchorAcrossConfigSnapshotAndBoundOpen(
 		Password: "must-not-be-returned",
 	})
 	runtime.openStore = func(
-		operationCtx context.Context,
+		_ context.Context,
 		_ []string,
 	) (*accessStoreSession, error) {
-		release, acquireErr := lockanchor.Acquire(operationCtx)
-		if acquireErr != nil {
-			return nil, acquireErr
-		}
-		if release == nil {
-			return nil, errors.New("bound store anchor returned nil release")
-		}
-		if releaseErr := release(); releaseErr != nil {
-			return nil, releaseErr
-		}
+		storeOnce.Do(func() { close(storeOpened) })
 		return &accessStoreSession{
 			store:            backing,
 			resolveMountPath: runtime.resolveMountPath,
@@ -1993,19 +2089,15 @@ func TestSharedReadGate_HoldsOuterAnchorAcrossConfigSnapshotAndBoundOpen(
 	}()
 
 	select {
-	case <-configLoaded:
-		t.Fatal("config snapshot escaped the writer-held stable anchor")
-	case <-time.After(200 * time.Millisecond):
+	case <-acquireAttempted:
+	case <-ctx.Done():
+		t.Fatalf("read did not attempt anchor acquisition: %v", ctx.Err())
 	}
 
 	configMu.Lock()
 	currentConfig = shared
 	configMu.Unlock()
-	if err := writerRelease(); err != nil {
-		t.Fatalf("release concurrent writer anchor: %v", err)
-	}
-	writerHeld = false
-
+	close(acquireGate)
 	select {
 	case got := <-resultCh:
 		if !errors.Is(got.err, ErrTeamAuditUnavailable) || got.entry != nil {
@@ -2016,7 +2108,20 @@ func TestSharedReadGate_HoldsOuterAnchorAcrossConfigSnapshotAndBoundOpen(
 			)
 		}
 	case <-ctx.Done():
-		t.Fatalf("read did not finish after writer handoff: %v", ctx.Err())
+		t.Fatalf(
+			"read did not finish after the anchor gate opened: %v",
+			ctx.Err(),
+		)
+	}
+	select {
+	case <-configReached:
+	case <-ctx.Done():
+		t.Fatalf("config did not load after writer release: %v", ctx.Err())
+	}
+	select {
+	case <-storeOpened:
+	case <-ctx.Done():
+		t.Fatalf("store did not open after writer release: %v", ctx.Err())
 	}
 	preflightCalls, appendCalls := manager.calls()
 	if preflightCalls != 1 || len(appendCalls) != 0 {
@@ -2031,17 +2136,6 @@ func TestSharedReadGate_HoldsOuterAnchorAcrossConfigSnapshotAndBoundOpen(
 func TestHistory_HoldsOuterAnchorAcrossConfigSnapshot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	_, writerRelease, err := lockanchor.AcquireContext(ctx)
-	if err != nil {
-		t.Fatalf("acquire concurrent writer anchor: %v", err)
-	}
-	writerHeld := true
-	defer func() {
-		if writerHeld {
-			_ = writerRelease()
-		}
-	}()
 
 	personal := &syncpkg.Config{
 		Version: 1,
@@ -2058,18 +2152,31 @@ func TestHistory_HoldsOuterAnchorAcrossConfigSnapshot(t *testing.T) {
 	}
 	var configMu sync.Mutex
 	currentConfig := personal
-	configLoaded := make(chan struct{})
-	var loadOnce sync.Once
+	configReached := make(chan struct{})
+	var configOnce sync.Once
+	acquireAttempted := make(chan struct{})
+	var acquireOnce sync.Once
+	acquireGate := make(chan struct{})
 	runtime := gatedRuntime(
 		aiActor(),
 		personal,
 		map[string]*fakeTeamAuditManager{},
 	)
-	runtime.acquireAnchor = lockanchor.AcquireContext
+	runtime.acquireAnchor = func(
+		operationCtx context.Context,
+	) (context.Context, func() error, error) {
+		acquireOnce.Do(func() { close(acquireAttempted) })
+		select {
+		case <-acquireGate:
+			return operationCtx, func() error { return nil }, nil
+		case <-operationCtx.Done():
+			return nil, nil, operationCtx.Err()
+		}
+	}
 	runtime.loadSyncConfig = func() (*syncpkg.Config, error) {
 		configMu.Lock()
 		defer configMu.Unlock()
-		loadOnce.Do(func() { close(configLoaded) })
+		configOnce.Do(func() { close(configReached) })
 		snapshot := *currentConfig
 		snapshot.Remotes = append([]syncpkg.StoreRemote(nil), currentConfig.Remotes...)
 		return &snapshot, nil
@@ -2092,19 +2199,15 @@ func TestHistory_HoldsOuterAnchorAcrossConfigSnapshot(t *testing.T) {
 	}()
 
 	select {
-	case <-configLoaded:
-		t.Fatal("history config snapshot escaped the writer-held stable anchor")
-	case <-time.After(200 * time.Millisecond):
+	case <-acquireAttempted:
+	case <-ctx.Done():
+		t.Fatalf("history did not attempt anchor acquisition: %v", ctx.Err())
 	}
 
 	configMu.Lock()
 	currentConfig = shared
 	configMu.Unlock()
-	if err := writerRelease(); err != nil {
-		t.Fatalf("release concurrent writer anchor: %v", err)
-	}
-	writerHeld = false
-
+	close(acquireGate)
 	select {
 	case got := <-resultCh:
 		var denied *ErrDenied
@@ -2116,7 +2219,94 @@ func TestHistory_HoldsOuterAnchorAcrossConfigSnapshot(t *testing.T) {
 			)
 		}
 	case <-ctx.Done():
-		t.Fatalf("history did not finish after writer handoff: %v", ctx.Err())
+		t.Fatalf("history did not finish after the anchor gate opened: %v", ctx.Err())
+	}
+	select {
+	case <-configReached:
+	case <-ctx.Done():
+		t.Fatalf("history config did not load after the anchor gate opened: %v", ctx.Err())
+	}
+}
+
+func TestSharedReadGate_AnchorGateCancellationStopsBeforeConfigAndStore(
+	t *testing.T,
+) {
+	deadlineCtx, cancelDeadline := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancelDeadline()
+	operationCtx, cancelOperation := context.WithCancel(deadlineCtx)
+	defer cancelOperation()
+
+	app, fakeStore, _, _ := gatedApp(
+		t,
+		aiActor(),
+		&store.Entry{Path: "jasp/one", Password: "must-not-be-returned"},
+	)
+	attempted := make(chan struct{})
+	gate := make(chan struct{})
+	var attemptOnce sync.Once
+	configLoads := 0
+	storeOpens := 0
+	app.teamReads.acquireAnchor = func(
+		ctx context.Context,
+	) (context.Context, func() error, error) {
+		attemptOnce.Do(func() { close(attempted) })
+		select {
+		case <-gate:
+			return ctx, func() error { return nil }, nil
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	app.teamReads.loadSyncConfig = func() (*syncpkg.Config, error) {
+		configLoads++
+		return nil, errors.New("config loader must not run")
+	}
+	app.teamReads.openStore = func(
+		context.Context,
+		[]string,
+	) (*accessStoreSession, error) {
+		storeOpens++
+		return nil, errors.New("store opener must not run")
+	}
+
+	type result struct {
+		entry *store.Entry
+		err   error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		entry, err := app.Get(operationCtx, "jasp/one")
+		resultCh <- result{entry: entry, err: err}
+	}()
+
+	select {
+	case <-attempted:
+	case <-deadlineCtx.Done():
+		t.Fatalf("read did not attempt anchor acquisition: %v", deadlineCtx.Err())
+	}
+	cancelOperation()
+	select {
+	case got := <-resultCh:
+		if !errors.Is(got.err, ErrTeamAuditUnavailable) || got.entry != nil {
+			t.Fatalf(
+				"cancelled read = %+v/%v, want generic failure without plaintext",
+				got.entry,
+				got.err,
+			)
+		}
+	case <-deadlineCtx.Done():
+		t.Fatalf("cancelled read did not return: %v", deadlineCtx.Err())
+	}
+	if configLoads != 0 || storeOpens != 0 || fakeStore.GetCallCount() != 0 {
+		t.Fatalf(
+			"cancelled read access = config:%d store-open:%d decrypt:%d, want 0/0/0",
+			configLoads,
+			storeOpens,
+			fakeStore.GetCallCount(),
+		)
 	}
 }
 

@@ -275,21 +275,14 @@ func (a *App) beginAccessOperation(
 		err = config.Validate()
 	}
 	if err != nil || config == nil {
-		if readOnly && actor.Kind != caller.KindAI {
-			a.warnTeamAudit()
-			operation.config = &syncpkg.Config{Version: 1}
-		} else {
-			if !readOnly {
-				return nil, errors.Join(
-					ErrPolicyUnavailable,
-					operation.close(ctx),
-				)
-			}
-			return nil, errors.Join(
-				ErrTeamAuditUnavailable,
-				operation.close(ctx),
-			)
+		// The config establishes whether a mount is shared, so an unavailable
+		// or invalid config makes authorization indeterminate. Never replace it
+		// with an empty config: that would silently skip the shared policy gate.
+		_ = operation.close(ctx)
+		if actor.Kind == caller.KindAI {
+			return nil, ErrTeamAuditUnavailable
 		}
+		return nil, ErrPolicyUnavailable
 	} else {
 		operation.config = config
 	}
