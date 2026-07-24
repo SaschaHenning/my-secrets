@@ -91,10 +91,17 @@ banner "Installing mys to ~/bin"
 
 INSTALL_PATH="$HOME/bin/mys"
 mkdir -p "$HOME/bin"
-# Remove first: overwriting a signed binary in place keeps the inode and
-# macOS then SIGKILLs it with a stale code-signature cache.
-rm -f "$INSTALL_PATH"
-cp bin/mys "$INSTALL_PATH"
+# Use install(1), not `rm -f` + `cp`: it writes the bytes to a fresh inode
+# and atomically renames them into place. Two problems this avoids when the
+# target is a *running* mys binary (e.g. the `mys web` KeepAlive
+# LaunchAgent): (1) overwriting in place keeps the inode and the macOS
+# codesigning monitor then SIGKILLs the process over a stale signature
+# cache; (2) `rm` + `cp` leaves a sub-second window where the path is
+# missing or half-written, during which launchd could exec a truncated
+# binary. A fresh-inode atomic replace closes both. install matches the
+# idiom the docs (INSTALL.md) already use. The embedded ad-hoc signature is
+# part of the copied bytes, so it is preserved.
+install -m 0755 bin/mys "$INSTALL_PATH"
 ok "mys → $INSTALL_PATH"
 
 case ":$PATH:" in
