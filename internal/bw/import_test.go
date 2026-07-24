@@ -134,3 +134,117 @@ func TestBuildImportDiff_OrgFilter(t *testing.T) {
 		t.Errorf("diffs = %+v, want exactly the zuhause NEW row", diffs)
 	}
 }
+
+func TestBuildImportDiffForTarget_RebasesSourceIntoSharedMount(t *testing.T) {
+	stored := map[string]*store.Entry{
+		"jasp-shared/changed": {
+			Path: "jasp-shared/changed", Org: "jasp-shared",
+			Kind: store.KindPassword, Password: "old",
+		},
+		"jasp-shared/only": {
+			Path: "jasp-shared/only", Org: "jasp-shared",
+			Kind: store.KindPassword, Password: "store-only",
+		},
+	}
+	remote := remoteWith(t, "jasp",
+		mirrorItem(t, &store.Entry{
+			Path: "jasp/changed", Org: "jasp",
+			Kind: store.KindPassword, Password: "new",
+		}, "i1", "f-jasp"),
+		Item{Type: TypeLogin, Name: "phone", Login: &Login{Password: "phone-secret"}},
+	)
+
+	diffs, inSync, warnings, err := BuildImportDiffForTarget(
+		stored, remote, "jasp", "jasp-shared")
+	if err != nil {
+		t.Fatalf("BuildImportDiffForTarget: %v", err)
+	}
+	if inSync != 0 || len(warnings) != 0 {
+		t.Fatalf("inSync=%d warnings=%v, want zero and none", inSync, warnings)
+	}
+	if len(diffs) != 3 {
+		t.Fatalf("diffs = %+v, want CHANGED, NEW, STORE-ONLY", diffs)
+	}
+	want := []struct {
+		path, class string
+	}{
+		{"jasp-shared/changed", ClassChanged},
+		{"jasp-shared/phone", ClassNew},
+		{"jasp-shared/only", ClassStoreOnly},
+	}
+	for i, expected := range want {
+		if diffs[i].Path != expected.path || diffs[i].Class != expected.class {
+			t.Errorf("diff %d = %+v, want path=%q class=%q",
+				i, diffs[i], expected.path, expected.class)
+		}
+		if diffs[i].Incoming != nil {
+			if diffs[i].Incoming.Path != expected.path {
+				t.Errorf("incoming path = %q, want %q",
+					diffs[i].Incoming.Path, expected.path)
+			}
+			if diffs[i].Incoming.Org != "jasp-shared" {
+				t.Errorf("incoming org = %q, want jasp-shared", diffs[i].Incoming.Org)
+			}
+		}
+	}
+}
+
+func TestBuildImportDiffForTarget_IdentityMappingDoesNotDoublePrefix(t *testing.T) {
+	remote := remoteWith(t, "jasp",
+		Item{Type: TypeLogin, Name: "phone", Login: &Login{Password: "value"}})
+	diffs, _, warnings, err := BuildImportDiffForTarget(
+		map[string]*store.Entry{}, remote, "jasp", "jasp")
+	if err != nil {
+		t.Fatalf("BuildImportDiffForTarget: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v", warnings)
+	}
+	if len(diffs) != 1 || diffs[0].Path != "jasp/phone" {
+		t.Fatalf("diffs = %+v, want jasp/phone", diffs)
+	}
+}
+
+func TestBuildImportDiffForTarget_RejectsNonCanonicalSourcePaths(t *testing.T) {
+	paths := []string{
+		"jasp/../private",
+		"jasp/./secret",
+		"jasp//secret",
+		"jasp/secret\ninjected",
+	}
+	items := make([]Item, 0, len(paths))
+	for _, sourcePath := range paths {
+		items = append(items, Item{
+			Type: TypeLogin,
+			Name: "malformed",
+			Fields: []Field{{
+				Name: FieldPath, Value: sourcePath,
+			}},
+			Login: &Login{Password: "must-not-leak"},
+		})
+	}
+	remote := remoteWith(t, "jasp", items...)
+	diffs, _, warnings, err := BuildImportDiffForTarget(
+		map[string]*store.Entry{}, remote, "jasp", "jasp-shared")
+	if err != nil {
+		t.Fatalf("BuildImportDiffForTarget: %v", err)
+	}
+	if len(diffs) != 0 {
+		t.Fatalf("malformed paths produced diffs: %+v", diffs)
+	}
+	if len(warnings) != len(paths) {
+		t.Fatalf("warnings = %v, want %d sanitized warnings", warnings, len(paths))
+	}
+	for _, warning := range warnings {
+		if strings.Contains(warning, "must-not-leak") ||
+			strings.ContainsAny(warning, "\r\n") {
+			t.Fatalf("warning is not sanitized: %q", warning)
+		}
+	}
+}
+
+func TestRebaseImportPath_RequiresSourceOrgForTarget(t *testing.T) {
+	if _, err := RebaseImportPath("jasp/item", "", "jasp-shared"); err == nil {
+		t.Fatal("RebaseImportPath should reject a target mount without source org")
+	}
+}

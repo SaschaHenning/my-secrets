@@ -743,6 +743,44 @@ func gopassPayloadLines(out []byte) []string {
 	return lines
 }
 
+// SyncSharedMountWithRetry syncs one explicitly shared mount and retries
+// exactly once after a non-fast-forward race. The caller must hold the
+// mount lock across its preceding read/write batch and this call.
+func SyncSharedMountWithRetry(
+	ctx context.Context,
+	runner Runner,
+	cfg *Config,
+	mount string,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ValidateSharedMountName(mount); err != nil {
+		return err
+	}
+	if cfg == nil || !cfg.IsSharedMount(mount) {
+		return fmt.Errorf("mount %q is not configured as shared", mount)
+	}
+	if runner == nil {
+		runner = ExecRunner{}
+	}
+	if _, err := GopassMountPath(ctx, runner, mount); err != nil {
+		return fmt.Errorf("validate shared mount %q: %w", mount, err)
+	}
+	if _, err := GopassSync(ctx, runner, mount); err == nil {
+		return nil
+	} else if !isNonFastForward(err) {
+		return fmt.Errorf("sync shared mount %q: %w", mount, err)
+	}
+	if _, err := GopassGitPull(ctx, runner, mount); err != nil {
+		return fmt.Errorf("pull concurrent shared update for %q: %w", mount, err)
+	}
+	if _, err := GopassSync(ctx, runner, mount); err != nil {
+		return fmt.Errorf("sync shared mount %q after one retry: %w", mount, err)
+	}
+	return nil
+}
+
 func pushSharedWithRetry(ctx context.Context, runner Runner, mount, storePath string,
 	targets []string, manifest *teamkeys.File, assets []publicKeyAsset, tracked []string) error {
 	if _, err := GopassGit(ctx, runner, mount, "push", "origin", "main"); err == nil {

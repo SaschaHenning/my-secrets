@@ -178,6 +178,39 @@ type recipientReconcileRunner struct {
 	calls     []string
 }
 
+type stubResponse struct {
+	out  []byte
+	errs []error
+}
+
+type sequenceSharedRunner struct {
+	handlers map[string]stubResponse
+	offsets  map[string]int
+	calls    []string
+}
+
+func (r *sequenceSharedRunner) Run(
+	_ context.Context,
+	name string,
+	args ...string,
+) ([]byte, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.calls = append(r.calls, call)
+	response, ok := r.handlers[call]
+	if !ok {
+		return nil, fmt.Errorf("unexpected call: %s", call)
+	}
+	if r.offsets == nil {
+		r.offsets = map[string]int{}
+	}
+	offset := r.offsets[call]
+	r.offsets[call] = offset + 1
+	if offset < len(response.errs) && response.errs[offset] != nil {
+		return response.out, response.errs[offset]
+	}
+	return response.out, nil
+}
+
 func (r *recipientReconcileRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	call := name + " " + strings.Join(args, " ")
 	r.calls = append(r.calls, call)
@@ -215,6 +248,120 @@ func TestReconcileSharedRecipientsAddsBeforeRemoving(t *testing.T) {
 	}
 	if strings.Join(runner.calls, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("calls = %v, want add-before-remove %v", runner.calls, want)
+	}
+}
+
+func TestSyncSharedMountWithRetry(t *testing.T) {
+	mountPath := t.TempDir()
+	config := &Config{Version: 1, Remotes: []StoreRemote{{
+		Mount: "jasp-shared", URL: "file:///audit/shared.git", Shared: true,
+	}}}
+	tests := []struct {
+		name      string
+		handlers  map[string]stubResponse
+		wantCalls []string
+		wantErr   string
+	}{
+		{
+			name: "success",
+			handlers: map[string]stubResponse{
+				"gopass config mounts.jasp-shared.path": {out: []byte(mountPath + "\n")},
+				"gopass sync --store jasp-shared":       {},
+			},
+			wantCalls: []string{
+				"gopass config mounts.jasp-shared.path",
+				"gopass sync --store jasp-shared",
+			},
+		},
+		{
+			name: "one non-fast-forward retry",
+			handlers: map[string]stubResponse{
+				"gopass config mounts.jasp-shared.path": {out: []byte(mountPath + "\n")},
+				"gopass sync --store jasp-shared": {
+					errs: []error{errors.New("non-fast-forward"), nil},
+				},
+				"gopass git --store jasp-shared rev-parse --abbrev-ref HEAD": {
+					out: []byte("main\n"),
+				},
+				"gopass git --store jasp-shared pull origin main": {},
+			},
+			wantCalls: []string{
+				"gopass config mounts.jasp-shared.path",
+				"gopass sync --store jasp-shared",
+				"gopass git --store jasp-shared rev-parse --abbrev-ref HEAD",
+				"gopass git --store jasp-shared pull origin main",
+				"gopass sync --store jasp-shared",
+			},
+		},
+		{
+			name: "non retryable error",
+			handlers: map[string]stubResponse{
+				"gopass config mounts.jasp-shared.path": {out: []byte(mountPath + "\n")},
+				"gopass sync --store jasp-shared": {
+					errs: []error{errors.New("authentication failed")},
+				},
+			},
+			wantCalls: []string{
+				"gopass config mounts.jasp-shared.path",
+				"gopass sync --store jasp-shared",
+			},
+			wantErr: "authentication failed",
+		},
+		{
+			name: "second non-fast-forward is returned",
+			handlers: map[string]stubResponse{
+				"gopass config mounts.jasp-shared.path": {out: []byte(mountPath + "\n")},
+				"gopass sync --store jasp-shared": {
+					errs: []error{
+						errors.New("non-fast-forward"),
+						errors.New("fetch first"),
+					},
+				},
+				"gopass git --store jasp-shared rev-parse --abbrev-ref HEAD": {
+					out: []byte("main\n"),
+				},
+				"gopass git --store jasp-shared pull origin main": {},
+			},
+			wantCalls: []string{
+				"gopass config mounts.jasp-shared.path",
+				"gopass sync --store jasp-shared",
+				"gopass git --store jasp-shared rev-parse --abbrev-ref HEAD",
+				"gopass git --store jasp-shared pull origin main",
+				"gopass sync --store jasp-shared",
+			},
+			wantErr: "after one retry",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &sequenceSharedRunner{handlers: test.handlers}
+			err := SyncSharedMountWithRetry(
+				context.Background(), runner, config, "jasp-shared")
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("SyncSharedMountWithRetry: %v", err)
+			}
+			if test.wantErr != "" &&
+				(err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+			if strings.Join(runner.calls, "\n") != strings.Join(test.wantCalls, "\n") {
+				t.Fatalf("calls = %v, want %v", runner.calls, test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestSyncSharedMountWithRetryRequiresSharedMount(t *testing.T) {
+	runner := &sequenceSharedRunner{}
+	err := SyncSharedMountWithRetry(context.Background(), runner,
+		&Config{Version: 1, Remotes: []StoreRemote{{
+			Mount: "personal", URL: "file:///personal.git",
+		}}}, "personal")
+	if err == nil || !strings.Contains(err.Error(), "not configured as shared") {
+		t.Fatalf("error = %v, want fail-closed shared validation", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runner calls = %v, want none", runner.calls)
 	}
 }
 

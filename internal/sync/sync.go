@@ -65,11 +65,19 @@ type StoreRemote struct {
 
 // Config is the persisted sync state.
 type Config struct {
-	Version int           `yaml:"version"`
-	Layout  Layout        `yaml:"layout"`
-	Owner   string        `yaml:"owner,omitempty"` // GitHub login used when the repos were created
-	Remotes []StoreRemote `yaml:"remotes"`
+	Version int `yaml:"version"`
+	// Revision is an optimistic concurrency token managed by Load and
+	// Save. Legacy files omit it and therefore start at revision zero.
+	Revision uint64        `yaml:"revision,omitempty"`
+	Layout   Layout        `yaml:"layout"`
+	Owner    string        `yaml:"owner,omitempty"` // GitHub login used when the repos were created
+	Remotes  []StoreRemote `yaml:"remotes"`
 }
+
+// ErrConfigConflict means sync.yaml changed after the caller loaded it.
+// The stale write is rejected so it cannot overwrite a newer LastSync,
+// shared marker, remote, or owner/layout change.
+var ErrConfigConflict = errors.New("sync config changed concurrently")
 
 // DefaultPath returns the usual sync-state path:
 // ~/.config/my-secrets/sync.yaml.
@@ -84,12 +92,10 @@ func DefaultPath() (string, error) {
 // Load reads the state file. Returns an empty config and no error if the
 // file does not exist — a missing file simply means „sync not set up yet".
 func Load(path string) (*Config, error) {
-	if path == "" {
-		var err error
-		path, err = DefaultPath()
-		if err != nil {
-			return nil, err
-		}
+	var err error
+	path, err = resolveConfigPath(path)
+	if err != nil {
+		return nil, err
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -111,18 +117,66 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
-// Save writes the state file with 0o600 permissions. Creates the parent
-// directory with 0o700 if needed.
+// Save atomically writes the state file with 0o600 permissions. It uses
+// Config.Revision as a compare-and-swap token under the config lock, so
+// a caller that loaded stale state fails with ErrConfigConflict instead
+// of overwriting a newer writer. Creates the parent directory with
+// 0o700 if needed.
 func Save(path string, c *Config) error {
 	if c == nil {
 		return fmt.Errorf("save sync config: nil config")
 	}
-	if path == "" {
-		var err error
-		path, err = DefaultPath()
-		if err != nil {
-			return err
-		}
+	var err error
+	path, err = resolveConfigPath(path)
+	if err != nil {
+		return err
+	}
+	release, err := acquireConfigLock(context.Background(), path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(saveConfigCASLocked(path, c), release())
+}
+
+func resolveConfigPath(path string) (string, error) {
+	if path != "" {
+		return path, nil
+	}
+	return DefaultPath()
+}
+
+func saveConfigCASLocked(path string, c *Config) error {
+	current, err := Load(path)
+	if err != nil {
+		return err
+	}
+	if current.Revision != c.Revision {
+		return fmt.Errorf(
+			"%w: expected revision %d, found %d",
+			ErrConfigConflict, c.Revision, current.Revision,
+		)
+	}
+	return saveConfigNextRevisionLocked(path, c)
+}
+
+func saveConfigNextRevisionLocked(path string, c *Config) error {
+	if c.Revision == ^uint64(0) {
+		return fmt.Errorf("save sync config: revision exhausted")
+	}
+	candidate := *c
+	candidate.Remotes = append([]StoreRemote(nil), c.Remotes...)
+	candidate.Revision++
+	if err := saveConfigFile(path, &candidate); err != nil {
+		return err
+	}
+	c.Version = candidate.Version
+	c.Revision = candidate.Revision
+	return nil
+}
+
+func saveConfigFile(path string, c *Config) error {
+	if c == nil {
+		return fmt.Errorf("save sync config: nil config")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("mkdir sync config dir: %w", err)
@@ -162,6 +216,42 @@ func Save(path string, c *Config) error {
 		return fmt.Errorf("replace sync config: %w", err)
 	}
 	return nil
+}
+
+// MarkSharedSyncedAndSave reloads sync.yaml while holding its exclusive
+// writer lock, updates only LastSync for mount, and atomically saves the
+// merged configuration. The mount must still be explicitly shared in
+// the freshly loaded file.
+func MarkSharedSyncedAndSave(
+	ctx context.Context,
+	path string,
+	mount string,
+	at time.Time,
+) (*Config, error) {
+	if err := ValidateSharedMountName(mount); err != nil {
+		return nil, err
+	}
+	resolvedPath, err := resolveConfigPath(path)
+	if err != nil {
+		return nil, err
+	}
+	release, err := acquireConfigLock(ctx, resolvedPath)
+	if err != nil {
+		return nil, err
+	}
+	current, updateErr := Load(resolvedPath)
+	if updateErr == nil && !current.IsSharedMount(mount) {
+		updateErr = fmt.Errorf(
+			"mount %q is no longer configured as shared", mount)
+	}
+	if updateErr == nil {
+		current.MarkSynced(mount, at)
+		updateErr = saveConfigNextRevisionLocked(resolvedPath, current)
+	}
+	if err := errors.Join(updateErr, release()); err != nil {
+		return nil, err
+	}
+	return current, nil
 }
 
 // Validate checks invariants that security-sensitive shared-mount
@@ -355,7 +445,14 @@ func (c *Config) MergeSharedFrom(previous *Config) error {
 		}
 		c.Remotes = append(c.Remotes, remote)
 	}
-	return c.Validate()
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	// The wizard reconstructs the personal portion from scratch. Carry
+	// forward the revision from the state it was based on so Save can
+	// detect another writer that completed while the wizard was open.
+	c.Revision = previous.Revision
+	return nil
 }
 
 // ValidateSharedMountName rejects aliases that could address the default

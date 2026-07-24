@@ -47,6 +47,11 @@ type App struct {
 	Audit    *audit.Log
 	Policy   *policy.Policy
 	Override string // explicit --requester value for this invocation
+	// SuppressAutoSync disables the normal best-effort personal-store
+	// auto-sync for this App instance. Administrative batch flows use it
+	// when they hold their own mount lock and perform one explicit sync
+	// after all writes.
+	SuppressAutoSync bool
 	// Stderr is where user-visible warnings (auto-sync failure, etc.)
 	// are written. Nil falls back to os.Stderr. Tests inject a
 	// *bytes.Buffer here to assert on the output.
@@ -535,7 +540,7 @@ func (a *App) Remove(ctx context.Context, path string) error {
 // A 5-second timeout is imposed on top of the caller's context so a
 // hanging `git push` cannot block the CLI indefinitely.
 func (a *App) AutoSync(ctx context.Context, trigger string) {
-	if NoSyncFlag {
+	if a.SuppressAutoSync || NoSyncFlag {
 		return
 	}
 	ctx2, cancel := context.WithTimeout(ctx, autoSyncTimeout)

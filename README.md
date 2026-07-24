@@ -593,6 +593,40 @@ muss ein dauerhaft entferntes Mitglied auch aus `team-keys.yaml`
 verschwinden; andernfalls fügt ein späterer Provisionierungsabgleich
 seinen Key wieder hinzu.
 
+#### Shared-Mount aus Bitwarden seeden oder aktualisieren
+
+`bw-import` kann genau einen Bitwarden-Org-Namespace in einen explizit
+geteilten Mount abbilden. Quelle und Ziel dürfen verschieden heißen:
+
+```bash
+# Nur Diff: mys/jasp/* mit jasp-shared/* vergleichen
+mys bw-import --org jasp --mount jasp-shared
+
+# NEW/CHANGED nach Bestätigung übernehmen
+mys bw-import --org jasp --mount jasp-shared --apply
+
+# Non-interaktiv alle NEW/CHANGED übernehmen
+mys bw-import --org jasp --mount jasp-shared --apply --yes
+```
+
+Dabei wird `mys/jasp/stage/api` ausschließlich zu
+`jasp-shared/stage/api`; ein persönlicher Pfad `jasp/stage/api` bleibt
+unverändert. `--mount` verlangt `--org` und akzeptiert nur einen in
+`sync.yaml` eindeutig mit `shared: true` markierten, live erreichbaren
+Mount. Nach dieser Konfigurationsauswahl hält der Befehl den Mount-Lock
+von der erneuten Live-Mount-Prüfung bis zum finalen Sync, zieht zuerst
+den aktuellen Team-Stand und liest erst danach Bitwarden. `LastSync`
+wird anschließend unter einem eigenen Config-Lock aus dem frisch
+geladenen Stand zusammengeführt. Auch wenn ein späterer Eintrag
+fehlschlägt, werden bereits erfolgreiche lokale Writes noch
+synchronisiert; der Aufruf endet trotzdem mit Fehler.
+
+Policy-Prüfung, Diff, Ausgabe und Audit verwenden den **Zielpfad**. Das
+Bitwarden-Master-Passwort ist vor und nach der Abbildung gesperrt.
+Subprozessfehler erscheinen vollständig nur im aktuellen CLI-Fehler;
+das persistente Audit speichert ausschließlich Stufe und Zähler.
+`bw-import` bleibt für AI-Caller hart gesperrt, auch mit `--yes`.
+
 ### Trust Model und aktueller Ausbauzustand
 
 Shared-Mounts aus Tier A sind **advisory**, nicht erzwingbar auditiert.
@@ -603,11 +637,12 @@ lokale SQLite-Datenbank pro Maschine. Das Shared-Repo schafft in dieser
 Ausbaustufe Team-Verfügbarkeit und eine Fingerprint-zu-Identität-Map,
 aber noch keinen zentralen oder beweisbaren „wer hat was gelesen"-Nachweis.
 
-In diesem Stand sind nur Tier-A-Phase 1 (Shared-Mount-Provisionierung)
-und Phase 2 (mount-spezifische Recipient-Verwaltung) umgesetzt.
-Bitwarden-Seeding, ein signiertes Team-Read-Audit, fail-closed
-Shared-Policy und der Revocation-/Rotations-Runbook aus den Phasen 3–6
-sind noch nicht implementiert. Beim Entfernen eines Team-Keys muss man
+In diesem Stand sind Tier-A-Phase 1 (Shared-Mount-Provisionierung),
+Phase 2 (mount-spezifische Recipient-Verwaltung) und Phase 3
+(Bitwarden-Seeding in einen expliziten Shared-Mount) umgesetzt.
+Ein signiertes Team-Read-Audit, fail-closed Shared-Policy und der
+Revocation-/Rotations-Runbook aus den Phasen 4–6 sind noch nicht
+implementiert. Beim Entfernen eines Team-Keys muss man
 weiterhin davon ausgehen, dass die Person alle bisher zugänglichen
 Secrets gelesen oder alte Ciphertext-Kopien behalten haben könnte;
 betroffene Secrets müssen deshalb rotiert werden.
@@ -626,9 +661,10 @@ die Schreiboperation selbst geglückt ist.
 
 Dieser schreibgekoppelte Auto-Sync gilt nur für persönliche Remotes.
 Shared-Mounts werden dabei bewusst übersprungen; ihre Provisionierung
-pusht ihre eigenen Änderungen, und `mys sync push` / `mys sync pull`
-lassen sich für einen expliziten manuellen Abgleich aller konfigurierten
-Remotes verwenden.
+pusht ihre eigenen Änderungen, ein Shared-`bw-import` synchronisiert
+seinen Ziel-Mount einmal nach dem gesamten Batch, und `mys sync push` /
+`mys sync pull` lassen sich für einen expliziten manuellen Abgleich aller
+konfigurierten Remotes verwenden.
 
 Opt-out:
 

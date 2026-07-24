@@ -419,8 +419,9 @@ func TestMergeSharedFrom(t *testing.T) {
 				Remotes: []StoreRemote{{Mount: DefaultStoreMount, URL: "new-personal.git"}},
 			},
 			previous: &Config{
-				Version: 1,
-				Layout:  LayoutPerOrg,
+				Version:  1,
+				Revision: 7,
+				Layout:   LayoutPerOrg,
 				Remotes: []StoreRemote{
 					{Mount: "old-personal", URL: "old.git"},
 					{Mount: "jasp", URL: "shared.git", Shared: true, LastSync: now},
@@ -438,6 +439,9 @@ func TestMergeSharedFrom(t *testing.T) {
 				}
 				if _, ok := got.Remote("old-personal"); ok {
 					t.Fatal("stale personal remote was preserved")
+				}
+				if got.Revision != 7 {
+					t.Fatalf("revision = %d, want loaded revision 7", got.Revision)
 				}
 			},
 		},
@@ -497,6 +501,36 @@ func TestLoadRejectsDuplicateMounts(t *testing.T) {
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("Load error = %v, want duplicate mount error", err)
+	}
+}
+
+func TestSaveUpgradesLegacyConfigWithoutRevision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.yaml")
+	body := []byte("version: 1\nlayout: per-org\nowner: legacy\nremotes:\n" +
+		"  - mount: jasp\n    url: file:///legacy.git\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("load legacy config: %v", err)
+	}
+	if config.Revision != 0 {
+		t.Fatalf("legacy revision = %d, want 0", config.Revision)
+	}
+	config.Owner = "upgraded"
+	if err := Save(path, config); err != nil {
+		t.Fatalf("save legacy config: %v", err)
+	}
+	if config.Revision != 1 {
+		t.Fatalf("saved revision = %d, want 1", config.Revision)
+	}
+	persisted, err := Load(path)
+	if err != nil {
+		t.Fatalf("reload upgraded config: %v", err)
+	}
+	if persisted.Owner != "upgraded" || persisted.Revision != 1 {
+		t.Fatalf("upgraded config = %+v", persisted)
 	}
 }
 
@@ -615,6 +649,141 @@ func TestMarkSynced(t *testing.T) {
 	c.MarkSynced("nope", ts)
 	if len(c.Remotes) != 1 {
 		t.Errorf("unknown mount mutated remotes: %+v", c.Remotes)
+	}
+}
+
+func TestMarkSharedSyncedAndSaveMergesFreshConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.yaml")
+	initial := &Config{
+		Version: 1,
+		Layout:  LayoutSingle,
+		Owner:   "initial-owner",
+		Remotes: []StoreRemote{{
+			Mount: "jasp-shared", URL: "file:///shared.git", Shared: true,
+		}},
+	}
+	if err := Save(path, initial); err != nil {
+		t.Fatalf("save initial config: %v", err)
+	}
+	fresh, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	fresh.Owner = "concurrent-owner"
+	fresh.Layout = LayoutPerOrg
+	fresh.Remotes = append(fresh.Remotes, StoreRemote{
+		Mount: "personal", URL: "file:///personal.git",
+	})
+	if err := Save(path, fresh); err != nil {
+		t.Fatalf("save concurrent config: %v", err)
+	}
+
+	at := time.Date(2026, 7, 24, 10, 11, 12, 0, time.UTC)
+	merged, err := MarkSharedSyncedAndSave(
+		context.Background(), path, "jasp-shared", at,
+	)
+	if err != nil {
+		t.Fatalf("MarkSharedSyncedAndSave: %v", err)
+	}
+	if merged.Owner != "concurrent-owner" || merged.Layout != LayoutPerOrg {
+		t.Fatalf("fresh config fields were lost: %+v", merged)
+	}
+	if remote, ok := merged.Remote("personal"); !ok ||
+		remote.URL != "file:///personal.git" {
+		t.Fatalf("fresh remote was lost: %+v", merged.Remotes)
+	}
+	if remote, ok := merged.Remote("jasp-shared"); !ok ||
+		!remote.LastSync.Equal(at) {
+		t.Fatalf("LastSync = %+v, want %v", remote, at)
+	}
+	persisted, err := Load(path)
+	if err != nil {
+		t.Fatalf("reload merged config: %v", err)
+	}
+	if remote, ok := persisted.Remote("jasp-shared"); !ok ||
+		!remote.LastSync.Equal(at) {
+		t.Fatalf("persisted LastSync = %+v, want %v", remote, at)
+	}
+}
+
+func TestMarkSharedSyncedAndSaveFailsWhenMountChangedToPersonal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.yaml")
+	config := &Config{Version: 1, Remotes: []StoreRemote{{
+		Mount: "jasp-shared", URL: "file:///personal.git",
+	}}}
+	if err := Save(path, config); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	_, err := MarkSharedSyncedAndSave(
+		context.Background(), path, "jasp-shared", time.Now(),
+	)
+	if err == nil || !strings.Contains(err.Error(), "no longer configured as shared") {
+		t.Fatalf("error = %v, want sharing-mode refusal", err)
+	}
+	persisted, loadErr := Load(path)
+	if loadErr != nil {
+		t.Fatalf("reload config: %v", loadErr)
+	}
+	remote, ok := persisted.Remote("jasp-shared")
+	if !ok || !remote.LastSync.IsZero() {
+		t.Fatalf("personal mount was stamped: %+v", persisted.Remotes)
+	}
+}
+
+func TestSaveRejectsOverlappingStaleWriterWithoutLosingLastSync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.yaml")
+	initial := &Config{
+		Version: 1,
+		Owner:   "initial-owner",
+		Remotes: []StoreRemote{{
+			Mount: "jasp-shared", URL: "file:///shared.git", Shared: true,
+		}},
+	}
+	if err := Save(path, initial); err != nil {
+		t.Fatalf("save initial config: %v", err)
+	}
+
+	staleWriter, err := Load(path)
+	if err != nil {
+		t.Fatalf("load first writer: %v", err)
+	}
+	at := time.Date(2026, 7, 24, 18, 19, 20, 0, time.UTC)
+	if _, err := MarkSharedSyncedAndSave(
+		context.Background(), path, "jasp-shared", at,
+	); err != nil {
+		t.Fatalf("save LastSync from second writer: %v", err)
+	}
+
+	staleWriter.Owner = "stale-owner"
+	err = Save(path, staleWriter)
+	if !errors.Is(err, ErrConfigConflict) {
+		t.Fatalf("stale Save error = %v, want ErrConfigConflict", err)
+	}
+
+	persisted, err := Load(path)
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	if persisted.Owner != "initial-owner" {
+		t.Fatalf("stale writer changed owner to %q", persisted.Owner)
+	}
+	remote, ok := persisted.Remote("jasp-shared")
+	if !ok || !remote.LastSync.Equal(at) {
+		t.Fatalf("LastSync lost after stale writer: %+v", remote)
+	}
+
+	persisted.Owner = "fresh-owner"
+	if err := Save(path, persisted); err != nil {
+		t.Fatalf("save after conflict did not release config lock: %v", err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("reload fresh write: %v", err)
+	}
+	remote, ok = reloaded.Remote("jasp-shared")
+	if reloaded.Owner != "fresh-owner" || !ok || !remote.LastSync.Equal(at) {
+		t.Fatalf("fresh write after conflict = %+v", reloaded)
 	}
 }
 

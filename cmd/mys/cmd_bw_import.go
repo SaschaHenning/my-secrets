@@ -8,12 +8,14 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/bw"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
 	"github.com/SaschaHenning/my-secrets/internal/store"
+	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
 	"github.com/spf13/cobra"
 )
 
@@ -23,6 +25,7 @@ func bwImportCmd(requester *string) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "bw-import",
 		Short: "Diff the Bitwarden mys/ namespace against the store and selectively import changes",
+		Args:  cobra.NoArgs,
 		Long: `Compares the items in your Bitwarden mys/* folders (the bw-push mirror
 namespace) against the store and shows what changed on the Bitwarden side —
 e.g. a password rotated on the phone, or an item newly created in a mys/<org>
@@ -35,6 +38,10 @@ takes all of them. CHANGED rows overwrite exactly the changed fields;
 STORE-ONLY rows are informational — the reverse channel never deletes store
 entries, and Bitwarden is never written to.
 
+With --org <source> --mount <shared-target>, canonical source paths are
+rebased into an explicitly configured shared mount. The command pulls the
+mount before reading Bitwarden and performs one shared sync after the batch.
+
 Session handling matches bw-push (inherited BW_SESSION or unlock via the
 master password from the store). AI callers cannot invoke this command.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -42,10 +49,8 @@ master password from the store). AI callers cannot invoke this command.`,
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			// Nested prefixes like "jasp/stage" would make the store
-			// filter and the mys/<org> folder mapping diverge silently.
-			if strings.Contains(opts.Org, "/") {
-				return fmt.Errorf("--org must be a top-level org name (no '/'): %q", opts.Org)
+			if err := validateBwImportSyntax(opts); err != nil {
+				return err
 			}
 			// Deny AI-flagged callers outright — with a forensic audit
 			// row, same contract as bw-push: a channel that writes vault
@@ -55,10 +60,21 @@ master password from the store). AI callers cannot invoke this command.`,
 			if detected.Kind == caller.KindAI {
 				if aa, aerr := openAuditOnly(); aerr == nil {
 					aa.Override = *requester
-					aa.AuditBWImport(ctx, opts.Org, audit.ResultDenied, "bw-import refused for AI caller")
+					aa.AuditBWImport(ctx, bwImportAuditOrg(opts),
+						audit.ResultDenied, "bw-import refused for AI caller")
 					_ = aa.Close(ctx)
 				}
 				return fmt.Errorf("bw-import is refused for AI callers")
+			}
+			if opts.Mount != "" {
+				syncConfig, err := syncpkg.Load("")
+				if err != nil {
+					return err
+				}
+				opts.SyncConfig = syncConfig
+			}
+			if err := validateBwImportOptions(opts); err != nil {
+				return err
 			}
 			cfg, err := bw.LoadConfig("")
 			if err != nil {
@@ -72,6 +88,14 @@ master password from the store). AI callers cannot invoke this command.`,
 				return err
 			}
 			defer release()
+			if opts.Mount != "" {
+				releaseMount, lockErr := syncpkg.AcquireMountLock(ctx, opts.Mount)
+				if lockErr != nil {
+					return lockErr
+				}
+				defer func() { _ = releaseMount() }()
+				opts.SyncRunner = syncpkg.ExecRunner{}
+			}
 			a, err := app.Open(ctx, *requester)
 			if err != nil {
 				return err
@@ -81,6 +105,8 @@ master password from the store). AI callers cannot invoke this command.`,
 		},
 	}
 	c.Flags().StringVar(&opts.Org, "org", "", "import only this org")
+	c.Flags().StringVar(&opts.Mount, "mount", "",
+		"write one --org namespace into this explicitly shared mount")
 	c.Flags().BoolVar(&opts.Apply, "apply", false, "apply NEW/CHANGED rows to the store after per-item confirmation")
 	c.Flags().BoolVar(&opts.Yes, "yes", false, "with --apply: take every NEW/CHANGED row without prompting")
 	return c
@@ -88,15 +114,61 @@ master password from the store). AI callers cannot invoke this command.`,
 
 // bwImportOptions carries the flag and environment inputs of one import run.
 type bwImportOptions struct {
-	Org     string
-	Apply   bool
-	Yes     bool
-	Session string
-	Config  *bw.Config
+	Org        string
+	Mount      string
+	Apply      bool
+	Yes        bool
+	Session    string
+	Config     *bw.Config
+	SyncConfig *syncpkg.Config
+	SyncRunner syncpkg.Runner
 	// Interactive marks stdin as a real TTY. RunE derives it from
 	// os.Stdin; tests set it to drive the per-item prompt through an
 	// injected reader.
 	Interactive bool
+}
+
+func validateBwImportSyntax(opts bwImportOptions) error {
+	if opts.Org != strings.TrimSpace(opts.Org) ||
+		strings.ContainsAny(opts.Org, `/\`+"\x00\r\n") ||
+		opts.Org == "." || opts.Org == ".." {
+		return fmt.Errorf("--org must be a top-level org name (no '/'): %q", opts.Org)
+	}
+	if opts.Mount == "" {
+		return nil
+	}
+	if opts.Org == "" {
+		return errors.New("--mount requires --org")
+	}
+	if err := syncpkg.ValidateSharedMountName(opts.Mount); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateBwImportOptions(opts bwImportOptions) error {
+	if err := validateBwImportSyntax(opts); err != nil {
+		return err
+	}
+	if opts.Mount != "" &&
+		(opts.SyncConfig == nil || !opts.SyncConfig.IsSharedMount(opts.Mount)) {
+		return fmt.Errorf("mount %q is not configured as shared", opts.Mount)
+	}
+	return nil
+}
+
+func bwImportAuditOrg(opts bwImportOptions) string {
+	if opts.Mount != "" {
+		return opts.Mount
+	}
+	return opts.Org
+}
+
+func bwImportScopeSummary(opts bwImportOptions) string {
+	if opts.Mount == "" {
+		return ""
+	}
+	return fmt.Sprintf(" source_org=%s target_mount=%s", opts.Org, opts.Mount)
 }
 
 // runBwImport resolves the session, diffs the vault namespace against
@@ -104,10 +176,14 @@ type bwImportOptions struct {
 // app layer. Split from RunE so tests can drive it with a fake store
 // and a fake bw runner.
 func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, stdout, stderr io.Writer, opts bwImportOptions) error {
-	cfg := opts.Config
-	if cfg == nil {
-		cfg = &bw.Config{}
+	if err := validateBwImportOptions(opts); err != nil {
+		return err
 	}
+	bwConfig := opts.Config
+	if bwConfig == nil {
+		bwConfig = &bw.Config{}
+	}
+	auditOrg := bwImportAuditOrg(opts)
 	// fail audits an early abort under bw_import so failed attempts are
 	// reconstructable from the log. The reason carries only OUR stage
 	// label, never err.Error(): bw's stderr is embedded in those errors
@@ -115,8 +191,22 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 	// persistent audit DB. The full error still reaches the caller (and
 	// the CLI's own ephemeral stderr).
 	fail := func(stage string, err error) error {
-		a.AuditBWImport(ctx, opts.Org, audit.ResultError, stage+" failed")
+		a.AuditBWImport(ctx, auditOrg, audit.ResultError,
+			stage+" failed"+bwImportScopeSummary(opts))
 		return err
+	}
+	if opts.Mount != "" {
+		a.SuppressAutoSync = true
+		if _, err := syncpkg.GopassMountPath(
+			ctx, opts.SyncRunner, opts.Mount,
+		); err != nil {
+			return fail("shared mount validation", err)
+		}
+		if _, err := syncpkg.GopassGitPull(
+			ctx, opts.SyncRunner, opts.Mount,
+		); err != nil {
+			return fail("shared pull", err)
+		}
 	}
 	// Pin the server BEFORE anything touches the master password: a bw
 	// CLI pointed at the wrong server must not even trigger the audited
@@ -125,15 +215,17 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 	if err != nil {
 		return fail("bw status", err)
 	}
-	if cfg.ServerURL != "" && st.ServerURL != cfg.ServerURL {
-		reason := fmt.Sprintf("server mismatch: bw is configured for %s, expected %s", st.ServerURL, cfg.ServerURL)
-		a.AuditBWImport(ctx, opts.Org, audit.ResultError, reason)
-		return fmt.Errorf("%s — refusing to import", reason)
+	if bwConfig.ServerURL != "" && st.ServerURL != bwConfig.ServerURL {
+		a.AuditBWImport(ctx, auditOrg, audit.ResultError,
+			"server mismatch"+bwImportScopeSummary(opts))
+		return fmt.Errorf(
+			"server mismatch: bw is configured for %s, expected %s — refusing to import",
+			st.ServerURL, bwConfig.ServerURL)
 	}
 	// The master password is fetched through the audited app layer like
 	// any other secret — its read shows up in the audit log.
 	getPassword := func(ctx context.Context) (string, error) {
-		e, err := a.Get(ctx, cfg.PasswordPath())
+		e, err := a.Get(ctx, bwConfig.PasswordPath())
 		if err != nil {
 			return "", err
 		}
@@ -146,7 +238,11 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 		return fail("bw sync", err)
 	}
 
-	paths, err := a.List(ctx, opts.Org)
+	storeScope := opts.Org
+	if opts.Mount != "" {
+		storeScope = opts.Mount
+	}
+	paths, err := a.List(ctx, storeScope)
 	if err != nil {
 		return fail("store list", err)
 	}
@@ -155,7 +251,7 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 		// The vault's unlock secret never participates in the mirror —
 		// bw-push refuses to write it out, and the reverse channel must
 		// not drag it into the diff either.
-		if p == cfg.PasswordPath() {
+		if p == bwConfig.PasswordPath() {
 			continue
 		}
 		e, err := a.Get(ctx, p)
@@ -170,6 +266,7 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 	if err != nil {
 		return fail("vault read", err)
 	}
+	preWarnings := make([]string, 0)
 	// Policy-invisible paths stay invisible in the diff too: a caller
 	// whose scope policy hides an org must not learn that org's paths
 	// from the vault side either. The count-only warning deliberately
@@ -179,8 +276,32 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 	visible := remote.Items[:0]
 	hidden := 0
 	for _, it := range remote.Items {
-		p := bw.PathForItem(it, remote.FolderNames[it.FolderID])
-		if !a.Policy.Evaluate(string(det.Kind), det.AgentLabel, p).Allowed {
+		sourcePath := bw.PathForItem(it, remote.FolderNames[it.FolderID])
+		if opts.Org != "" && !strings.HasPrefix(sourcePath, opts.Org+"/") {
+			// Keep out-of-scope items for BuildImportDiffForTarget to
+			// discard without warnings or policy-visible counts.
+			visible = append(visible, it)
+			continue
+		}
+		targetPath, mapErr := bw.RebaseImportPath(
+			sourcePath, opts.Org, opts.Mount)
+		// The unlock secret is protected in both namespaces: checking
+		// before and after the rebase prevents a target mount named
+		// "private" from receiving it under its canonical path.
+		if sourcePath == bwConfig.PasswordPath() ||
+			(mapErr == nil && targetPath == bwConfig.PasswordPath()) {
+			preWarnings = append(preWarnings,
+				"the vault's master password is never imported")
+			continue
+		}
+		if mapErr != nil {
+			// BuildImportDiffForTarget emits one sanitized warning.
+			visible = append(visible, it)
+			continue
+		}
+		if !a.Policy.Evaluate(
+			string(det.Kind), det.AgentLabel, targetPath,
+		).Allowed {
 			hidden++
 			continue
 		}
@@ -190,18 +311,12 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 	if hidden > 0 {
 		fmt.Fprintf(stderr, "warning: %d vault item(s) policy-invisible for this caller — skipped\n", hidden)
 	}
-	diffs, inSync, warnings := bw.BuildImportDiff(storeEntries, remote, opts.Org)
-	// A vault item claiming the master-password path must never reach an
-	// apply: it could overwrite the very secret that unlocks the vault.
-	kept := diffs[:0]
-	for _, d := range diffs {
-		if d.Path == cfg.PasswordPath() {
-			warnings = append(warnings, d.Path+": the vault's master password is never imported")
-			continue
-		}
-		kept = append(kept, d)
+	diffs, inSync, warnings, err := bw.BuildImportDiffForTarget(
+		storeEntries, remote, opts.Org, opts.Mount)
+	if err != nil {
+		return fail("diff mapping", err)
 	}
-	diffs = kept
+	warnings = append(preWarnings, warnings...)
 	for _, w := range warnings {
 		fmt.Fprintln(stderr, "warning:", w)
 	}
@@ -222,20 +337,22 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 	// row must not read as "full diff shown" when items were skipped.
 	counts := fmt.Sprintf("server=%s new=%d changed=%d store_only=%d in_sync=%d warnings=%d",
 		st.ServerURL, news, changed, storeOnly, inSync, len(warnings))
+	counts += bwImportScopeSummary(opts)
 	if !opts.Apply {
-		a.AuditBWImport(ctx, opts.Org, audit.ResultOK, "diff-only "+counts)
+		a.AuditBWImport(ctx, auditOrg, audit.ResultOK, "diff-only "+counts)
 		if news+changed > 0 {
 			fmt.Fprintln(stdout, "diff only — re-run with --apply to import")
 		}
 		return nil
 	}
 	if news+changed == 0 {
-		a.AuditBWImport(ctx, opts.Org, audit.ResultOK, "no-op "+counts)
+		a.AuditBWImport(ctx, auditOrg, audit.ResultOK, "no-op "+counts)
 		fmt.Fprintln(stdout, "store already in sync — nothing to import")
 		return nil
 	}
 	if !opts.Yes && !opts.Interactive {
-		a.AuditBWImport(ctx, opts.Org, audit.ResultDenied, "aborted: non-interactive without --yes "+counts)
+		a.AuditBWImport(ctx, auditOrg, audit.ResultDenied,
+			"aborted: non-interactive without --yes "+counts)
 		return fmt.Errorf("non-interactive stdin: pass --yes to apply without prompting")
 	}
 
@@ -250,7 +367,7 @@ apply:
 		if !applyAll {
 			answer, perr := promptApply(reader, stdout, d)
 			if perr != nil {
-				a.AuditBWImport(ctx, opts.Org, audit.ResultError,
+				a.AuditBWImport(ctx, auditOrg, audit.ResultError,
 					fmt.Sprintf("confirmation read failed after applied=%d failed=%d %s", applied, failed, counts))
 				return perr
 			}
@@ -282,11 +399,41 @@ apply:
 	}
 	skipped := news + changed - applied - failed
 	result := fmt.Sprintf("applied=%d skipped=%d failed=%d %s", applied, skipped, failed, counts)
+	var finalErrors []error
 	if failed > 0 {
-		a.AuditBWImport(ctx, opts.Org, audit.ResultError, result)
-		return fmt.Errorf("%d of %d writes failed", failed, applied+failed)
+		finalErrors = append(finalErrors,
+			fmt.Errorf("%d of %d writes failed", failed, applied+failed))
 	}
-	a.AuditBWImport(ctx, opts.Org, audit.ResultOK, result)
+	syncStage := ""
+	if opts.Mount != "" && applied > 0 {
+		if err := syncpkg.SyncSharedMountWithRetry(
+			ctx, opts.SyncRunner, opts.SyncConfig, opts.Mount,
+		); err != nil {
+			syncStage = "shared sync failed"
+			finalErrors = append(finalErrors, err)
+		} else {
+			current, err := syncpkg.MarkSharedSyncedAndSave(
+				ctx, "", opts.Mount, time.Now().UTC(),
+			)
+			if err != nil {
+				syncStage = "shared sync state save failed"
+				finalErrors = append(finalErrors, err)
+			} else {
+				*opts.SyncConfig = *current
+			}
+		}
+	}
+	if len(finalErrors) > 0 {
+		stage := "apply failed"
+		if failed == 0 {
+			stage = syncStage
+		} else if syncStage != "" {
+			stage += " and " + syncStage
+		}
+		a.AuditBWImport(ctx, auditOrg, audit.ResultError, stage+" "+result)
+		return errors.Join(finalErrors...)
+	}
+	a.AuditBWImport(ctx, auditOrg, audit.ResultOK, result)
 	fmt.Fprintf(stdout, "imported: %d applied, %d skipped\n", applied, skipped)
 	return nil
 }

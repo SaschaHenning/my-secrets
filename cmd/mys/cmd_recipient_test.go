@@ -94,11 +94,12 @@ func newTestCmd(stdin, stdout *bytes.Buffer) *cobra.Command {
 
 func saveRecipientSyncConfig(t *testing.T, remotes ...syncpkg.StoreRemote) {
 	t.Helper()
-	cfg := &syncpkg.Config{
-		Version: 1,
-		Layout:  syncpkg.LayoutPerOrg,
-		Remotes: remotes,
+	cfg, err := syncpkg.Load("")
+	if err != nil {
+		t.Fatalf("load recipient sync config: %v", err)
 	}
+	cfg.Layout = syncpkg.LayoutPerOrg
+	cfg.Remotes = remotes
 	if err := syncpkg.Save("", cfg); err != nil {
 		t.Fatalf("save recipient sync config: %v", err)
 	}

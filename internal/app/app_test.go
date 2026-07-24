@@ -748,6 +748,40 @@ func TestApp_Add_AutoSync_NoSyncFlag(t *testing.T) {
 	}
 }
 
+func TestApp_Add_SuppressAutoSyncIsInstanceLocal(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
+	suppressed, _ := appWithFake(t, "human")
+	suppressed.SuppressAutoSync = true
+	ctx := context.Background()
+	if err := suppressed.Add(ctx, &store.Entry{
+		Path: "jasp-shared/new", Password: "value",
+	}); err != nil {
+		t.Fatalf("suppressed add: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("suppressed app triggered sync calls: %v", rec.calls)
+	}
+	addRows, err := suppressed.Audit.Tail(ctx, audit.Filter{
+		Action: audit.ActionAdd, Limit: 5,
+	})
+	if err != nil {
+		t.Fatalf("tail add audit: %v", err)
+	}
+	if len(addRows) != 1 || addRows[0].Result != audit.ResultOK {
+		t.Fatalf("suppressed add audit rows = %+v, want one ok row", addRows)
+	}
+
+	normal, _ := appWithFake(t, "human")
+	if err := normal.Add(ctx, &store.Entry{
+		Path: "jasp/personal", Password: "value",
+	}); err != nil {
+		t.Fatalf("normal add: %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("normal app sync calls = %v, want exactly one", rec.calls)
+	}
+}
+
 func TestApp_Rotate_AutoSync(t *testing.T) {
 	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
 	a, _ := appWithFake(t, "human", sampleEntries()...)

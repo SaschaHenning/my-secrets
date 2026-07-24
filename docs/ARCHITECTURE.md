@@ -183,10 +183,23 @@ remain AI-denied, and add retains the human confirmation gate. Removing
 a member from `.gpg-id` without also removing it from the manifest is
 likewise temporary: provisioning will restore the declared fingerprint.
 
-This is Tier-A phases 1–2 only. It does not add Bitwarden seeding,
-shared signed read events, team-log aggregation, fail-closed read policy,
-or revocation automation (phases 3–6). All current read auditing remains
-machine-local and bypassable by any holder of a recipient private key.
+`mys bw-import --org <source> --mount <shared-target>` is the phase-3
+data-plane bridge. It rebases only canonical `source/relative` paths to
+`shared-target/relative`; store lookup, duplicate detection, policy
+evaluation, output, and audit all use the target path. The command
+validates the shared marker before locking, then holds the mount lock
+from live-mount revalidation through pull, reads, writes, and the final
+shared sync. It pulls before any Bitwarden access and suppresses
+per-entry personal auto-sync. Successful writes are still synced when a
+later entry fails, while the command and summary audit remain failed.
+`LastSync` is merged into a freshly loaded config under a separate
+config lock. Persistent audit reasons contain stage/count metadata,
+never raw Git or Bitwarden subprocess errors.
+
+This is Tier-A phases 1–3. It does not add shared signed read events,
+team-log aggregation, fail-closed read policy, or revocation automation
+(phases 4–6). All current read auditing remains machine-local and
+bypassable by any holder of a recipient private key.
 
 ## Metadata model
 

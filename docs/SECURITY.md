@@ -352,6 +352,25 @@ ordinary write-triggered auto-sync skips shared remotes; shared
 provisioning pushes its own changes, while explicit `mys sync push` and
 `mys sync pull` handle configured remotes.
 
+Phase-3 Bitwarden seeding uses
+`mys bw-import --org <source> --mount <shared-target>`. The target must
+be a non-root mount unambiguously marked shared. That config marker is
+checked before locking; the mount lock then covers live-mount
+revalidation, pull, target-scoped store reads, writes, and the final
+sync. Pull happens before session unlock or vault reads. Only canonical
+paths exactly below the source org can be rebased, and every subsequent
+policy, duplicate, store, output, and audit decision uses the rebased
+target path. The Bitwarden unlock path is excluded on both sides of the
+mapping. AI callers remain denied before store or Bitwarden mutation;
+`--yes` cannot override classification.
+
+The batch sync is attempted whenever at least one write succeeded,
+including partial-write failures. Success is recorded only after sync
+and `LastSync` persistence. That timestamp is merged into a freshly
+loaded `sync.yaml` under a separate config lock, so concurrent setup
+changes are not overwritten. Raw subprocess errors and remote URLs are
+never copied into the persistent audit reason.
+
 ### Advisory guarantee
 
 Every recipient owns a private key that can decrypt every secret in the
@@ -361,18 +380,18 @@ current audit database is local to each machine; the optional signed
 chain above protects one local log but is not an aggregated team-read
 audit. Scope policy also gates only compliant, machine-local callers.
 
-Therefore phases 1–2 provide shared availability, distinct recipient
-keys, and a reusable fingerprint-to-identity manifest, but not a
-provable „who read what" record or instant revocation. Removing a key
-prevents future decryption only after re-encryption and does not retract
-old copies; rotate every secret the departed recipient could access.
+Therefore phases 1–3 provide shared availability, distinct recipient
+keys, a reusable fingerprint-to-identity manifest, and a guarded
+Bitwarden-to-shared seed path, but not a provable „who read what" record
+or instant revocation. Removing a key prevents future decryption only
+after re-encryption and does not retract old copies; rotate every secret
+the departed recipient could access.
 For authoritative per-user access control, use a brokered/hosted vault
 such as Bitwarden rather than treating this client-side model as
 enforceable.
 
-Tier-A phases not present here are Bitwarden-to-shared seeding (phase 3),
-the signed shared read-audit and team aggregation (phase 4), fail-closed
-shared-read policy (phase 5), and an automated
+Tier-A phases not present here are the signed shared read-audit and team
+aggregation (phase 4), fail-closed shared-read policy (phase 5), and the
 revocation/rotation runbook (phase 6).
 
 Sync-related subprocess calls (`gh`, `gopass git …`, `gopass sync`) are

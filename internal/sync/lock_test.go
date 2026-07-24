@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -35,5 +36,25 @@ func TestAcquireMountLockSerializesAndReleases(t *testing.T) {
 	}
 	if err := releaseAgain(); err != nil {
 		t.Fatalf("second release: %v", err)
+	}
+}
+
+func TestConfigLockSerializesLastSyncMerge(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.yaml")
+	release, err := acquireConfigLock(context.Background(), path)
+	if err != nil {
+		t.Fatalf("first config lock: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	_, err = MarkSharedSyncedAndSave(
+		ctx, path, "jasp-shared", time.Now(),
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("merge error = %v, want deadline exceeded", err)
+	}
+	if err := release(); err != nil {
+		t.Fatalf("release config lock: %v", err)
 	}
 }
