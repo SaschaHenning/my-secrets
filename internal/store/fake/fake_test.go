@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/SaschaHenning/my-secrets/internal/store"
@@ -167,6 +168,83 @@ func TestSearch_ErrorForced(t *testing.T) {
 	}
 }
 
+func TestSearchObserved_ReportsOnlyMetadataDecryptions(t *testing.T) {
+	s := NewWithEntries(
+		&store.Entry{Path: "jasp/path-hit", Username: "nobody"},
+		&store.Entry{Path: "jasp/metadata", Username: "path-hit"},
+		&store.Entry{Path: "private/denied", Username: "path-hit"},
+	)
+	var observed []string
+	allowed, denied, err := s.SearchObserved(
+		ctx(),
+		"path-hit",
+		func(path string) bool { return path != "private/denied" },
+		func(path string) { observed = append(observed, path) },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(allowed, []string{"jasp/metadata", "jasp/path-hit"}) {
+		t.Fatalf("allowed = %v", allowed)
+	}
+	if !reflect.DeepEqual(denied, []string{"private/denied"}) {
+		t.Fatalf("denied = %v", denied)
+	}
+	sort.Strings(observed)
+	if !reflect.DeepEqual(observed, []string{"jasp/metadata"}) {
+		t.Fatalf("observed = %v, want only metadata decrypt", observed)
+	}
+}
+
+func TestSearchObserved_PerPathDecryptErrorReturnsNoPartialResults(t *testing.T) {
+	s := NewWithEntries(
+		&store.Entry{Path: "jasp/a", Username: "first"},
+		&store.Entry{Path: "jasp/b", Username: "second"},
+	)
+	s.GetErrors = map[string]error{
+		"jasp/b": errors.New("gpg decrypt failed"),
+	}
+	var observed []string
+
+	allowed, denied, err := s.SearchObserved(
+		ctx(),
+		"metadata-only-query",
+		nil,
+		func(path string) { observed = append(observed, path) },
+	)
+
+	if err == nil || err.Error() != "gpg decrypt failed" {
+		t.Fatalf("error = %v, want targeted decrypt error", err)
+	}
+	if allowed != nil || denied != nil {
+		t.Fatalf("partial results leaked: allowed=%v denied=%v", allowed, denied)
+	}
+	if !reflect.DeepEqual(observed, []string{"jasp/a"}) {
+		t.Fatalf("observed = %v, want only successful decrypt before failure", observed)
+	}
+}
+
+func TestGet_PerPathDecryptErrorAffectsOnlyTarget(t *testing.T) {
+	s := NewWithEntries(
+		&store.Entry{Path: "jasp/a", Password: "first"},
+		&store.Entry{Path: "jasp/b", Password: "second"},
+	)
+	s.GetErrors = map[string]error{
+		"jasp/a": errors.New("locked"),
+	}
+
+	if _, err := s.Get(ctx(), "jasp/a"); err == nil || err.Error() != "locked" {
+		t.Fatalf("target error = %v", err)
+	}
+	entry, err := s.Get(ctx(), "jasp/b")
+	if err != nil {
+		t.Fatalf("unaffected get: %v", err)
+	}
+	if entry.Password != "second" {
+		t.Fatalf("unaffected password = %q", entry.Password)
+	}
+}
+
 func TestGetReturnsClone(t *testing.T) {
 	s := NewWithEntries(sample()...)
 	e, err := s.Get(ctx(), "jasp/github")
@@ -193,6 +271,35 @@ func TestGet_Missing(t *testing.T) {
 	_, err := s.Get(ctx(), "nope")
 	if err == nil {
 		t.Error("want error for missing entry")
+	}
+}
+
+func TestGetCallCount_CountsEveryGetAttempt(t *testing.T) {
+	s := NewWithEntries(&store.Entry{Path: "jasp/present", Password: "p"})
+	if got := s.GetCallCount(); got != 0 {
+		t.Fatalf("initial GetCallCount() = %d, want 0", got)
+	}
+
+	if _, err := s.Get(ctx(), "jasp/present"); err != nil {
+		t.Fatalf("get present entry: %v", err)
+	}
+	if got := s.GetCallCount(); got != 1 {
+		t.Fatalf("GetCallCount() after successful Get = %d, want 1", got)
+	}
+
+	if _, err := s.Get(ctx(), "jasp/missing"); err == nil {
+		t.Fatal("get missing entry: want error")
+	}
+	if got := s.GetCallCount(); got != 2 {
+		t.Fatalf("GetCallCount() after missing Get = %d, want 2", got)
+	}
+
+	s.GetErr = errors.New("decrypt failed")
+	if _, err := s.Get(ctx(), "jasp/present"); err == nil {
+		t.Fatal("get forced-error entry: want error")
+	}
+	if got := s.GetCallCount(); got != 3 {
+		t.Fatalf("GetCallCount() after forced-error Get = %d, want 3", got)
 	}
 }
 

@@ -1244,6 +1244,36 @@ func TestHandleReveal_JSONMode_Denied(t *testing.T) {
 	}
 }
 
+func TestHandleReveal_JSONMode_AuditUnavailableDoesNotLeakPlaintext(t *testing.T) {
+	secretSentinel := "sentinel-" + "secret-must-not-leak"
+	entryPath := "jasp/" + "production"
+	entryURL := "https://credentials.invalid/" + secretSentinel
+	a, fakeStore := newFakeApp(t, "human", &store.Entry{
+		Path: entryPath, URL: entryURL, Password: secretSentinel,
+	})
+	// The app-level matrix establishes the preflight source of this error.
+	// This HTTP test makes the response boundary fail closed as well.
+	fakeStore.GetErr = app.ErrTeamAuditUnavailable
+
+	r := httptest.NewRequest("POST", "/entries/jasp/production", nil)
+	r.SetPathValue("path", entryPath)
+	r.Header.Set("Accept", "application/json")
+	w := httptest.NewRecorder()
+	handleEntryDetail(a)(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%q", w.Code, w.Body.String())
+	}
+	if w.Body.String() != app.ErrTeamAuditUnavailable.Error()+"\n" {
+		t.Fatalf("body = %q, want generic audit failure", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), secretSentinel) ||
+		strings.Contains(w.Body.String(), entryURL) ||
+		strings.Contains(w.Body.String(), entryPath) {
+		t.Fatalf("reveal response leaked plaintext, URL, or path: %q", w.Body.String())
+	}
+}
+
 func TestHandleReveal_DeniedDoesNotRenderValue(t *testing.T) {
 	a, _ := newFakeApp(t, "claude-code", sampleWebEntries()...)
 

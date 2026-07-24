@@ -3,17 +3,61 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
 	"github.com/SaschaHenning/my-secrets/internal/doctor"
+	"github.com/SaschaHenning/my-secrets/internal/store"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
+
+type doctorRotationApp interface {
+	DoctorRotationEntries(context.Context) ([]*store.Entry, error)
+	Close(context.Context) error
+}
+
+type appRotationProvider struct {
+	requester string
+	open      func(context.Context, string) (doctorRotationApp, error)
+}
+
+const doctorCleanupTimeout = 5 * time.Second
+
+func (provider appRotationProvider) Entries(
+	ctx context.Context,
+) ([]*store.Entry, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	open := provider.open
+	if open == nil {
+		open = func(openCtx context.Context, requester string) (doctorRotationApp, error) {
+			return app.Open(openCtx, requester)
+		}
+	}
+	application, err := open(ctx, provider.requester)
+	if err != nil {
+		return nil, fmt.Errorf("open app: %w", err)
+	}
+	entries, readErr := application.DoctorRotationEntries(ctx)
+	closeCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		doctorCleanupTimeout,
+	)
+	closeErr := application.Close(closeCtx)
+	cancel()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
 
 // ANSI colour codes for status prefixes. Plain-text fallback is used when
 // stdout is not a TTY.
@@ -42,6 +86,9 @@ non-zero if any check fails.`,
 			if ctx == nil {
 				ctx = context.Background()
 			}
+			ctx = doctor.WithRotationProvider(ctx, appRotationProvider{
+				requester: *requester,
+			})
 			report := doctor.Run(ctx, only)
 			out := cmd.OutOrStdout()
 			if jsonOut {

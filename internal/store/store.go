@@ -6,12 +6,17 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/SaschaHenning/my-secrets/internal/lockanchor"
 	"github.com/gopasspw/gopass/pkg/gopass"
 	"github.com/gopasspw/gopass/pkg/gopass/api"
 	"github.com/gopasspw/gopass/pkg/gopass/secrets"
@@ -25,11 +30,218 @@ type Interface interface {
 	Close(ctx context.Context) error
 	List(ctx context.Context, org string) ([]string, error)
 	Search(ctx context.Context, query string, allow func(path string) bool) (allowed, denied []string, err error)
+	SearchObserved(
+		ctx context.Context,
+		query string,
+		allow func(path string) bool,
+		observer SearchObserver,
+	) (allowed, denied []string, err error)
 	Get(ctx context.Context, path string) (*Entry, error)
 	Set(ctx context.Context, e *Entry) error
 	Remove(ctx context.Context, path string) error
 	Rotate(ctx context.Context, path, newPassword string) error
 	Orgs(ctx context.Context) ([]string, error)
+}
+
+// SearchObserver is called after SearchObserved successfully decrypts an
+// entry to inspect its metadata. Pure path matches do not require decryption
+// and therefore do not trigger the observer.
+type SearchObserver func(path string)
+
+// MountPathResolver resolves a configured gopass mount to its live directory.
+type MountPathResolver func(context.Context, string) (string, error)
+
+type mountBinding struct {
+	path string
+	info os.FileInfo
+}
+
+// MountSnapshot is an immutable view of the real paths and filesystem
+// identities of a set of gopass mounts.
+type MountSnapshot struct {
+	bindings map[string]mountBinding
+}
+
+// BoundSession couples a store with the exact mount snapshot captured by its
+// opener. Callers must use ResolveMountPath instead of consulting live config.
+type BoundSession struct {
+	store    Interface
+	snapshot MountSnapshot
+}
+
+type anchoredStore struct {
+	Interface
+	release   func() error
+	closeOnce sync.Once
+	closeErr  error
+}
+
+var _ Interface = (*anchoredStore)(nil)
+
+var gopassOpenGate = func() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}()
+
+const boundStoreCleanupTimeout = 5 * time.Second
+
+// CaptureMountSnapshot resolves and stats every mount. The real path and the
+// directory identity are both retained so a same-path directory replacement
+// is distinguishable from a stable mount.
+func CaptureMountSnapshot(
+	ctx context.Context,
+	mounts []string,
+	resolve MountPathResolver,
+) (MountSnapshot, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if resolve == nil {
+		return MountSnapshot{}, errors.New("mount path resolver is required")
+	}
+	snapshot := MountSnapshot{
+		bindings: make(map[string]mountBinding, len(mounts)),
+	}
+	for _, mount := range mounts {
+		if err := ctx.Err(); err != nil {
+			return MountSnapshot{}, err
+		}
+		if mount == "" || strings.TrimSpace(mount) != mount {
+			return MountSnapshot{}, fmt.Errorf("invalid mount name %q", mount)
+		}
+		if _, duplicate := snapshot.bindings[mount]; duplicate {
+			return MountSnapshot{}, fmt.Errorf("duplicate mount %q", mount)
+		}
+		resolved, err := resolve(ctx, mount)
+		if err != nil {
+			return MountSnapshot{}, fmt.Errorf(
+				"resolve gopass mount %q: %w",
+				mount,
+				err,
+			)
+		}
+		if strings.TrimSpace(resolved) == "" {
+			return MountSnapshot{}, fmt.Errorf(
+				"resolve gopass mount %q: empty path",
+				mount,
+			)
+		}
+		absolute, err := filepath.Abs(resolved)
+		if err != nil {
+			return MountSnapshot{}, fmt.Errorf(
+				"make gopass mount %q absolute: %w",
+				mount,
+				err,
+			)
+		}
+		realPath, err := filepath.EvalSymlinks(absolute)
+		if err != nil {
+			return MountSnapshot{}, fmt.Errorf(
+				"resolve real gopass mount %q path: %w",
+				mount,
+				err,
+			)
+		}
+		info, err := os.Stat(realPath)
+		if err != nil {
+			return MountSnapshot{}, fmt.Errorf(
+				"stat real gopass mount %q path: %w",
+				mount,
+				err,
+			)
+		}
+		if !info.IsDir() {
+			return MountSnapshot{}, fmt.Errorf(
+				"gopass mount %q path is not a directory",
+				mount,
+			)
+		}
+		snapshot.bindings[mount] = mountBinding{
+			path: realPath,
+			info: info,
+		}
+	}
+	return snapshot, nil
+}
+
+// ResolveMountPath resolves exclusively from the frozen snapshot.
+func (snapshot MountSnapshot) ResolveMountPath(
+	ctx context.Context,
+	mount string,
+) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	binding, ok := snapshot.bindings[mount]
+	if !ok {
+		return "", fmt.Errorf("gopass mount %q is not in the store session", mount)
+	}
+	current, err := os.Stat(binding.path)
+	if err != nil {
+		return "", fmt.Errorf("stat bound gopass mount %q: %w", mount, err)
+	}
+	if binding.info == nil || !os.SameFile(binding.info, current) {
+		return "", fmt.Errorf("bound gopass mount %q identity changed", mount)
+	}
+	return binding.path, nil
+}
+
+func (snapshot MountSnapshot) verify(ctx context.Context) error {
+	mounts := make([]string, 0, len(snapshot.bindings))
+	for mount := range snapshot.bindings {
+		mounts = append(mounts, mount)
+	}
+	sort.Strings(mounts)
+	for _, mount := range mounts {
+		if _, err := snapshot.ResolveMountPath(ctx, mount); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ResolveMountPath resolves a mount from the immutable store-session snapshot.
+func (session *BoundSession) ResolveMountPath(
+	ctx context.Context,
+	mount string,
+) (string, error) {
+	if session == nil {
+		return "", errors.New("bound store session is required")
+	}
+	return session.snapshot.ResolveMountPath(ctx, mount)
+}
+
+// SecretStore returns the store opened as part of this bound session.
+func (session *BoundSession) SecretStore() Interface {
+	if session == nil {
+		return nil
+	}
+	return session.store
+}
+
+func (store *anchoredStore) Close(ctx context.Context) error {
+	if store == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	store.closeOnce.Do(func() {
+		var closeErr error
+		if store.Interface != nil {
+			closeErr = store.Interface.Close(ctx)
+		}
+		var releaseErr error
+		if store.release != nil {
+			releaseErr = store.release()
+		}
+		store.closeErr = errors.Join(closeErr, releaseErr)
+	})
+	return store.closeErr
 }
 
 type Store struct {
@@ -102,15 +314,159 @@ type Entry struct {
 // chance of collision when older entries are read back.
 const fieldKeyPrefix = "field."
 
-// Open opens the existing gopass store. Callers must have previously run
-// `gopass setup` (the store initialisation flow). Returns ErrNotInitialized
-// otherwise.
-func Open(ctx context.Context) (*Store, error) {
+func open(ctx context.Context) (*Store, error) {
 	gp, err := api.New(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open gopass: %w", err)
 	}
 	return &Store{gp: gp}, nil
+}
+
+// Open opens the existing gopass store. Callers must have previously run
+// `gopass setup` (the store initialisation flow). Returns ErrNotInitialized
+// otherwise.
+func Open(ctx context.Context) (*Store, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := acquireGopassOpen(ctx); err != nil {
+		return nil, err
+	}
+	defer releaseGopassOpen()
+	return open(ctx)
+}
+
+// OpenBound opens a store and captures its mount resolver as one access
+// session. The global lock anchor excludes compliant mys mutations until the
+// returned SecretStore is closed, while the process gate serializes api.New.
+//
+// The gopass public API does not expose the mount map loaded by api.New, so
+// callers must treat this opener as the integration authority instead of
+// stitching a store together with later live-config observations. Deliberate
+// mutation by an external raw-gopass process remains outside this package's
+// advisory boundary.
+func OpenBound(
+	ctx context.Context,
+	mounts []string,
+	resolve MountPathResolver,
+) (*BoundSession, error) {
+	return openBoundAnchored(
+		ctx,
+		mounts,
+		resolve,
+		lockanchor.Acquire,
+		func(ctx context.Context) (Interface, error) {
+			return open(ctx)
+		},
+	)
+}
+
+type acquireAnchorFunc func(context.Context) (func() error, error)
+
+func openBoundAnchored(
+	ctx context.Context,
+	mounts []string,
+	resolve MountPathResolver,
+	acquireAnchor acquireAnchorFunc,
+	openStore func(context.Context) (Interface, error),
+) (*BoundSession, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if acquireAnchor == nil {
+		return nil, errors.New("stable lock anchor acquirer is required")
+	}
+	release, err := acquireAnchor(ctx)
+	if err != nil {
+		if release != nil {
+			err = errors.Join(err, release())
+		}
+		return nil, err
+	}
+	if release == nil {
+		return nil, errors.New("stable lock anchor acquirer returned nil release")
+	}
+
+	session, err := openBound(ctx, mounts, resolve, openStore)
+	if err != nil {
+		return nil, errors.Join(err, release())
+	}
+	if session == nil || session.store == nil {
+		return nil, errors.Join(
+			errors.New("store opener returned incomplete bound session"),
+			release(),
+		)
+	}
+	session.store = &anchoredStore{
+		Interface: session.store,
+		release:   release,
+	}
+	return session, nil
+}
+
+func openBound(
+	ctx context.Context,
+	mounts []string,
+	resolve MountPathResolver,
+	openStore func(context.Context) (Interface, error),
+) (*BoundSession, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if openStore == nil {
+		return nil, errors.New("store opener is required")
+	}
+	if err := acquireGopassOpen(ctx); err != nil {
+		return nil, err
+	}
+	defer releaseGopassOpen()
+
+	snapshot, err := CaptureMountSnapshot(ctx, mounts, resolve)
+	if err != nil {
+		return nil, err
+	}
+	opened, openErr := openStore(ctx)
+	if openErr != nil {
+		if opened == nil {
+			return nil, openErr
+		}
+		return nil, errors.Join(openErr, closeBoundStore(ctx, opened))
+	}
+	if opened == nil {
+		return nil, errors.New("store opener returned nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Join(err, closeBoundStore(ctx, opened))
+	}
+	if err := snapshot.verify(ctx); err != nil {
+		return nil, errors.Join(err, closeBoundStore(ctx, opened))
+	}
+	return &BoundSession{
+		store:    opened,
+		snapshot: snapshot,
+	}, nil
+}
+
+func acquireGopassOpen(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gopassOpenGate:
+		return nil
+	}
+}
+
+func releaseGopassOpen() {
+	gopassOpenGate <- struct{}{}
+}
+
+func closeBoundStore(ctx context.Context, opened Interface) error {
+	closeCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(ctx),
+		boundStoreCleanupTimeout,
+	)
+	defer cancel()
+	return opened.Close(closeCtx)
 }
 
 // ErrNotInitialized is re-exported from the gopass API for callers that need
@@ -159,6 +515,18 @@ func (s *Store) List(ctx context.Context, org string) ([]string, error) {
 // When allow is nil no policy filter is applied and every candidate path
 // is inspected as before; denied will then be empty.
 func (s *Store) Search(ctx context.Context, query string, allow func(path string) bool) (allowed []string, denied []string, err error) {
+	return s.SearchObserved(ctx, query, allow, nil)
+}
+
+// SearchObserved behaves like Search and reports only paths whose metadata
+// was actually decrypted. The callback runs synchronously after gp.Get
+// succeeds, regardless of whether the decrypted metadata matches the query.
+func (s *Store) SearchObserved(
+	ctx context.Context,
+	query string,
+	allow func(path string) bool,
+	observer SearchObserver,
+) (allowed []string, denied []string, err error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil, nil
 	}
@@ -187,7 +555,10 @@ func (s *Store) Search(ctx context.Context, query string, allow func(path string
 		// paths that policy has cleared.
 		sec, gerr := s.gp.Get(ctx, p, "latest")
 		if gerr != nil {
-			continue
+			return nil, nil, fmt.Errorf("decrypt %q for search: %w", p, gerr)
+		}
+		if observer != nil {
+			observer(p)
 		}
 		if secretMatches(sec, q) {
 			allowed = append(allowed, p)
