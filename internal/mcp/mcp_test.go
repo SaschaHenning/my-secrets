@@ -323,6 +323,54 @@ func TestToolsCall_CredsGet_Denied(t *testing.T) {
 	}
 }
 
+func TestToolsCall_CredsGet_PropagatesAppErrorWithoutCredentialContent(
+	t *testing.T,
+) {
+	secretSentinel := "sentinel-" + "secret-must-not-leak"
+	entryPath := "jasp/" + "production"
+	entryURL := "https://credentials.invalid/" + secretSentinel
+	a, fakeStore := newFakeApp(t, &store.Entry{
+		Path: entryPath, URL: entryURL, Password: secretSentinel,
+	})
+	// This transport-only test injects the exact App error at Store.Get.
+	// The App runtime contract separately proves that a real team-audit
+	// preflight failure returns it before Store.Get.
+	fakeStore.GetErr = app.ErrTeamAuditUnavailable
+
+	lines := sendAndReceive(t, a, []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"creds_get","arguments":{"path":"jasp/production"}}}`,
+	})
+	if len(lines) != 1 {
+		t.Fatalf("responses = %d, want 1", len(lines))
+	}
+	var response struct {
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if response.Error == nil || response.Error.Code != -32000 {
+		t.Fatalf("response error = %+v, want internal tool error", response.Error)
+	}
+	if response.Error.Message != app.ErrTeamAuditUnavailable.Error() {
+		t.Fatalf("message = %q, want generic audit failure", response.Error.Message)
+	}
+	if strings.Contains(lines[0], secretSentinel) ||
+		strings.Contains(lines[0], entryURL) ||
+		strings.Contains(lines[0], entryPath) {
+		t.Fatalf("MCP response leaked plaintext, URL, or path: %s", lines[0])
+	}
+	if fakeStore.GetCallCount() != 1 {
+		t.Fatalf(
+			"transport injection Store.Get calls = %d, want 1",
+			fakeStore.GetCallCount(),
+		)
+	}
+}
+
 func TestToolsCall_CredsGet_MissingPath(t *testing.T) {
 	a, _ := newFakeApp(t)
 	lines := sendAndReceive(t, a, []string{

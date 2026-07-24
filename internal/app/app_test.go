@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,6 +166,59 @@ func (f *fakeSearcher) Search(_ context.Context, query string, allow func(path s
 	return allowed, denied, nil
 }
 
+func assertSearchAuditRedaction(
+	t *testing.T,
+	rows []audit.Entry,
+	query string,
+	marker string,
+	result string,
+	stage string,
+) {
+	t.Helper()
+	trimmed := strings.TrimSpace(query)
+	metadata := fmt.Sprintf(
+		"query=redacted query_len=%d query_runes=%d",
+		len(trimmed),
+		len([]rune(trimmed)),
+	)
+	var aggregate *audit.Entry
+	for i := range rows {
+		row := &rows[i]
+		if strings.Contains(row.Reason, query) ||
+			strings.Contains(row.Reason, marker) {
+			t.Fatalf("raw search query persisted in audit row: %q", row.Reason)
+		}
+		if row.SecretPath == "" && row.Result == result {
+			aggregate = row
+		}
+	}
+	if aggregate == nil {
+		t.Fatalf("aggregate %s search audit row missing: %+v", result, rows)
+	}
+	if !strings.Contains(aggregate.Reason, metadata) {
+		t.Fatalf(
+			"safe search metadata missing from %q; want %q",
+			aggregate.Reason,
+			metadata,
+		)
+	}
+	if stage != "" &&
+		!strings.Contains(aggregate.Reason, "stage="+stage) {
+		t.Fatalf(
+			"failure stage missing from search audit reason %q",
+			aggregate.Reason,
+		)
+	}
+}
+
+func TestSearchAuditMetadataCountsTrimmedBytesAndRunes(t *testing.T) {
+	const query = "  päss🔐  "
+	const want = "query=redacted query_len=9 query_runes=5"
+	if got := searchAuditMetadata(query); got != want {
+		t.Fatalf("searchAuditMetadata() = %q, want %q", got, want)
+	}
+}
+
 func TestSearchPrefiltersDeniedPathsBeforeDecrypting(t *testing.T) {
 	a := appWithAuditOnly(t) // Override=claude-code, so kind=ai
 	ctx := context.Background()
@@ -231,7 +286,7 @@ func TestSearchPrefiltersDeniedPathsBeforeDecrypting(t *testing.T) {
 	var summarySeen bool
 	for _, r := range summaryRows {
 		if r.SecretPath == "" && r.Result == audit.ResultOK &&
-			strings.Contains(r.Reason, "query=\"secret\"") &&
+			strings.Contains(r.Reason, "query_len=6") &&
 			strings.Contains(r.Reason, "2 of 3 visible") {
 			summarySeen = true
 			break
@@ -402,17 +457,94 @@ func TestSearch_Filters(t *testing.T) {
 	}
 }
 
+func TestSearch_AuditRedactsQueryOnSuccess(t *testing.T) {
+	const marker = "QUERY-CREDENTIAL-7F0EA3"
+	query := "https://user:" + marker + "@example.invalid/?token=" + marker
+	a, _ := appWithFake(
+		t,
+		"human",
+		&store.Entry{Path: "jasp/match", Notes: query},
+	)
+
+	paths, err := a.Search(context.Background(), query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(paths, []string{"jasp/match"}) {
+		t.Fatalf("paths = %v, want jasp/match", paths)
+	}
+	rows, err := a.Audit.Tail(
+		context.Background(),
+		audit.Filter{Action: audit.ActionSearch, Limit: 10},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSearchAuditRedaction(
+		t,
+		rows,
+		query,
+		marker,
+		audit.ResultOK,
+		"",
+	)
+}
+
 func TestSearch_StoreError(t *testing.T) {
+	const marker = "QUERY-CREDENTIAL-522E90"
+	query := "https://user:" + marker + "@example.invalid/?token=" + marker
 	a, f := appWithFake(t, "claude-code", sampleEntries()...)
-	f.SearchErr = errors.New("broken")
-	_, err := a.Search(context.Background(), "anything")
+	f.SearchErr = fmt.Errorf("search failed for %s", query)
+	_, err := a.Search(context.Background(), query)
 	if err == nil {
 		t.Fatal("want error")
 	}
-	rows, _ := a.Audit.Tail(context.Background(), audit.Filter{Action: audit.ActionSearch, Limit: 5})
-	if len(rows) != 1 || rows[0].Result != audit.ResultError {
-		t.Fatalf("want error audit row, got %+v", rows)
+	rows, auditErr := a.Audit.Tail(
+		context.Background(),
+		audit.Filter{Action: audit.ActionSearch, Limit: 5},
+	)
+	if auditErr != nil {
+		t.Fatal(auditErr)
 	}
+	assertSearchAuditRedaction(
+		t,
+		rows,
+		query,
+		marker,
+		audit.ResultError,
+		"execute",
+	)
+}
+
+func TestSearchObserved_StoreErrorAuditRedactsQuery(t *testing.T) {
+	const marker = "QUERY-CREDENTIAL-B8F1C4"
+	query := "https://user:" + marker + "@example.invalid/?token=" + marker
+	a, f, _, _ := gatedApp(
+		t,
+		aiActor(),
+		&store.Entry{Path: "jasp/one", Username: "user"},
+	)
+	f.SearchErr = fmt.Errorf("search failed for %s", query)
+
+	_, err := a.Search(context.Background(), query)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	rows, auditErr := a.Audit.Tail(
+		context.Background(),
+		audit.Filter{Action: audit.ActionSearch, Limit: 5},
+	)
+	if auditErr != nil {
+		t.Fatal(auditErr)
+	}
+	assertSearchAuditRedaction(
+		t,
+		rows,
+		query,
+		marker,
+		audit.ResultError,
+		"execute",
+	)
 }
 
 func TestAdd_OK(t *testing.T) {
@@ -540,6 +672,314 @@ func TestClose_ClosesStoreAndAudit(t *testing.T) {
 	a, _ := appWithFake(t, "human", sampleEntries()...)
 	if err := a.Close(context.Background()); err != nil {
 		t.Errorf("close: %v", err)
+	}
+}
+
+type closeRecordingStore struct {
+	*fake.Store
+	mu          sync.Mutex
+	closeCalls  int
+	closeCtxErr error
+	hasDeadline bool
+	closeErr    error
+}
+
+func (s *closeRecordingStore) Close(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeCalls++
+	s.closeCtxErr = ctx.Err()
+	_, s.hasDeadline = ctx.Deadline()
+	return s.closeErr
+}
+
+func (s *closeRecordingStore) closeState() (int, error, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeCalls, s.closeCtxErr, s.hasDeadline
+}
+
+func TestClose_DetachesCancelledContextAndClosesExactlyOnce(t *testing.T) {
+	closeErr := errors.New("queue flush failed")
+	probe := &closeRecordingStore{
+		Store:    fake.New(),
+		closeErr: closeErr,
+	}
+	a := &App{Store: probe}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := a.Close(ctx); !errors.Is(err, closeErr) {
+		t.Fatalf("first close error = %v", err)
+	}
+	if err := a.Close(context.Background()); !errors.Is(err, closeErr) {
+		t.Fatalf("second close error = %v", err)
+	}
+	calls, closeCtxErr, hasDeadline := probe.closeState()
+	if calls != 1 {
+		t.Fatalf("close calls = %d, want 1", calls)
+	}
+	if closeCtxErr != nil {
+		t.Fatalf("close context inherited cancellation: %v", closeCtxErr)
+	}
+	if !hasDeadline {
+		t.Fatal("close context has no bounded deadline")
+	}
+}
+
+func TestClose_AcceptsNilContext(t *testing.T) {
+	probe := &closeRecordingStore{Store: fake.New()}
+	a := &App{Store: probe}
+
+	if err := a.Close(nil); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	calls, closeCtxErr, hasDeadline := probe.closeState()
+	if calls != 1 || closeCtxErr != nil || !hasDeadline {
+		t.Fatalf(
+			"close = calls:%d err:%v deadline:%t",
+			calls,
+			closeCtxErr,
+			hasDeadline,
+		)
+	}
+}
+
+func TestOpenAppJoinsPolicyAndCleanupErrorsWithBoundedContext(t *testing.T) {
+	policyErr := errors.New("policy init failed")
+	storeCloseErr := errors.New("store close failed")
+	auditCloseErr := errors.New("audit close failed")
+	probe := &closeRecordingStore{
+		Store:    fake.New(),
+		closeErr: storeCloseErr,
+	}
+	auditLog := &audit.Log{}
+	auditCloseCalls := 0
+	var auditCloseCtxErr error
+	auditCloseHasDeadline := false
+	dependencies := appOpenDependencies{
+		openStore: func(context.Context) (store.Interface, error) {
+			return probe, nil
+		},
+		openAudit: func() (*audit.Log, error) {
+			return auditLog, nil
+		},
+		loadPolicy: func() (*policy.Policy, error) {
+			return nil, policyErr
+		},
+		closeAudit: func(ctx context.Context, got *audit.Log) error {
+			auditCloseCalls++
+			auditCloseCtxErr = ctx.Err()
+			_, auditCloseHasDeadline = ctx.Deadline()
+			if got != auditLog {
+				t.Fatalf("closed audit log = %p, want %p", got, auditLog)
+			}
+			return auditCloseErr
+		},
+	}
+
+	application, err := openApp(nil, "test", dependencies)
+
+	if application != nil {
+		t.Fatalf("application returned after init failure: %+v", application)
+	}
+	for _, want := range []error{policyErr, storeCloseErr, auditCloseErr} {
+		if !errors.Is(err, want) {
+			t.Fatalf("error = %v, want joined %v", err, want)
+		}
+	}
+	storeCloseCalls, storeCloseCtxErr, storeCloseDeadline := probe.closeState()
+	if storeCloseCalls != 1 ||
+		storeCloseCtxErr != nil ||
+		!storeCloseDeadline {
+		t.Fatalf(
+			"store close = calls:%d err:%v deadline:%t",
+			storeCloseCalls,
+			storeCloseCtxErr,
+			storeCloseDeadline,
+		)
+	}
+	if auditCloseCalls != 1 ||
+		auditCloseCtxErr != nil ||
+		!auditCloseHasDeadline {
+		t.Fatalf(
+			"audit close = calls:%d err:%v deadline:%t",
+			auditCloseCalls,
+			auditCloseCtxErr,
+			auditCloseHasDeadline,
+		)
+	}
+}
+
+func TestOpenAppClosesPartialResourcesFromOpenErrors(t *testing.T) {
+	storeOpenErr := errors.New("store open failed")
+	storeCloseErr := errors.New("store close failed")
+	probe := &closeRecordingStore{
+		Store:    fake.New(),
+		closeErr: storeCloseErr,
+	}
+	application, err := openApp(
+		context.Background(),
+		"test",
+		appOpenDependencies{
+			openStore: func(context.Context) (store.Interface, error) {
+				return probe, storeOpenErr
+			},
+		},
+	)
+	if application != nil {
+		t.Fatalf("application returned after store open failure: %+v", application)
+	}
+	if !errors.Is(err, storeOpenErr) || !errors.Is(err, storeCloseErr) {
+		t.Fatalf("error = %v, want open and close errors", err)
+	}
+	calls, closeCtxErr, hasDeadline := probe.closeState()
+	if calls != 1 || closeCtxErr != nil || !hasDeadline {
+		t.Fatalf(
+			"partial store close = calls:%d err:%v deadline:%t",
+			calls,
+			closeCtxErr,
+			hasDeadline,
+		)
+	}
+}
+
+func TestOpenAppJoinsAuditOpenAndBothCleanupErrors(t *testing.T) {
+	auditOpenErr := errors.New("audit open failed")
+	storeCloseErr := errors.New("store close failed")
+	auditCloseErr := errors.New("audit close failed")
+	probe := &closeRecordingStore{
+		Store:    fake.New(),
+		closeErr: storeCloseErr,
+	}
+	auditLog := &audit.Log{}
+	auditCloseCalls := 0
+
+	application, err := openApp(
+		context.Background(),
+		"test",
+		appOpenDependencies{
+			openStore: func(context.Context) (store.Interface, error) {
+				return probe, nil
+			},
+			openAudit: func() (*audit.Log, error) {
+				return auditLog, auditOpenErr
+			},
+			closeAudit: func(context.Context, *audit.Log) error {
+				auditCloseCalls++
+				return auditCloseErr
+			},
+		},
+	)
+
+	if application != nil {
+		t.Fatalf("application returned after audit open failure: %+v", application)
+	}
+	for _, want := range []error{
+		auditOpenErr,
+		storeCloseErr,
+		auditCloseErr,
+	} {
+		if !errors.Is(err, want) {
+			t.Fatalf("error = %v, want joined %v", err, want)
+		}
+	}
+	storeCloseCalls, _, _ := probe.closeState()
+	if storeCloseCalls != 1 || auditCloseCalls != 1 {
+		t.Fatalf(
+			"close calls = store:%d audit:%d, want 1/1",
+			storeCloseCalls,
+			auditCloseCalls,
+		)
+	}
+}
+
+func TestOpenAuditOnlyWithDependenciesJoinsPolicyAndCloseErrors(
+	t *testing.T,
+) {
+	policyErr := errors.New("policy init failed")
+	auditCloseErr := errors.New("audit close failed")
+	auditLog := &audit.Log{}
+	closeCalls := 0
+	var closeCtxErr error
+	hasDeadline := false
+
+	application, err := openAuditOnlyWithDependencies(
+		nil,
+		appOpenDependencies{
+			openAudit: func() (*audit.Log, error) {
+				return auditLog, nil
+			},
+			loadPolicy: func() (*policy.Policy, error) {
+				return nil, policyErr
+			},
+			closeAudit: func(ctx context.Context, got *audit.Log) error {
+				closeCalls++
+				closeCtxErr = ctx.Err()
+				_, hasDeadline = ctx.Deadline()
+				if got != auditLog {
+					t.Fatalf("closed audit log = %p, want %p", got, auditLog)
+				}
+				return auditCloseErr
+			},
+		},
+	)
+
+	if application != nil {
+		t.Fatalf("application returned after policy failure: %+v", application)
+	}
+	if !errors.Is(err, policyErr) || !errors.Is(err, auditCloseErr) {
+		t.Fatalf("error = %v, want policy and close errors", err)
+	}
+	if closeCalls != 1 || closeCtxErr != nil || !hasDeadline {
+		t.Fatalf(
+			"audit close = calls:%d err:%v deadline:%t",
+			closeCalls,
+			closeCtxErr,
+			hasDeadline,
+		)
+	}
+}
+
+func TestOpenAuditOnlyWithDependenciesJoinsOpenAndCloseErrors(t *testing.T) {
+	openErr := errors.New("audit open failed")
+	closeErr := errors.New("audit close failed")
+	auditLog := &audit.Log{}
+	closeCalls := 0
+	var closeCtxErr error
+	hasDeadline := false
+
+	application, err := openAuditOnlyWithDependencies(
+		context.Background(),
+		appOpenDependencies{
+			openAudit: func() (*audit.Log, error) {
+				return auditLog, openErr
+			},
+			closeAudit: func(ctx context.Context, got *audit.Log) error {
+				closeCalls++
+				closeCtxErr = ctx.Err()
+				_, hasDeadline = ctx.Deadline()
+				if got != auditLog {
+					t.Fatalf("closed audit log = %p, want %p", got, auditLog)
+				}
+				return closeErr
+			},
+		},
+	)
+
+	if application != nil {
+		t.Fatalf("application returned after open failure: %+v", application)
+	}
+	if !errors.Is(err, openErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("error = %v, want open and close errors", err)
+	}
+	if closeCalls != 1 || closeCtxErr != nil || !hasDeadline {
+		t.Fatalf(
+			"audit close = calls:%d err:%v deadline:%t",
+			closeCalls,
+			closeCtxErr,
+			hasDeadline,
+		)
 	}
 }
 
@@ -745,6 +1185,40 @@ func TestApp_Add_AutoSync_NoSyncFlag(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Errorf("runner must not be called with --no-sync, got %d calls", len(rec.calls))
+	}
+}
+
+func TestApp_Add_SuppressAutoSyncIsInstanceLocal(t *testing.T) {
+	rec := withTempSyncConfig(t, singleRemoteConfig(), nil)
+	suppressed, _ := appWithFake(t, "human")
+	suppressed.SuppressAutoSync = true
+	ctx := context.Background()
+	if err := suppressed.Add(ctx, &store.Entry{
+		Path: "jasp-shared/new", Password: "value",
+	}); err != nil {
+		t.Fatalf("suppressed add: %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("suppressed app triggered sync calls: %v", rec.calls)
+	}
+	addRows, err := suppressed.Audit.Tail(ctx, audit.Filter{
+		Action: audit.ActionAdd, Limit: 5,
+	})
+	if err != nil {
+		t.Fatalf("tail add audit: %v", err)
+	}
+	if len(addRows) != 1 || addRows[0].Result != audit.ResultOK {
+		t.Fatalf("suppressed add audit rows = %+v, want one ok row", addRows)
+	}
+
+	normal, _ := appWithFake(t, "human")
+	if err := normal.Add(ctx, &store.Entry{
+		Path: "jasp/personal", Password: "value",
+	}); err != nil {
+		t.Fatalf("normal add: %v", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("normal app sync calls = %v, want exactly one", rec.calls)
 	}
 }
 
@@ -1108,22 +1582,62 @@ func TestSearchByDomain_EmptyQuery(t *testing.T) {
 }
 
 func TestSearchByDomain_AuditReason(t *testing.T) {
+	const marker = "DOMAIN-CREDENTIAL-63EAA1"
+	query := "https://user:" + marker + "@jasp.eu/login?token=" + marker
 	a, _ := appWithFake(t, "human", domainSeed()...)
 	ctx := context.Background()
-	_, _, err := a.SearchByDomain(ctx, "jasp.eu", true)
+	matches, _, err := a.SearchByDomain(ctx, query, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionSearch, Limit: 10})
-	var found bool
-	for _, r := range rows {
-		if strings.Contains(r.Reason, "domain=\"jasp.eu\"") && strings.Contains(r.Reason, "exact=1") {
-			found = true
-		}
+	if len(matches) != 2 {
+		t.Fatalf("matches = %+v, want exact and subdomain hits", matches)
 	}
-	if !found {
-		t.Errorf("expected domain audit row with tier breakdown, got %+v", rows)
+	rows, auditErr := a.Audit.Tail(
+		ctx,
+		audit.Filter{Action: audit.ActionSearch, Limit: 10},
+	)
+	if auditErr != nil {
+		t.Fatal(auditErr)
 	}
+	assertSearchAuditRedaction(
+		t,
+		rows,
+		query,
+		marker,
+		audit.ResultOK,
+		"",
+	)
+	if !strings.Contains(rows[0].Reason, "exact=1") {
+		t.Fatalf("domain tier breakdown missing: %+v", rows)
+	}
+}
+
+func TestSearchByDomain_ErrorAuditRedactsQuery(t *testing.T) {
+	const marker = "DOMAIN-CREDENTIAL-862B03"
+	query := "https://user:" + marker + "@jasp.eu/login?token=" + marker
+	a, f := appWithFake(t, "human", domainSeed()...)
+	f.ListErr = fmt.Errorf("domain search failed for %s", query)
+
+	_, _, err := a.SearchByDomain(context.Background(), query, true)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	rows, auditErr := a.Audit.Tail(
+		context.Background(),
+		audit.Filter{Action: audit.ActionSearch, Limit: 10},
+	)
+	if auditErr != nil {
+		t.Fatal(auditErr)
+	}
+	assertSearchAuditRedaction(
+		t,
+		rows,
+		query,
+		marker,
+		audit.ResultError,
+		"list",
+	)
 }
 
 func TestAdd_AutoDerivesDomainFromURL(t *testing.T) {
@@ -1484,15 +1998,15 @@ func TestHistory_Denied(t *testing.T) {
 	}
 }
 
-func TestBrowseDetailed_SkipsUndecryptableEntries(t *testing.T) {
+func TestBrowseDetailed_DecryptErrorReturnsNoPartialEntries(t *testing.T) {
 	a, f := appWithFake(t, "human", sampleEntries()...)
 	f.GetErr = errors.New("decrypt failure")
 	entries, err := a.BrowseDetailed(context.Background(), "")
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || err.Error() != "decrypt failure" {
+		t.Fatalf("error = %v, want decrypt failure", err)
 	}
-	if len(entries) != 0 {
-		t.Errorf("expected zero entries when every Get fails, got %d", len(entries))
+	if entries != nil {
+		t.Fatalf("partial entries returned: %+v", entries)
 	}
 }
 
@@ -1528,11 +2042,12 @@ type cancelOnFirstGetStore struct {
 }
 
 func (s *cancelOnFirstGetStore) Get(ctx context.Context, path string) (*store.Entry, error) {
-	if !s.fired {
+	entry, err := s.Store.Get(ctx, path)
+	if err == nil && !s.fired {
 		s.fired = true
 		s.cancel()
 	}
-	return s.Store.Get(ctx, path)
+	return entry, err
 }
 
 func TestBrowseDetailed_MidLoopCancelReturnsErrorNotPartial(t *testing.T) {

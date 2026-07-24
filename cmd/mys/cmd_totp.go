@@ -167,22 +167,18 @@ func totpAddCmd(requester *string) *cobra.Command {
 // runTOTPOnce generates a single code and writes it to w.
 func runTOTPOnce(ctx context.Context, a *app.App, path string, w io.Writer) error {
 	now := nowFunc()
-	code, secondsLeft, err := a.GenerateTOTP(ctx, path, now)
+	details, err := a.GenerateTOTPDetails(ctx, path, now)
 	if err != nil {
 		return err
 	}
-	// Fetch meta for display. GenerateTOTP has already applied policy so
-	// an additional Get call here would double-audit; we use the Store
-	// interface directly. If the direct read fails we fall back to the
-	// path without issuer/label — the code itself is the important bit.
-	issuer, label := "", ""
-	if a.Store != nil {
-		if e, err := a.Store.Get(ctx, path); err == nil {
-			issuer = e.TOTPIssuer
-			label = e.TOTPLabel
-		}
-	}
-	printTOTPCode(w, path, issuer, label, code, secondsLeft)
+	printTOTPCode(
+		w,
+		path,
+		details.Issuer,
+		details.Label,
+		details.Code,
+		details.SecondsLeft,
+	)
 	return nil
 }
 
@@ -193,21 +189,21 @@ func runTOTPWatch(ctx context.Context, a *app.App, path string, w io.Writer) err
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	// Pre-fetch metadata once so the watch loop does not spam Get/audit
-	// rows. Policy has already cleared us via the first GenerateTOTP
-	// below; if that fails we exit before writing the watch output.
-	issuer, label := "", ""
-	code, secondsLeft, err := a.GenerateTOTP(ctx, path, nowFunc())
+	// Read the code and display metadata through one policy-checked access.
+	// Subsequent ticks only regenerate the code, keeping metadata stable while
+	// preserving the existing one-audit-row-per-window behavior.
+	details, err := a.GenerateTOTPDetails(ctx, path, nowFunc())
 	if err != nil {
 		return err
 	}
-	if a.Store != nil {
-		if e, gerr := a.Store.Get(ctx, path); gerr == nil {
-			issuer = e.TOTPIssuer
-			label = e.TOTPLabel
-		}
-	}
-	writeWatchLine(w, path, issuer, label, code, secondsLeft)
+	writeWatchLine(
+		w,
+		path,
+		details.Issuer,
+		details.Label,
+		details.Code,
+		details.SecondsLeft,
+	)
 
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -225,7 +221,7 @@ func runTOTPWatch(ctx context.Context, a *app.App, path string, w io.Writer) err
 				fmt.Fprintln(w)
 				return err
 			}
-			writeWatchLine(w, path, issuer, label, code, secondsLeft)
+			writeWatchLine(w, path, details.Issuer, details.Label, code, secondsLeft)
 		}
 	}
 }

@@ -1,11 +1,9 @@
 // Package recipient wraps gpg and gopass subprocesses to manage the set of
 // GPG keys that can decrypt the password store.
 //
-// Scope: this is deliberately a thin, audited wrapper intended for your own
-// additional devices or hardware tokens (for example a second laptop, or a
-// YubiKey). Adding a colleague's key is the wrong trust model — a new
-// recipient can decrypt every secret in the store, including entries under
-// private/**. Team sharing belongs in Bitwarden.
+// Scope: this is deliberately a thin, audited wrapper. The legacy operations
+// manage the user's default store. Foreign recipients are only accepted for
+// an explicitly shared, non-root mount with a valid team-key manifest.
 package recipient
 
 import (
@@ -16,8 +14,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
+
+	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
+	"github.com/SaschaHenning/my-secrets/internal/teamkeys"
 )
 
 // Recipient is a GPG key currently registered as a gopass store recipient.
@@ -86,10 +88,21 @@ func Import(ctx context.Context, path string) (fingerprint, uid string, err erro
 // Add registers `fingerprint` as a gopass recipient. Gopass re-encrypts
 // every secret in the store for the new recipient set.
 func Add(ctx context.Context, fingerprint string) error {
+	return AddToMount(ctx, "", fingerprint)
+}
+
+// AddToMount registers fingerprint as a recipient of mount. Empty and root
+// mounts retain the legacy default-store argv exactly.
+func AddToMount(ctx context.Context, mount, fingerprint string) error {
 	if fingerprint == "" {
 		return errors.New("empty fingerprint")
 	}
-	if _, err := defaultRunner.Run(ctx, "gopass", "recipients", "add", fingerprint); err != nil {
+	args := []string{"recipients", "add"}
+	if mount != "" && mount != syncpkg.DefaultStoreMount {
+		args = append(args, "--store", mount)
+	}
+	args = append(args, fingerprint)
+	if _, err := defaultRunner.Run(ctx, "gopass", args...); err != nil {
 		return fmt.Errorf("gopass recipients add: %w", err)
 	}
 	return nil
@@ -97,10 +110,21 @@ func Add(ctx context.Context, fingerprint string) error {
 
 // Remove drops `fingerprint` from the gopass recipient set.
 func Remove(ctx context.Context, fingerprint string) error {
+	return RemoveFromMount(ctx, "", fingerprint)
+}
+
+// RemoveFromMount drops fingerprint from the recipient set of mount. Empty
+// and root mounts retain the legacy default-store argv exactly.
+func RemoveFromMount(ctx context.Context, mount, fingerprint string) error {
 	if fingerprint == "" {
 		return errors.New("empty fingerprint")
 	}
-	if _, err := defaultRunner.Run(ctx, "gopass", "recipients", "remove", fingerprint); err != nil {
+	args := []string{"recipients", "remove"}
+	if mount != "" && mount != syncpkg.DefaultStoreMount {
+		args = append(args, "--store", mount)
+	}
+	args = append(args, fingerprint)
+	if _, err := defaultRunner.Run(ctx, "gopass", args...); err != nil {
 		return fmt.Errorf("gopass recipients remove: %w", err)
 	}
 	return nil
@@ -113,7 +137,29 @@ func List(ctx context.Context) ([]Recipient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gopass recipients: %w", err)
 	}
-	fprs := parseGopassRecipients(out)
+	return enrichRecipients(ctx, parseGopassRecipients(out)), nil
+}
+
+// ListFromMount returns the recipients of mount. Gopass has no supported
+// `recipients --store` form, so named mounts are resolved to their live path
+// and read from that store's .gpg-id file.
+func ListFromMount(ctx context.Context, mount string) ([]Recipient, error) {
+	if mount == "" || mount == syncpkg.DefaultStoreMount {
+		return List(ctx)
+	}
+	mountPath, err := syncpkg.GopassMountPath(ctx, defaultRunner, mount)
+	if err != nil {
+		return nil, fmt.Errorf("resolve gopass mount %q: %w", mount, err)
+	}
+	gpgIDPath := filepath.Join(mountPath, ".gpg-id")
+	out, err := os.ReadFile(gpgIDPath)
+	if err != nil {
+		return nil, fmt.Errorf("read recipients for mount %q: %w", mount, err)
+	}
+	return enrichRecipients(ctx, parseGPGIDRecipients(out)), nil
+}
+
+func enrichRecipients(ctx context.Context, fprs []string) []Recipient {
 	recipients := make([]Recipient, 0, len(fprs))
 	for _, fpr := range fprs {
 		r := Recipient{Fingerprint: fpr}
@@ -124,7 +170,115 @@ func List(ctx context.Context) ([]Recipient, error) {
 		}
 		recipients = append(recipients, r)
 	}
-	return recipients, nil
+	return recipients
+}
+
+// ForeignInfo describes how a foreign fingerprint appears in the shared
+// mount's team-key manifest. An unlisted fingerprint is represented by
+// Listed=false and is not itself an error.
+type ForeignInfo struct {
+	Fingerprint string
+	Name        string
+	Email       string
+	Listed      bool
+}
+
+// ValidateSharedMount fails closed unless mount is a live, non-root gopass
+// mount explicitly marked shared and containing a valid team-key manifest.
+func ValidateSharedMount(ctx context.Context, mount string, cfg *syncpkg.Config) error {
+	_, err := loadSharedManifest(ctx, mount, cfg)
+	return err
+}
+
+// InspectForeign looks up fingerprint in a validated shared mount's team-key
+// manifest. A valid but unlisted fingerprint returns Listed=false.
+func InspectForeign(
+	ctx context.Context,
+	mount, fingerprint string,
+	cfg *syncpkg.Config,
+) (ForeignInfo, error) {
+	fingerprint, err := normalizeForeignFingerprint(fingerprint)
+	if err != nil {
+		return ForeignInfo{}, err
+	}
+	manifest, err := loadSharedManifest(ctx, mount, cfg)
+	if err != nil {
+		return ForeignInfo{}, err
+	}
+	info := ForeignInfo{Fingerprint: fingerprint}
+	member, ok := manifest.FindFingerprint(fingerprint)
+	if !ok {
+		return info, nil
+	}
+	info.Name = member.Name
+	info.Email = member.Email
+	info.Listed = true
+	return info, nil
+}
+
+// AddForeign adds a foreign fingerprint only after revalidating the shared
+// mount immediately before invoking gopass. The caller must have obtained
+// human confirmation before calling this function.
+func AddForeign(
+	ctx context.Context,
+	mount, fingerprint string,
+	cfg *syncpkg.Config,
+) error {
+	fingerprint, err := normalizeForeignFingerprint(fingerprint)
+	if err != nil {
+		return err
+	}
+	mount = strings.TrimSpace(mount)
+	if err := ValidateSharedMount(ctx, mount, cfg); err != nil {
+		return err
+	}
+	return addConfirmedToMount(ctx, mount, fingerprint)
+}
+
+func addConfirmedToMount(ctx context.Context, mount, fingerprint string) error {
+	if _, err := syncpkg.GopassRecipientsAddConfirmed(
+		ctx,
+		defaultRunner,
+		mount,
+		fingerprint,
+	); err != nil {
+		return fmt.Errorf("gopass recipients add: %w", err)
+	}
+	return nil
+}
+
+func loadSharedManifest(
+	ctx context.Context,
+	mount string,
+	cfg *syncpkg.Config,
+) (*teamkeys.File, error) {
+	mount = strings.TrimSpace(mount)
+	if mount == "" || mount == syncpkg.DefaultStoreMount {
+		return nil, errors.New("shared recipient mount must be non-root")
+	}
+	if cfg == nil || !cfg.IsSharedMount(mount) {
+		return nil, fmt.Errorf("mount %q is not configured as shared", mount)
+	}
+	mountPath, err := syncpkg.GopassMountPath(ctx, defaultRunner, mount)
+	if err != nil {
+		return nil, fmt.Errorf("resolve shared mount %q: %w", mount, err)
+	}
+	manifestPath := filepath.Join(mountPath, teamkeys.Filename)
+	manifest, err := teamkeys.Load(manifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("load %s for shared mount %q: %w",
+			teamkeys.Filename, mount, err)
+	}
+	return manifest, nil
+}
+
+func normalizeForeignFingerprint(fingerprint string) (string, error) {
+	fingerprint = strings.ToUpper(strings.TrimSpace(fingerprint))
+	if !isFingerprint(fingerprint) {
+		return "", fmt.Errorf("invalid fingerprint %q: expected 40 hexadecimal characters",
+			fingerprint)
+	}
+	return fingerprint, nil
 }
 
 // parseFirstFprUID extracts the first primary fingerprint (fpr) and first
@@ -231,12 +385,12 @@ func parseGopassRecipients(b []byte) []string {
 			}
 		}
 	}
-	// Second pass: drop a 16-char short ID when we already have its
-	// matching 40-char fingerprint (the short ID is the fingerprint's
-	// last 16 characters). This handles the case where both formats
-	// appear in the same gopass output (older tree-style listings put
-	// both the short header line and the full fingerprint line below
-	// each other).
+	return dropShadowShortIDs(fprs)
+}
+
+// dropShadowShortIDs drops a 16-character short ID when the matching
+// 40-character fingerprint is also present.
+func dropShadowShortIDs(fprs []string) []string {
 	fulls := map[string]struct{}{}
 	for _, f := range fprs {
 		if len(f) == 40 {
@@ -253,6 +407,34 @@ func parseGopassRecipients(b []byte) []string {
 		out = append(out, f)
 	}
 	return out
+}
+
+// parseGPGIDRecipients extracts and deduplicates the 16- and 40-character
+// hexadecimal key IDs accepted by gopass .gpg-id files. Inline comments and
+// an optional 0x prefix are ignored.
+func parseGPGIDRecipients(b []byte) []string {
+	var fprs []string
+	seen := map[string]struct{}{}
+	for _, line := range bytes.Split(b, []byte{'\n'}) {
+		if i := bytes.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		for _, field := range bytes.Fields(line) {
+			id := string(field)
+			id = strings.TrimPrefix(id, "0x")
+			id = strings.TrimPrefix(id, "0X")
+			if !isHexID(id) {
+				continue
+			}
+			id = strings.ToUpper(id)
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			fprs = append(fprs, id)
+		}
+	}
+	return dropShadowShortIDs(fprs)
 }
 
 // resolveShortID calls `gpg --with-colons --list-keys <short>` to expand

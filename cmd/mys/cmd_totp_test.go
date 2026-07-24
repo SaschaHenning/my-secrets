@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -199,6 +200,13 @@ func TestRunTOTPOnce_PrintsCodeAndMetadata(t *testing.T) {
 	if rows[0].Result != audit.ResultOK {
 		t.Errorf("result = %q", rows[0].Result)
 	}
+	fakeStore, ok := a.Store.(*fake.Store)
+	if !ok {
+		t.Fatalf("store type = %T, want *fake.Store", a.Store)
+	}
+	if fakeStore.GetCallCount() != 1 {
+		t.Fatalf("decryptions = %d, want 1", fakeStore.GetCallCount())
+	}
 }
 
 // hasDigitGroup reports whether s contains a run of len1 digits, a
@@ -243,5 +251,36 @@ func TestRunTOTPOnce_NonTOTPReturnsError(t *testing.T) {
 		t.Fatal("want error for non-totp entry")
 	} else if !strings.Contains(err.Error(), "not a totp entry") {
 		t.Errorf("error = %v", err)
+	}
+}
+
+func TestRunTOTPOnce_AuditUnavailableWritesNoPartialPlaintext(t *testing.T) {
+	secretSentinel := "sentinel-" + "secret-must-not-leak"
+	entryPath := "jasp/" + "production"
+	a := totpTestApp(t, &store.Entry{
+		Path: entryPath, Kind: store.KindTOTP, Password: secretSentinel,
+	})
+	fakeStore, ok := a.Store.(*fake.Store)
+	if !ok {
+		t.Fatalf("store type = %T, want *fake.Store", a.Store)
+	}
+	// The app-level preflight regression maps this exact generic error to a
+	// failed shared-audit preflight. The CLI runner must write nothing first.
+	fakeStore.GetErr = app.ErrTeamAuditUnavailable
+
+	var output bytes.Buffer
+	err := runTOTPOnce(context.Background(), a, entryPath, &output)
+	if !errors.Is(err, app.ErrTeamAuditUnavailable) {
+		t.Fatalf("error = %v, want %v", err, app.ErrTeamAuditUnavailable)
+	}
+	if err.Error() != app.ErrTeamAuditUnavailable.Error() {
+		t.Fatalf("error = %q, want generic audit failure", err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("CLI wrote partial plaintext: %q", output.String())
+	}
+	if strings.Contains(output.String(), secretSentinel) ||
+		strings.Contains(output.String(), entryPath) {
+		t.Fatalf("CLI output leaked plaintext or path: %q", output.String())
 	}
 }

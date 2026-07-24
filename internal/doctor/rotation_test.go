@@ -115,3 +115,36 @@ func TestCheckRotationOverdue_WarnOnProviderError(t *testing.T) {
 		t.Errorf("message should mention gpg, got %q", c.Message)
 	}
 }
+
+func TestCheckRotationOverdue_ContextProviderTakesPrecedence(t *testing.T) {
+	now := time.Date(2026, 4, 20, 0, 0, 0, 0, time.UTC)
+	withRotationProvider(
+		t,
+		nil,
+		errors.New("package fallback must not run"),
+		now,
+	)
+	ctx := WithRotationProvider(context.Background(), stubProvider{
+		entries: []*store.Entry{{
+			Path:        "jasp/a",
+			RotateAfter: "90d",
+			RotatedAt:   now.Add(-10 * 24 * time.Hour),
+		}},
+	})
+
+	c := CheckRotationOverdue(ctx)
+	if c.Status != StatusPass {
+		t.Fatalf("want PASS from context provider, got %s (%s)", c.Status, c.Message)
+	}
+}
+
+func TestCheckRotationOverdue_NilContextProviderKeepsFallback(t *testing.T) {
+	now := time.Now().UTC()
+	withRotationProvider(t, nil, errors.New("fallback selected"), now)
+	ctx := WithRotationProvider(context.Background(), nil)
+
+	c := CheckRotationOverdue(ctx)
+	if c.Status != StatusWarn {
+		t.Fatalf("want WARN from fallback provider, got %s (%s)", c.Status, c.Message)
+	}
+}

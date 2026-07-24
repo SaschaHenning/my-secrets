@@ -25,17 +25,47 @@ import (
 // check needs. It returns every entry in the store (already decrypted,
 // with RotateAfter / RotatedAt populated) or an error explaining why
 // enumeration is not currently possible.
-//
-// The default implementation opens the real gopass store; tests inject
-// a stub so they never touch gpg.
 type RotationEntriesProvider interface {
 	Entries(ctx context.Context) ([]*store.Entry, error)
 }
 
-// rotationProvider is the package-level hook CheckRotationOverdue calls
-// into. Tests overwrite it via SetRotationProvider(); production code
-// leaves it at the default implementation.
-var rotationProvider RotationEntriesProvider = defaultRotationProvider{}
+type rotationProviderContextKey struct{}
+
+type unconfiguredRotationProvider struct{}
+
+func (unconfiguredRotationProvider) Entries(context.Context) ([]*store.Entry, error) {
+	return nil, fmt.Errorf("rotation entry provider is not configured")
+}
+
+// rotationProvider is the package-level fallback CheckRotationOverdue calls
+// into. Tests overwrite it via SetRotationProvider(); the CLI provides its
+// policy-aware App adapter through the request context.
+var rotationProvider RotationEntriesProvider = unconfiguredRotationProvider{}
+
+// WithRotationProvider attaches a request-scoped entry provider. The
+// request-scoped form avoids mutating package globals when multiple doctor
+// reports run concurrently.
+func WithRotationProvider(
+	ctx context.Context,
+	provider RotationEntriesProvider,
+) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if provider == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, rotationProviderContextKey{}, provider)
+}
+
+func activeRotationProvider(ctx context.Context) RotationEntriesProvider {
+	if ctx != nil {
+		if provider, ok := ctx.Value(rotationProviderContextKey{}).(RotationEntriesProvider); ok {
+			return provider
+		}
+	}
+	return rotationProvider
+}
 
 // rotationNow is the "now" source for the rotation-overdue check. Tests
 // override it to pin time for deterministic assertions; production code
@@ -48,7 +78,7 @@ var rotationNow = func() time.Time { return time.Now().UTC() }
 func SetRotationProvider(p RotationEntriesProvider) RotationEntriesProvider {
 	prev := rotationProvider
 	if p == nil {
-		rotationProvider = defaultRotationProvider{}
+		rotationProvider = unconfiguredRotationProvider{}
 	} else {
 		rotationProvider = p
 	}
@@ -68,42 +98,12 @@ func SetRotationNow(fn func() time.Time) func() time.Time {
 	return prev
 }
 
-// defaultRotationProvider opens the real gopass store and decrypts every
-// entry. Any gpg error (locked keyring, missing store, agent unreachable)
-// is surfaced verbatim; the check wraps it into a WARN with a
-// gpg-independent explanation so other checks keep running.
-type defaultRotationProvider struct{}
-
-func (defaultRotationProvider) Entries(ctx context.Context) ([]*store.Entry, error) {
-	st, err := store.Open(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("open store: %w", err)
-	}
-	defer func() { _ = st.Close(ctx) }()
-	paths, err := st.List(ctx, "")
-	if err != nil {
-		return nil, fmt.Errorf("list store: %w", err)
-	}
-	out := make([]*store.Entry, 0, len(paths))
-	for _, p := range paths {
-		e, gerr := st.Get(ctx, p)
-		if gerr != nil {
-			// Abort enumeration on the first decrypt failure: a partial
-			// count would be misleading. The caller converts this into
-			// a WARN.
-			return nil, fmt.Errorf("decrypt %s: %w", p, gerr)
-		}
-		out = append(out, e)
-	}
-	return out, nil
-}
-
 // CheckRotationOverdue — check #11: count entries past their rotation
 // horizon and flag a WARN when any exist. Never returns FAIL: missing
 // rotations are a nudge, not a blocker.
 func CheckRotationOverdue(ctx context.Context) Check {
 	c := Check{ID: "rotation-overdue", Label: "rotation reminders"}
-	entries, err := rotationProvider.Entries(ctx)
+	entries, err := activeRotationProvider(ctx).Entries(ctx)
 	if err != nil {
 		c.Status = StatusWarn
 		c.Message = "store cannot be enumerated without gpg"

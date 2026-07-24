@@ -10,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
+	"github.com/SaschaHenning/my-secrets/internal/teamkeys"
 )
 
 // --- parser unit tests ------------------------------------------------------
@@ -122,6 +125,40 @@ func TestParseGopassRecipients_Dedup(t *testing.T) {
 	fprs := parseGopassRecipients([]byte(input))
 	if len(fprs) != 1 {
 		t.Errorf("want 1 unique fpr, got %d: %v", len(fprs), fprs)
+	}
+}
+
+func TestParseGPGIDRecipients(t *testing.T) {
+	const fullFingerprint = "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555"
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{
+			name: "accepts supported forms",
+			in:   strings.ToLower(fullFingerprint) + "\n0x3333444455556666\n",
+			want: []string{fullFingerprint, "3333444455556666"},
+		},
+		{
+			name: "ignores comments and invalid tokens",
+			in:   "# " + fullFingerprint + "\nnot-a-key\n" + fullFingerprint + " # Alice\n",
+			want: []string{fullFingerprint},
+		},
+		{
+			name: "drops short shadow of full fingerprint",
+			in:   "DDDD4444EEEE5555\n" + fullFingerprint + "\n",
+			want: []string{fullFingerprint},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseGPGIDRecipients([]byte(tc.in))
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Fatalf("parseGPGIDRecipients() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -293,6 +330,135 @@ func TestRemove_Stubbed(t *testing.T) {
 	}
 }
 
+func TestRecipientMutationArgv(t *testing.T) {
+	const fingerprint = "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555"
+	tests := []struct {
+		name string
+		run  func(context.Context) error
+		want string
+	}{
+		{
+			name: "legacy add",
+			run:  func(ctx context.Context) error { return Add(ctx, fingerprint) },
+			want: "gopass recipients add " + fingerprint,
+		},
+		{
+			name: "add empty mount",
+			run: func(ctx context.Context) error {
+				return AddToMount(ctx, "", fingerprint)
+			},
+			want: "gopass recipients add " + fingerprint,
+		},
+		{
+			name: "add root mount",
+			run: func(ctx context.Context) error {
+				return AddToMount(ctx, syncpkg.DefaultStoreMount, fingerprint)
+			},
+			want: "gopass recipients add " + fingerprint,
+		},
+		{
+			name: "add named mount",
+			run: func(ctx context.Context) error {
+				return AddToMount(ctx, "jasp", fingerprint)
+			},
+			want: "gopass recipients add --store jasp " + fingerprint,
+		},
+		{
+			name: "legacy remove",
+			run:  func(ctx context.Context) error { return Remove(ctx, fingerprint) },
+			want: "gopass recipients remove " + fingerprint,
+		},
+		{
+			name: "remove empty mount",
+			run: func(ctx context.Context) error {
+				return RemoveFromMount(ctx, "", fingerprint)
+			},
+			want: "gopass recipients remove " + fingerprint,
+		},
+		{
+			name: "remove root mount",
+			run: func(ctx context.Context) error {
+				return RemoveFromMount(ctx, syncpkg.DefaultStoreMount, fingerprint)
+			},
+			want: "gopass recipients remove " + fingerprint,
+		},
+		{
+			name: "remove named mount",
+			run: func(ctx context.Context) error {
+				return RemoveFromMount(ctx, "jasp", fingerprint)
+			},
+			want: "gopass recipients remove --store jasp " + fingerprint,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubRunner{handlers: map[string]stubResp{
+				tc.want: {},
+			}}
+			restore := WithRunner(stub)
+			defer restore()
+
+			if err := tc.run(context.Background()); err != nil {
+				t.Fatalf("mutation: %v", err)
+			}
+			if len(stub.calls) != 1 || stub.calls[0] != tc.want {
+				t.Fatalf("calls = %v, want [%q]", stub.calls, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecipientMutationErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(context.Context) error
+		want string
+	}{
+		{
+			name: "add empty fingerprint",
+			run: func(ctx context.Context) error {
+				return AddToMount(ctx, "jasp", "")
+			},
+			want: "empty fingerprint",
+		},
+		{
+			name: "remove empty fingerprint",
+			run: func(ctx context.Context) error {
+				return RemoveFromMount(ctx, "jasp", "")
+			},
+			want: "empty fingerprint",
+		},
+		{
+			name: "add runner failure",
+			run: func(ctx context.Context) error {
+				return AddToMount(ctx, "jasp", "AAAA")
+			},
+			want: "gopass recipients add",
+		},
+		{
+			name: "remove runner failure",
+			run: func(ctx context.Context) error {
+				return RemoveFromMount(ctx, "jasp", "AAAA")
+			},
+			want: "gopass recipients remove",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubRunner{handlers: map[string]stubResp{}}
+			restore := WithRunner(stub)
+			defer restore()
+
+			err := tc.run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestList_Stubbed(t *testing.T) {
 	stub := &stubRunner{handlers: map[string]stubResp{
 		"gopass recipients": {out: []byte(gopassRecipientsFixture), err: nil},
@@ -320,6 +486,458 @@ func TestList_Stubbed(t *testing.T) {
 	// present so the list is still useful.
 	if recs[1].Fingerprint != "DDDDEEEEFFFF0000111122223333444455556666" {
 		t.Errorf("second fpr: %q", recs[1].Fingerprint)
+	}
+}
+
+func TestListFromMount_DefaultArgvUnchanged(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(context.Context) ([]Recipient, error)
+	}{
+		{
+			name: "legacy list",
+			run:  List,
+		},
+		{
+			name: "empty mount",
+			run: func(ctx context.Context) ([]Recipient, error) {
+				return ListFromMount(ctx, "")
+			},
+		},
+		{
+			name: "root mount",
+			run: func(ctx context.Context) ([]Recipient, error) {
+				return ListFromMount(ctx, syncpkg.DefaultStoreMount)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubRunner{handlers: map[string]stubResp{
+				"gopass recipients": {},
+			}}
+			restore := WithRunner(stub)
+			defer restore()
+
+			recipients, err := tc.run(context.Background())
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			if len(recipients) != 0 {
+				t.Fatalf("recipients = %+v, want none", recipients)
+			}
+			if len(stub.calls) != 1 || stub.calls[0] != "gopass recipients" {
+				t.Fatalf("calls = %v, want [gopass recipients]", stub.calls)
+			}
+		})
+	}
+}
+
+func TestListFromMount_ReadsLiveGPGID(t *testing.T) {
+	const (
+		fullFingerprint = "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555"
+		shortID         = "3333444455556666"
+	)
+	mountPath := t.TempDir()
+	gpgID := strings.Join([]string{
+		"# team recipients",
+		strings.ToLower(fullFingerprint),
+		"0x" + shortID,
+		fullFingerprint + " # duplicate",
+		"not-a-key",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(mountPath, ".gpg-id"), []byte(gpgID), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secondKeyFixture := `pub:-:3072:1:3333444455556666:1705320000::::::scESC:::::::
+fpr:::::::::DDDDEEEEFFFF0000111122223333444455556666:
+uid:-::::1705320000::33333333333333333333333333333333::Bob Builder \x3cbob@example.org\x3e::::::::::0:
+`
+	stub := &stubRunner{handlers: map[string]stubResp{
+		"gopass config mounts.jasp.path": {
+			out: []byte(mountPath + "\n"),
+		},
+		"gpg --with-colons --fixed-list-mode --list-keys " + fullFingerprint: {
+			out: []byte(showKeysFixture),
+		},
+		"gpg --with-colons --fixed-list-mode --list-keys " + shortID: {
+			out: []byte(secondKeyFixture),
+		},
+	}}
+	restore := WithRunner(stub)
+	defer restore()
+
+	recipients, err := ListFromMount(context.Background(), "jasp")
+	if err != nil {
+		t.Fatalf("ListFromMount: %v", err)
+	}
+	if len(recipients) != 2 {
+		t.Fatalf("recipients = %+v, want two unique IDs", recipients)
+	}
+	if recipients[0].Fingerprint != fullFingerprint ||
+		len(recipients[0].UIDs) == 0 ||
+		!strings.Contains(recipients[0].UIDs[0], "Alice") {
+		t.Errorf("first recipient = %+v", recipients[0])
+	}
+	if recipients[1].Fingerprint != shortID ||
+		len(recipients[1].UIDs) == 0 ||
+		!strings.Contains(recipients[1].UIDs[0], "Bob") {
+		t.Errorf("second recipient = %+v", recipients[1])
+	}
+	wantCalls := []string{
+		"gopass config mounts.jasp.path",
+		"gpg --with-colons --fixed-list-mode --list-keys " + fullFingerprint,
+		"gpg --with-colons --fixed-list-mode --list-keys " + shortID,
+	}
+	if strings.Join(stub.calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("calls = %v, want %v", stub.calls, wantCalls)
+	}
+	for _, call := range stub.calls {
+		if strings.Contains(call, "gopass recipients") {
+			t.Fatalf("non-default list must not invoke gopass recipients: %v", stub.calls)
+		}
+	}
+}
+
+func TestListFromMountErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		mountPath  func(*testing.T) string
+		pathResult stubResp
+		want       string
+	}{
+		{
+			name: "mount lookup failure",
+			pathResult: stubResp{
+				err: errors.New("lookup failed"),
+			},
+			want: "resolve gopass mount",
+		},
+		{
+			name: "missing gpg id",
+			mountPath: func(t *testing.T) string {
+				return t.TempDir()
+			},
+			want: "read recipients",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := tc.pathResult
+			if tc.mountPath != nil {
+				result.out = []byte(tc.mountPath(t) + "\n")
+			}
+			stub := &stubRunner{handlers: map[string]stubResp{
+				"gopass config mounts.jasp.path": result,
+			}}
+			restore := WithRunner(stub)
+			defer restore()
+
+			_, err := ListFromMount(context.Background(), "jasp")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateSharedMount(t *testing.T) {
+	validMountPath := t.TempDir()
+	writeTeamManifest(t, validMountPath, []teamkeys.Member{validTeamMember()})
+	missingManifestPath := t.TempDir()
+	invalidManifestPath := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(invalidManifestPath, teamkeys.Filename),
+		[]byte("version: 1\nmembers: ["),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		mount      string
+		cfg        *syncpkg.Config
+		pathResult stubResp
+		want       string
+		wantCalls  int
+	}{
+		{
+			name:      "nil config",
+			mount:     "jasp",
+			want:      "not configured as shared",
+			wantCalls: 0,
+		},
+		{
+			name:      "root refused",
+			mount:     syncpkg.DefaultStoreMount,
+			cfg:       sharedConfig("jasp"),
+			want:      "non-root",
+			wantCalls: 0,
+		},
+		{
+			name:      "empty refused",
+			cfg:       sharedConfig("jasp"),
+			want:      "non-root",
+			wantCalls: 0,
+		},
+		{
+			name:      "personal refused",
+			mount:     "jasp",
+			cfg:       &syncpkg.Config{Remotes: []syncpkg.StoreRemote{{Mount: "jasp"}}},
+			want:      "not configured as shared",
+			wantCalls: 0,
+		},
+		{
+			name:  "live path failure",
+			mount: "jasp",
+			cfg:   sharedConfig("jasp"),
+			pathResult: stubResp{
+				err: errors.New("lookup failed"),
+			},
+			want:      "resolve shared mount",
+			wantCalls: 1,
+		},
+		{
+			name:  "missing manifest",
+			mount: "jasp",
+			cfg:   sharedConfig("jasp"),
+			pathResult: stubResp{
+				out: []byte(missingManifestPath + "\n"),
+			},
+			want:      teamkeys.Filename,
+			wantCalls: 1,
+		},
+		{
+			name:  "invalid manifest",
+			mount: "jasp",
+			cfg:   sharedConfig("jasp"),
+			pathResult: stubResp{
+				out: []byte(invalidManifestPath + "\n"),
+			},
+			want:      teamkeys.Filename,
+			wantCalls: 1,
+		},
+		{
+			name:  "valid shared mount",
+			mount: "jasp",
+			cfg:   sharedConfig("jasp"),
+			pathResult: stubResp{
+				out: []byte(validMountPath + "\n"),
+			},
+			wantCalls: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubRunner{handlers: map[string]stubResp{
+				"gopass config mounts.jasp.path": tc.pathResult,
+			}}
+			restore := WithRunner(stub)
+			defer restore()
+
+			err := ValidateSharedMount(context.Background(), tc.mount, tc.cfg)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("ValidateSharedMount: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+			if len(stub.calls) != tc.wantCalls {
+				t.Fatalf("calls = %v, want %d", stub.calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestInspectForeign(t *testing.T) {
+	const unlistedFingerprint = "111122223333444455556666777788889999AAAA"
+	mountPath := t.TempDir()
+	member := validTeamMember()
+	writeTeamManifest(t, mountPath, []teamkeys.Member{member})
+
+	tests := []struct {
+		name        string
+		fingerprint string
+		want        ForeignInfo
+		wantErr     string
+	}{
+		{
+			name:        "listed canonicalizes fingerprint",
+			fingerprint: strings.ToLower(member.Fingerprint),
+			want: ForeignInfo{
+				Fingerprint: member.Fingerprint,
+				Name:        member.Name,
+				Email:       member.Email,
+				Listed:      true,
+			},
+		},
+		{
+			name:        "unlisted is not an error",
+			fingerprint: unlistedFingerprint,
+			want: ForeignInfo{
+				Fingerprint: unlistedFingerprint,
+			},
+		},
+		{
+			name:        "invalid fingerprint",
+			fingerprint: "not-a-fingerprint",
+			wantErr:     "invalid fingerprint",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubRunner{handlers: map[string]stubResp{
+				"gopass config mounts.jasp.path": {out: []byte(mountPath + "\n")},
+			}}
+			restore := WithRunner(stub)
+			defer restore()
+
+			got, err := InspectForeign(
+				context.Background(),
+				"jasp",
+				tc.fingerprint,
+				sharedConfig("jasp"),
+			)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("InspectForeign: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("ForeignInfo = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAddForeignRevalidatesSharedMount(t *testing.T) {
+	member := validTeamMember()
+	mountPath := t.TempDir()
+	writeTeamManifest(t, mountPath, []teamkeys.Member{member})
+	missingManifestPath := t.TempDir()
+
+	tests := []struct {
+		name      string
+		mount     string
+		cfg       *syncpkg.Config
+		handlers  map[string]stubResp
+		want      string
+		wantCalls []string
+	}{
+		{
+			name:  "non-shared refused",
+			mount: "jasp",
+			cfg:   &syncpkg.Config{Remotes: []syncpkg.StoreRemote{{Mount: "jasp"}}},
+			want:  "not configured as shared",
+		},
+		{
+			name:  "root refused",
+			mount: syncpkg.DefaultStoreMount,
+			cfg:   sharedConfig("jasp"),
+			want:  "non-root",
+		},
+		{
+			name:  "missing manifest refused",
+			mount: "jasp",
+			cfg:   sharedConfig("jasp"),
+			handlers: map[string]stubResp{
+				"gopass config mounts.jasp.path": {
+					out: []byte(missingManifestPath + "\n"),
+				},
+			},
+			want: teamkeys.Filename,
+			wantCalls: []string{
+				"gopass config mounts.jasp.path",
+			},
+		},
+		{
+			name:  "valid shared mount adds",
+			mount: "jasp",
+			cfg:   sharedConfig("jasp"),
+			handlers: map[string]stubResp{
+				"gopass config mounts.jasp.path": {
+					out: []byte(mountPath + "\n"),
+				},
+				"gopass --yes recipients add --store jasp " + member.Fingerprint: {},
+			},
+			wantCalls: []string{
+				"gopass config mounts.jasp.path",
+				"gopass --yes recipients add --store jasp " + member.Fingerprint,
+			},
+		},
+		{
+			name:  "add error returned",
+			mount: "jasp",
+			cfg:   sharedConfig("jasp"),
+			handlers: map[string]stubResp{
+				"gopass config mounts.jasp.path": {
+					out: []byte(mountPath + "\n"),
+				},
+				"gopass --yes recipients add --store jasp " + member.Fingerprint: {
+					err: errors.New("reencryption failed"),
+				},
+			},
+			want: "gopass recipients add",
+			wantCalls: []string{
+				"gopass config mounts.jasp.path",
+				"gopass --yes recipients add --store jasp " + member.Fingerprint,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubRunner{handlers: tc.handlers}
+			restore := WithRunner(stub)
+			defer restore()
+
+			err := AddForeign(context.Background(), tc.mount, member.Fingerprint, tc.cfg)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("AddForeign: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+			if strings.Join(stub.calls, "\n") != strings.Join(tc.wantCalls, "\n") {
+				t.Fatalf("calls = %v, want %v", stub.calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func sharedConfig(mount string) *syncpkg.Config {
+	return &syncpkg.Config{
+		Remotes: []syncpkg.StoreRemote{{Mount: mount, Shared: true}},
+	}
+}
+
+func validTeamMember() teamkeys.Member {
+	return teamkeys.Member{
+		Name:        "Alice Example",
+		Email:       "alice@example.org",
+		Fingerprint: "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555",
+	}
+}
+
+func writeTeamManifest(t *testing.T, dir string, members []teamkeys.Member) {
+	t.Helper()
+	if err := teamkeys.Save(
+		filepath.Join(dir, teamkeys.Filename),
+		&teamkeys.File{Version: 1, Members: members},
+	); err != nil {
+		t.Fatalf("write team manifest: %v", err)
 	}
 }
 

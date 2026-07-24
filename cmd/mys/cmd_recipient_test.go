@@ -14,6 +14,8 @@ import (
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
 	"github.com/SaschaHenning/my-secrets/internal/recipient"
+	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
+	"github.com/SaschaHenning/my-secrets/internal/teamkeys"
 	"github.com/spf13/cobra"
 )
 
@@ -49,6 +51,11 @@ fpr:::::::::AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555:
 uid:-::::1705320000::11111111111111111111111111111111::Alice Example \x3calice@example.org\x3e::::::::::0:
 `
 
+const (
+	recipientTestFingerprint = "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555"
+	otherTestFingerprint     = "BBBB1111CCCC2222DDDD3333EEEE4444FFFF5555"
+)
+
 // newTestAuditHome redirects HOME so the audit Log lives in a temp dir and
 // returns the path the Log will be created at.
 func newTestAuditHome(t *testing.T) string {
@@ -68,16 +75,10 @@ func openTestAudit(t *testing.T, dbPath string) *audit.Log {
 	return l
 }
 
-// clearAISignals makes the current process look like a human TTY session for
-// caller.Identify. We cannot flip IsTerminal off, but we can strip the
-// AI-only env flags that would otherwise pin the caller to KindAI.
-func clearAISignals(t *testing.T) {
-	t.Helper()
-	for _, k := range []string{
-		"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION",
-		"CURSOR", "CURSOR_SESSION",
-	} {
-		t.Setenv(k, "")
+func humanRecipientDetail() caller.Detail {
+	return caller.Detail{
+		Kind:   caller.KindHuman,
+		Reason: "test human caller",
 	}
 }
 
@@ -89,6 +90,51 @@ func newTestCmd(stdin, stdout *bytes.Buffer) *cobra.Command {
 	c.SetOut(stdout)
 	c.SetErr(stdout)
 	return c
+}
+
+func saveRecipientSyncConfig(t *testing.T, remotes ...syncpkg.StoreRemote) {
+	t.Helper()
+	cfg, err := syncpkg.Load("")
+	if err != nil {
+		t.Fatalf("load recipient sync config: %v", err)
+	}
+	cfg.Layout = syncpkg.LayoutPerOrg
+	cfg.Remotes = remotes
+	if err := syncpkg.Save("", cfg); err != nil {
+		t.Fatalf("save recipient sync config: %v", err)
+	}
+}
+
+func writeRecipientTeamManifest(
+	t *testing.T,
+	mountPath string,
+	members ...teamkeys.Member,
+) {
+	t.Helper()
+	manifest := &teamkeys.File{Version: 1, Members: members}
+	if err := teamkeys.Save(
+		filepath.Join(mountPath, teamkeys.Filename),
+		manifest,
+	); err != nil {
+		t.Fatalf("save recipient team manifest: %v", err)
+	}
+}
+
+func recipientTeamMember(fingerprint string) teamkeys.Member {
+	return teamkeys.Member{
+		Name:        "Alice Example",
+		Fingerprint: fingerprint,
+		Email:       "alice@example.org",
+	}
+}
+
+func createRecipientKeyFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "recipient.asc")
+	if err := os.WriteFile(path, []byte("pretend-armored"), 0o600); err != nil {
+		t.Fatalf("write recipient key: %v", err)
+	}
+	return path
 }
 
 // TestRecipientAdd_DeniedForAI verifies that AI callers cannot add recipients
@@ -162,18 +208,89 @@ func TestRecipientRemove_DeniedForAI(t *testing.T) {
 	}
 }
 
-// TestRecipientAdd_WithYes drives the happy-path Add flow through runRecipientAdd
-// while pretending to be a human TTY, with the subprocess layer stubbed.
-//
-// Skipped when the surrounding process has an AI parent-chain marker (claude,
-// cursor, ...) we cannot strip — in that case caller.Identify pins the kind
-// to KindAI regardless of --requester, and the AI-denial would trip first.
+func TestRecipientMutations_DeniedForAIByMount(t *testing.T) {
+	tests := []struct {
+		name   string
+		action string
+		mount  string
+		run    func(context.Context, *cobra.Command, string) error
+	}{
+		{
+			name:   "default add",
+			action: audit.ActionRecipientAdd,
+			run: func(ctx context.Context, cmd *cobra.Command, mount string) error {
+				return runRecipientAddForMount(
+					ctx, cmd, "", "must-not-be-imported", mount, true)
+			},
+		},
+		{
+			name:   "shared add",
+			action: audit.ActionRecipientAdd,
+			mount:  "jasp",
+			run: func(ctx context.Context, cmd *cobra.Command, mount string) error {
+				return runRecipientAddForMount(
+					ctx, cmd, "", "must-not-be-imported", mount, true)
+			},
+		},
+		{
+			name:   "default remove",
+			action: audit.ActionRecipientRemove,
+			run: func(ctx context.Context, cmd *cobra.Command, mount string) error {
+				return runRecipientRemoveForMount(
+					ctx, cmd, "", recipientTestFingerprint, mount)
+			},
+		},
+		{
+			name:   "shared remove",
+			action: audit.ActionRecipientRemove,
+			mount:  "jasp",
+			run: func(ctx context.Context, cmd *cobra.Command, mount string) error {
+				return runRecipientRemoveForMount(
+					ctx, cmd, "", recipientTestFingerprint, mount)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := newTestAuditHome(t)
+			t.Setenv("CLAUDECODE", "1")
+
+			stub := &stubRunner{handlers: map[string]stubResp{}}
+			restore := recipient.WithRunner(stub)
+			defer restore()
+
+			cmd := newTestCmd(&bytes.Buffer{}, &bytes.Buffer{})
+			err := tc.run(context.Background(), cmd, tc.mount)
+			if !errors.Is(err, errRecipientAIDenied) {
+				t.Fatalf("error = %v, want errRecipientAIDenied", err)
+			}
+			if len(stub.calls) != 0 {
+				t.Fatalf("AI denial invoked subprocesses: %v", stub.calls)
+			}
+
+			al := openTestAudit(t, dbPath)
+			rows, err := al.Tail(context.Background(), audit.Filter{
+				Action: tc.action,
+				Limit:  5,
+			})
+			if err != nil {
+				t.Fatalf("read audit: %v", err)
+			}
+			if len(rows) != 1 || rows[0].Result != audit.ResultDenied {
+				t.Fatalf("audit rows = %+v, want one denied row", rows)
+			}
+			if rows[0].Org != tc.mount {
+				t.Fatalf("audit org = %q, want %q", rows[0].Org, tc.mount)
+			}
+		})
+	}
+}
+
+// TestRecipientAdd_WithYes drives the default-mount happy path with the
+// subprocess layer stubbed.
 func TestRecipientAdd_WithYes(t *testing.T) {
 	dbPath := newTestAuditHome(t)
-	clearAISignals(t)
-	if caller.Identify("human").Kind == caller.KindAI {
-		t.Skip("parent chain pins this test process as AI — cannot exercise human path")
-	}
 
 	stub := &stubRunner{handlers: map[string]stubResp{
 		"gpg --batch --import ":         {},
@@ -191,7 +308,14 @@ func TestRecipientAdd_WithYes(t *testing.T) {
 
 	var stdout bytes.Buffer
 	cmd := newTestCmd(&bytes.Buffer{}, &stdout)
-	if err := runRecipientAdd(context.Background(), cmd, "human", keyfile, true); err != nil {
+	if err := runRecipientAddForMountAs(
+		context.Background(),
+		cmd,
+		humanRecipientDetail(),
+		keyfile,
+		"",
+		true,
+	); err != nil {
 		t.Fatalf("runRecipientAdd: %v", err)
 	}
 	out := stdout.String()
@@ -200,6 +324,14 @@ func TestRecipientAdd_WithYes(t *testing.T) {
 	}
 	if !strings.Contains(out, "added recipient") {
 		t.Errorf("stdout missing success line: %q", out)
+	}
+	wantCalls := []string{
+		"gpg --batch --import " + keyfile,
+		"gpg --with-colons --show-keys " + keyfile,
+		"gopass recipients add " + recipientTestFingerprint,
+	}
+	if strings.Join(stub.calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("default recipient calls = %v, want %v", stub.calls, wantCalls)
 	}
 	// Assert audit row is OK with fpr in reason.
 	al := openTestAudit(t, dbPath)
@@ -220,15 +352,202 @@ func TestRecipientAdd_WithYes(t *testing.T) {
 	}
 }
 
+func TestRecipientAdd_SharedMountReconcilesTeamManifest(t *testing.T) {
+	tests := []struct {
+		name        string
+		memberFPR   string
+		wantOutput  string
+		wantWarning bool
+	}{
+		{
+			name:       "listed member",
+			memberFPR:  recipientTestFingerprint,
+			wantOutput: "team member: Alice Example <alice@example.org>",
+		},
+		{
+			name:        "manifest may lag new member",
+			memberFPR:   otherTestFingerprint,
+			wantOutput:  "not listed in team-keys.yaml",
+			wantWarning: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := newTestAuditHome(t)
+
+			mountPath := t.TempDir()
+			writeRecipientTeamManifest(t, mountPath, recipientTeamMember(tc.memberFPR))
+			saveRecipientSyncConfig(t, syncpkg.StoreRemote{
+				Mount:  "jasp",
+				URL:    "file:///test/jasp.git",
+				Shared: true,
+			})
+			keyfile := createRecipientKeyFile(t)
+
+			stub := &stubRunner{handlers: map[string]stubResp{
+				"gopass config mounts.jasp.path": {
+					out: []byte(mountPath + "\n"),
+				},
+				"gpg --batch --import " + keyfile: {},
+				"gpg --with-colons --show-keys " + keyfile: {
+					out: []byte(showKeysFixture),
+				},
+				"gopass --yes recipients add --store jasp " + recipientTestFingerprint: {},
+			}}
+			restore := recipient.WithRunner(stub)
+			defer restore()
+
+			var output bytes.Buffer
+			cmd := newTestCmd(&bytes.Buffer{}, &output)
+			err := runRecipientAddForMountAs(
+				context.Background(),
+				cmd,
+				humanRecipientDetail(),
+				keyfile,
+				"jasp",
+				true,
+			)
+			if err != nil {
+				t.Fatalf("run shared recipient add: %v", err)
+			}
+			if !strings.Contains(output.String(), tc.wantOutput) {
+				t.Fatalf("output %q does not contain %q", output.String(), tc.wantOutput)
+			}
+			if !strings.Contains(output.String(), `shared mount "jasp"`) {
+				t.Fatalf("shared warning missing from output: %q", output.String())
+			}
+
+			wantCalls := []string{
+				"gopass config mounts.jasp.path",
+				"gpg --batch --import " + keyfile,
+				"gpg --with-colons --show-keys " + keyfile,
+				"gopass config mounts.jasp.path",
+				"gopass config mounts.jasp.path",
+				"gopass --yes recipients add --store jasp " + recipientTestFingerprint,
+			}
+			if strings.Join(stub.calls, "\n") != strings.Join(wantCalls, "\n") {
+				t.Fatalf("shared recipient calls = %v, want %v", stub.calls, wantCalls)
+			}
+
+			al := openTestAudit(t, dbPath)
+			rows, err := al.Tail(context.Background(), audit.Filter{
+				Action: audit.ActionRecipientAdd,
+				Org:    "jasp",
+				Limit:  5,
+			})
+			if err != nil {
+				t.Fatalf("read shared recipient audit: %v", err)
+			}
+			if len(rows) != 1 || rows[0].Result != audit.ResultOK {
+				t.Fatalf("shared recipient audit rows = %+v", rows)
+			}
+			hasTeamName := strings.Contains(rows[0].Reason, "team_name=Alice Example")
+			if hasTeamName == tc.wantWarning {
+				t.Fatalf("audit reason %q hasTeamName=%v, want %v",
+					rows[0].Reason, hasTeamName, !tc.wantWarning)
+			}
+		})
+	}
+}
+
+func TestRecipientAdd_SharedMountRequiresManifestBeforeImport(t *testing.T) {
+	dbPath := newTestAuditHome(t)
+
+	mountPath := t.TempDir()
+	saveRecipientSyncConfig(t, syncpkg.StoreRemote{
+		Mount:  "jasp",
+		URL:    "file:///test/jasp.git",
+		Shared: true,
+	})
+	stub := &stubRunner{handlers: map[string]stubResp{
+		"gopass config mounts.jasp.path": {out: []byte(mountPath + "\n")},
+	}}
+	restore := recipient.WithRunner(stub)
+	defer restore()
+
+	cmd := newTestCmd(&bytes.Buffer{}, &bytes.Buffer{})
+	err := runRecipientAddForMountAs(
+		context.Background(),
+		cmd,
+		humanRecipientDetail(),
+		"must-not-be-imported",
+		"jasp",
+		true,
+	)
+	if err == nil || !strings.Contains(err.Error(), teamkeys.Filename) {
+		t.Fatalf("error = %v, want missing %s", err, teamkeys.Filename)
+	}
+	if strings.Join(stub.calls, "\n") != "gopass config mounts.jasp.path" {
+		t.Fatalf("calls = %v, key import must not run", stub.calls)
+	}
+
+	al := openTestAudit(t, dbPath)
+	rows, err := al.Tail(context.Background(), audit.Filter{
+		Action: audit.ActionRecipientAdd,
+		Org:    "jasp",
+		Limit:  5,
+	})
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Result != audit.ResultDenied {
+		t.Fatalf("audit rows = %+v, want denied shared add", rows)
+	}
+}
+
+func TestRecipientAdd_NamedPersonalMountKeepsOwnDevicePath(t *testing.T) {
+	newTestAuditHome(t)
+
+	saveRecipientSyncConfig(t, syncpkg.StoreRemote{
+		Mount: "work",
+		URL:   "file:///test/work.git",
+	})
+	keyfile := createRecipientKeyFile(t)
+	stub := &stubRunner{handlers: map[string]stubResp{
+		"gpg --batch --import " + keyfile: {},
+		"gpg --with-colons --show-keys " + keyfile: {
+			out: []byte(showKeysFixture),
+		},
+		"gopass recipients add --store work " + recipientTestFingerprint: {},
+	}}
+	restore := recipient.WithRunner(stub)
+	defer restore()
+
+	var output bytes.Buffer
+	cmd := newTestCmd(&bytes.Buffer{}, &output)
+	err := runRecipientAddForMountAs(
+		context.Background(),
+		cmd,
+		humanRecipientDetail(),
+		keyfile,
+		"work",
+		true,
+	)
+	if err != nil {
+		t.Fatalf("run named personal recipient add: %v", err)
+	}
+	wantCalls := []string{
+		"gpg --batch --import " + keyfile,
+		"gpg --with-colons --show-keys " + keyfile,
+		"gopass recipients add --store work " + recipientTestFingerprint,
+	}
+	if strings.Join(stub.calls, "\n") != strings.Join(wantCalls, "\n") {
+		t.Fatalf("calls = %v, want %v", stub.calls, wantCalls)
+	}
+	if !strings.Contains(output.String(), "your own second device") {
+		t.Fatalf("personal-store warning changed: %q", output.String())
+	}
+	if strings.Contains(output.String(), `shared mount "work"`) {
+		t.Fatalf("personal mount presented as shared: %q", output.String())
+	}
+}
+
 // TestRecipientAdd_NonInteractiveAborts verifies that piping stdin without
 // --yes aborts cleanly (no error to the shell), writes a denied audit row,
 // and prints "aborted".
 func TestRecipientAdd_NonInteractiveAborts(t *testing.T) {
 	dbPath := newTestAuditHome(t)
-	clearAISignals(t)
-	if caller.Identify("human").Kind == caller.KindAI {
-		t.Skip("parent chain pins this test process as AI — cannot exercise human path")
-	}
 
 	stub := &stubRunner{handlers: map[string]stubResp{
 		"gpg --batch --import ":         {},
@@ -245,7 +564,14 @@ func TestRecipientAdd_NonInteractiveAborts(t *testing.T) {
 	// Custom stdin reader (bytes.Buffer) → isTerminalStdin returns false.
 	var stdin, stdout bytes.Buffer
 	cmd := newTestCmd(&stdin, &stdout)
-	err := runRecipientAdd(context.Background(), cmd, "human", keyfile, false /*yes*/)
+	err := runRecipientAddForMountAs(
+		context.Background(),
+		cmd,
+		humanRecipientDetail(),
+		keyfile,
+		"",
+		false, /* yes */
+	)
 	if err != nil {
 		t.Fatalf("expected clean abort, got err: %v", err)
 	}
@@ -288,6 +614,229 @@ func TestRecipientList_AllowsAI(t *testing.T) {
 	}
 	if rows[0].ActorKind != string(caller.KindAI) {
 		t.Errorf("actor_kind = %q, want ai", rows[0].ActorKind)
+	}
+}
+
+func TestRecipientList_AllowsAIForDefaultAndSharedMounts(t *testing.T) {
+	tests := []struct {
+		name  string
+		mount string
+	}{
+		{name: "default"},
+		{name: "shared", mount: "jasp"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := newTestAuditHome(t)
+			t.Setenv("CLAUDECODE", "1")
+
+			handlers := map[string]stubResp{
+				"gopass recipients": {},
+			}
+			wantCall := "gopass recipients"
+			if tc.mount != "" {
+				mountPath := t.TempDir()
+				if err := os.WriteFile(
+					filepath.Join(mountPath, ".gpg-id"),
+					nil,
+					0o600,
+				); err != nil {
+					t.Fatalf("write .gpg-id: %v", err)
+				}
+				wantCall = "gopass config mounts.jasp.path"
+				handlers = map[string]stubResp{
+					wantCall: {out: []byte(mountPath + "\n")},
+				}
+			}
+
+			stub := &stubRunner{handlers: handlers}
+			restore := recipient.WithRunner(stub)
+			defer restore()
+
+			cmd := newTestCmd(&bytes.Buffer{}, &bytes.Buffer{})
+			if err := runRecipientListForMount(
+				context.Background(), cmd, "", tc.mount,
+			); err != nil {
+				t.Fatalf("run recipient list: %v", err)
+			}
+			if len(stub.calls) != 1 || stub.calls[0] != wantCall {
+				t.Fatalf("calls = %v, want [%q]", stub.calls, wantCall)
+			}
+
+			al := openTestAudit(t, dbPath)
+			rows, err := al.Tail(context.Background(), audit.Filter{
+				Action: audit.ActionRecipientList,
+				Limit:  5,
+			})
+			if err != nil {
+				t.Fatalf("read audit: %v", err)
+			}
+			if len(rows) != 1 || rows[0].Result != audit.ResultOK {
+				t.Fatalf("audit rows = %+v, want one ok row", rows)
+			}
+			if rows[0].Org != tc.mount {
+				t.Fatalf("audit org = %q, want %q", rows[0].Org, tc.mount)
+			}
+			if rows[0].ActorKind != string(caller.KindAI) {
+				t.Fatalf("actor kind = %q, want ai", rows[0].ActorKind)
+			}
+		})
+	}
+}
+
+func TestRecipientRemove_TargetsRequestedMount(t *testing.T) {
+	tests := []struct {
+		name      string
+		mount     string
+		shared    bool
+		wantCalls []string
+	}{
+		{
+			name:      "default argv unchanged",
+			wantCalls: []string{"gopass recipients remove " + recipientTestFingerprint},
+		},
+		{
+			name:  "named personal mount",
+			mount: "work",
+			wantCalls: []string{
+				"gopass recipients remove --store work " + recipientTestFingerprint,
+			},
+		},
+		{
+			name:   "shared mount revalidates manifest",
+			mount:  "jasp",
+			shared: true,
+			wantCalls: []string{
+				"gopass config mounts.jasp.path",
+				"gopass config mounts.jasp.path",
+				"gopass recipients remove --store jasp " + recipientTestFingerprint,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := newTestAuditHome(t)
+
+			handlers := map[string]stubResp{}
+			if tc.mount != "" {
+				saveRecipientSyncConfig(t, syncpkg.StoreRemote{
+					Mount:  tc.mount,
+					URL:    "file:///test/" + tc.mount + ".git",
+					Shared: tc.shared,
+				})
+			}
+			if tc.shared {
+				mountPath := t.TempDir()
+				writeRecipientTeamManifest(
+					t, mountPath, recipientTeamMember(recipientTestFingerprint))
+				handlers["gopass config mounts.jasp.path"] = stubResp{
+					out: []byte(mountPath + "\n"),
+				}
+			}
+			handlers[tc.wantCalls[len(tc.wantCalls)-1]] = stubResp{}
+
+			stub := &stubRunner{handlers: handlers}
+			restore := recipient.WithRunner(stub)
+			defer restore()
+
+			var output bytes.Buffer
+			cmd := newTestCmd(&bytes.Buffer{}, &output)
+			err := runRecipientRemoveForMountAs(
+				context.Background(),
+				cmd,
+				humanRecipientDetail(),
+				recipientTestFingerprint,
+				tc.mount,
+			)
+			if err != nil {
+				t.Fatalf("run recipient remove: %v", err)
+			}
+			if strings.Join(stub.calls, "\n") != strings.Join(tc.wantCalls, "\n") {
+				t.Fatalf("calls = %v, want %v", stub.calls, tc.wantCalls)
+			}
+			if !strings.Contains(output.String(), "removed recipient") {
+				t.Fatalf("success output missing: %q", output.String())
+			}
+
+			al := openTestAudit(t, dbPath)
+			rows, err := al.Tail(context.Background(), audit.Filter{
+				Action: audit.ActionRecipientRemove,
+				Limit:  5,
+			})
+			if err != nil {
+				t.Fatalf("read audit: %v", err)
+			}
+			if len(rows) != 1 || rows[0].Result != audit.ResultOK {
+				t.Fatalf("audit rows = %+v, want one ok row", rows)
+			}
+			if rows[0].Org != tc.mount {
+				t.Fatalf("audit org = %q, want %q", rows[0].Org, tc.mount)
+			}
+		})
+	}
+}
+
+func TestMutateRecipientTargetRejectsSharingModeChange(t *testing.T) {
+	newTestAuditHome(t)
+	saveRecipientSyncConfig(t, syncpkg.StoreRemote{
+		Mount: "work",
+		URL:   "file:///test/work.git",
+	})
+	original, err := loadRecipientMountTarget("work")
+	if err != nil {
+		t.Fatalf("load original target: %v", err)
+	}
+
+	saveRecipientSyncConfig(t, syncpkg.StoreRemote{
+		Mount:  "work",
+		URL:    "file:///test/work.git",
+		Shared: true,
+	})
+	mutated := false
+	err = mutateRecipientTarget(
+		context.Background(),
+		original,
+		func(recipientMountTarget) error {
+			mutated = true
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "sharing mode changed") {
+		t.Fatalf("error = %v, want sharing-mode change", err)
+	}
+	if mutated {
+		t.Fatal("mutation ran after sharing mode changed")
+	}
+}
+
+func TestRecipientCommandsExposeMountFlagAndScopeHelp(t *testing.T) {
+	requester := "human"
+	root := recipientCmd(&requester)
+	for _, name := range []string{"add", "list", "remove"} {
+		cmd, _, err := root.Find([]string{name})
+		if err != nil {
+			t.Fatalf("find %s command: %v", name, err)
+		}
+		flag := cmd.Flags().Lookup("mount")
+		if flag == nil {
+			t.Fatalf("%s command has no --mount flag", name)
+		}
+		if flag.DefValue != "" {
+			t.Fatalf("%s --mount default = %q, want empty", name, flag.DefValue)
+		}
+	}
+	for _, required := range []string{
+		"DEFAULT STORE SCOPE",
+		"ONLY",
+		"SHARED MOUNT SCOPE",
+		"team-keys.yaml",
+		"AI callers",
+	} {
+		if !strings.Contains(root.Long, required) {
+			t.Fatalf("recipient help is missing %q: %s", required, root.Long)
+		}
 	}
 }
 

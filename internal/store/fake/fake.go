@@ -33,6 +33,10 @@ type Store struct {
 	ListErr   error
 	SearchErr error
 	GetErr    error
+	// GetErrors targets decrypt failures to individual paths. SearchObserved
+	// uses the same Get path as callers, so a later metadata decrypt can fail
+	// after earlier entries were observed without relying on call ordering.
+	GetErrors map[string]error
 	SetErr    error
 	RemoveErr error
 	OrgsErr   error
@@ -111,27 +115,51 @@ func (s *Store) List(_ context.Context, org string) ([]string, error) {
 // paths never participate in a "decrypt" step in the real store, so the
 // fake simply surfaces them separately for assertion. When allow is nil,
 // all matches go into allowed and denied stays empty.
-func (s *Store) Search(_ context.Context, query string, allow func(path string) bool) (allowed, denied []string, err error) {
+func (s *Store) Search(ctx context.Context, query string, allow func(path string) bool) (allowed, denied []string, err error) {
+	return s.SearchObserved(ctx, query, allow, nil)
+}
+
+// SearchObserved mirrors the real store: an allowed path match needs no
+// decryption, while every other allowed candidate is decrypted once before
+// its metadata can be tested. The observer sees only those decryptions.
+func (s *Store) SearchObserved(
+	ctx context.Context,
+	query string,
+	allow func(path string) bool,
+	observer store.SearchObserver,
+) (allowed, denied []string, err error) {
 	if s.SearchErr != nil {
 		return nil, nil, s.SearchErr
 	}
 	if strings.TrimSpace(query) == "" {
 		return nil, nil, nil
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	paths, err := s.List(ctx, "")
+	if err != nil {
+		return nil, nil, err
+	}
 	q := strings.ToLower(query)
 	allowed = make([]string, 0)
 	denied = make([]string, 0)
-	for p, e := range s.entries {
-		if !entryMatches(p, e, q) {
-			continue
-		}
+	for _, p := range paths {
 		if allow != nil && !allow(p) {
 			denied = append(denied, p)
 			continue
 		}
-		allowed = append(allowed, p)
+		if strings.Contains(strings.ToLower(p), q) {
+			allowed = append(allowed, p)
+			continue
+		}
+		e, getErr := s.Get(ctx, p)
+		if getErr != nil {
+			return nil, nil, getErr
+		}
+		if observer != nil {
+			observer(p)
+		}
+		if entryMetadataMatches(e, q) {
+			allowed = append(allowed, p)
+		}
 	}
 	sort.Strings(allowed)
 	sort.Strings(denied)
@@ -147,6 +175,10 @@ func entryMatches(path string, e *store.Entry, q string) bool {
 	if strings.Contains(strings.ToLower(path), q) {
 		return true
 	}
+	return entryMetadataMatches(e, q)
+}
+
+func entryMetadataMatches(e *store.Entry, q string) bool {
 	if e == nil {
 		return false
 	}
@@ -202,6 +234,9 @@ func (s *Store) Get(ctx context.Context, path string) (*store.Entry, error) {
 	if s.GetErr != nil {
 		return nil, s.GetErr
 	}
+	if err := s.getError(path); err != nil {
+		return nil, err
+	}
 	// Honour an already-cancelled context, same as the real gopass store
 	// (its GPG decrypt fails with a context error). Without this the fake
 	// would happily "decrypt" under a dead context, hiding the exact
@@ -224,6 +259,15 @@ func (s *Store) Get(ctx context.Context, path string) (*store.Entry, error) {
 		return nil, fmt.Errorf("fake: entry %q not found", path)
 	}
 	return cloneEntry(e), nil
+}
+
+func (s *Store) getError(path string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.GetErrors == nil {
+		return nil
+	}
+	return s.GetErrors[path]
 }
 
 func (s *Store) Set(_ context.Context, e *store.Entry) error {

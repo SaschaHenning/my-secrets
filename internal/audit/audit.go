@@ -61,9 +61,10 @@ const (
 
 // Results recorded against each action.
 const (
-	ResultOK     = "ok"
-	ResultDenied = "denied"
-	ResultError  = "error"
+	ResultOK      = "ok"
+	ResultDenied  = "denied"
+	ResultError   = "error"
+	ResultStarted = "started"
 )
 
 // Actor kinds recorded with each entry.

@@ -3,11 +3,12 @@
 // remotes to a YAML state file under ~/.config/my-secrets/sync.yaml and
 // provides helpers to run `gopass sync`/`gopass git pull` as subprocesses.
 //
-// SCOPE ANCHOR: my-secrets is a personal credential manager. Git sync is
-// intended to keep a single user's secrets redundant across their own
-// devices. It is NOT a sharing mechanism for teams — gopass cannot
-// distinguish between humans who share a GPG key. For team credentials,
-// use Bitwarden or a hosted vault with per-user identity.
+// By default, sync keeps a single user's personal secrets redundant
+// across their own devices. A remote explicitly marked Shared is the
+// narrow exception: every team member keeps a distinct GPG key and the
+// mount's team-keys.yaml records the fingerprint-to-person mapping.
+// Local decryption can still bypass client-side audit, so shared mounts
+// provide advisory accountability rather than an enforceable read log.
 //
 // The `gopass` and `gh` binaries are invoked as subprocesses in this
 // package. This is an explicit, documented exception to the project's
@@ -17,13 +18,18 @@
 package sync
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -31,6 +37,8 @@ import (
 // DefaultStoreMount is the logical name of the primary (root) gopass
 // store when the user chose the single-repo layout.
 const DefaultStoreMount = "root"
+
+const maxSyncConfigBytes = 1 << 20
 
 // Layout describes how the user's secrets are split across remotes.
 type Layout string
@@ -55,15 +63,37 @@ type StoreRemote struct {
 	// LastSync records the last successful push/pull timestamp. Zero
 	// value means „never synced".
 	LastSync time.Time `yaml:"last_sync,omitempty"`
+	// Shared marks a mount whose recipients are distinct team-member
+	// keys described by team-keys.yaml in that mount's repository.
+	// The default/root store is never allowed to be shared.
+	Shared bool `yaml:"shared,omitempty"`
+	// TeamAudit configures the separate signed read-audit repository for
+	// this shared mount. It is invalid on personal or root stores.
+	TeamAudit *TeamAuditConfig `yaml:"team_audit,omitempty"`
+}
+
+// TeamAuditConfig identifies a shared mount's separate audit repository
+// and the primary OpenPGP fingerprint authorized to sign local events.
+type TeamAuditConfig struct {
+	URL                string `yaml:"url"`
+	SigningFingerprint string `yaml:"signing_fingerprint"`
 }
 
 // Config is the persisted sync state.
 type Config struct {
-	Version int           `yaml:"version"`
-	Layout  Layout        `yaml:"layout"`
-	Owner   string        `yaml:"owner,omitempty"` // GitHub login used when the repos were created
-	Remotes []StoreRemote `yaml:"remotes"`
+	Version int `yaml:"version"`
+	// Revision is an optimistic concurrency token managed by Load and
+	// Save. Legacy files omit it and therefore start at revision zero.
+	Revision uint64        `yaml:"revision,omitempty"`
+	Layout   Layout        `yaml:"layout"`
+	Owner    string        `yaml:"owner,omitempty"` // GitHub login used when the repos were created
+	Remotes  []StoreRemote `yaml:"remotes"`
 }
+
+// ErrConfigConflict means sync.yaml changed after the caller loaded it.
+// The stale write is rejected so it cannot overwrite a newer LastSync,
+// shared marker, remote, or owner/layout change.
+var ErrConfigConflict = errors.New("sync config changed concurrently")
 
 // DefaultPath returns the usual sync-state path:
 // ~/.config/my-secrets/sync.yaml.
@@ -78,39 +108,129 @@ func DefaultPath() (string, error) {
 // Load reads the state file. Returns an empty config and no error if the
 // file does not exist — a missing file simply means „sync not set up yet".
 func Load(path string) (*Config, error) {
-	if path == "" {
-		var err error
-		path, err = DefaultPath()
-		if err != nil {
-			return nil, err
-		}
+	var err error
+	path, err = resolveConfigPath(path)
+	if err != nil {
+		return nil, err
 	}
-	b, err := os.ReadFile(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &Config{Version: 1}, nil
 		}
+		return nil, fmt.Errorf("inspect sync config: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, errors.New("read sync config: config must be a regular file")
+	}
+	if info.Size() > maxSyncConfigBytes {
+		return nil, errors.New("read sync config: config is too large")
+	}
+	file, err := os.Open(path)
+	if err != nil {
 		return nil, fmt.Errorf("read sync config: %w", err)
 	}
+	openedInfo, statErr := file.Stat()
+	if statErr != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("inspect opened sync config: %w", statErr)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		_ = file.Close()
+		return nil, errors.New("read sync config: config must be a stable regular file")
+	}
+	b, readErr := io.ReadAll(io.LimitReader(file, maxSyncConfigBytes+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read sync config: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close sync config: %w", closeErr)
+	}
+	if len(b) > maxSyncConfigBytes {
+		return nil, errors.New("read sync config: config is too large")
+	}
+
 	var c Config
-	if err := yaml.Unmarshal(b, &c); err != nil {
-		return nil, fmt.Errorf("parse sync config: %w", err)
+	decoder := yaml.NewDecoder(bytes.NewReader(b))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&c); err != nil {
+		return nil, errors.New("parse sync config: invalid YAML syntax or schema")
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, errors.New(
+			"parse sync config: exactly one YAML document is required")
 	}
 	if c.Version == 0 {
 		c.Version = 1
 	}
+	if err := c.Validate(); err != nil {
+		return nil, fmt.Errorf("validate sync config: %w", err)
+	}
 	return &c, nil
 }
 
-// Save writes the state file with 0o600 permissions. Creates the parent
-// directory with 0o700 if needed.
+// Save atomically writes the state file with 0o600 permissions. It uses
+// Config.Revision as a compare-and-swap token under the config lock, so
+// a caller that loaded stale state fails with ErrConfigConflict instead
+// of overwriting a newer writer. Creates the parent directory with
+// 0o700 if needed.
 func Save(path string, c *Config) error {
-	if path == "" {
-		var err error
-		path, err = DefaultPath()
-		if err != nil {
-			return err
-		}
+	if c == nil {
+		return fmt.Errorf("save sync config: nil config")
+	}
+	var err error
+	path, err = resolveConfigPath(path)
+	if err != nil {
+		return err
+	}
+	release, err := acquireConfigLock(context.Background(), path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(saveConfigCASLocked(path, c), release())
+}
+
+func resolveConfigPath(path string) (string, error) {
+	if path != "" {
+		return path, nil
+	}
+	return DefaultPath()
+}
+
+func saveConfigCASLocked(path string, c *Config) error {
+	current, err := Load(path)
+	if err != nil {
+		return err
+	}
+	if current.Revision != c.Revision {
+		return fmt.Errorf(
+			"%w: expected revision %d, found %d",
+			ErrConfigConflict, c.Revision, current.Revision,
+		)
+	}
+	return saveConfigNextRevisionLocked(path, c)
+}
+
+func saveConfigNextRevisionLocked(path string, c *Config) error {
+	if c.Revision == ^uint64(0) {
+		return fmt.Errorf("save sync config: revision exhausted")
+	}
+	candidate := *c
+	candidate.Remotes = cloneStoreRemotes(c.Remotes)
+	candidate.Revision++
+	if err := saveConfigFile(path, &candidate); err != nil {
+		return err
+	}
+	c.Version = candidate.Version
+	c.Revision = candidate.Revision
+	return nil
+}
+
+func saveConfigFile(path string, c *Config) error {
+	if c == nil {
+		return fmt.Errorf("save sync config: nil config")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("mkdir sync config dir: %w", err)
@@ -118,14 +238,197 @@ func Save(path string, c *Config) error {
 	if c.Version == 0 {
 		c.Version = 1
 	}
+	if err := c.Validate(); err != nil {
+		return fmt.Errorf("validate sync config: %w", err)
+	}
 	b, err := yaml.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("marshal sync config: %w", err)
 	}
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		return fmt.Errorf("write sync config: %w", err)
+	if len(b) > maxSyncConfigBytes {
+		return errors.New("marshal sync config: config is too large")
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".sync-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create sync config temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod sync config temp file: %w", err)
+	}
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write sync config temp file: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync sync config temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close sync config temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace sync config: %w", err)
 	}
 	return nil
+}
+
+// MarkSharedSyncedAndSave reloads sync.yaml while holding its exclusive
+// writer lock, updates only LastSync for mount, and atomically saves the
+// merged configuration. The mount must still be explicitly shared in
+// the freshly loaded file.
+func MarkSharedSyncedAndSave(
+	ctx context.Context,
+	path string,
+	mount string,
+	at time.Time,
+) (*Config, error) {
+	if err := ValidateSharedMountName(mount); err != nil {
+		return nil, err
+	}
+	resolvedPath, err := resolveConfigPath(path)
+	if err != nil {
+		return nil, err
+	}
+	release, err := acquireConfigLock(ctx, resolvedPath)
+	if err != nil {
+		return nil, err
+	}
+	current, updateErr := Load(resolvedPath)
+	if updateErr == nil && !current.IsSharedMount(mount) {
+		updateErr = fmt.Errorf(
+			"mount %q is no longer configured as shared", mount)
+	}
+	if updateErr == nil {
+		current.MarkSynced(mount, at)
+		updateErr = saveConfigNextRevisionLocked(resolvedPath, current)
+	}
+	if err := errors.Join(updateErr, release()); err != nil {
+		return nil, err
+	}
+	return current, nil
+}
+
+// UpdateSharedTeamAuditAndSave reloads sync.yaml under its exclusive
+// writer lock, updates only the target shared mount's audit settings,
+// and saves a new revision without overwriting concurrent config edits.
+func UpdateSharedTeamAuditAndSave(
+	ctx context.Context,
+	path string,
+	mount string,
+	audit TeamAuditConfig,
+) (*Config, error) {
+	if err := ValidateSharedMountName(mount); err != nil {
+		return nil, err
+	}
+	normalizedAudit, err := normalizeTeamAuditConfig(audit)
+	if err != nil {
+		return nil, err
+	}
+	resolvedPath, err := resolveConfigPath(path)
+	if err != nil {
+		return nil, err
+	}
+	release, err := acquireConfigLock(ctx, resolvedPath)
+	if err != nil {
+		return nil, err
+	}
+	current, updateErr := Load(resolvedPath)
+	if updateErr == nil {
+		updateErr = setSharedTeamAudit(current, mount, normalizedAudit)
+	}
+	if updateErr == nil {
+		updateErr = saveConfigNextRevisionLocked(resolvedPath, current)
+	}
+	if err := errors.Join(updateErr, release()); err != nil {
+		return nil, err
+	}
+	return current, nil
+}
+
+func setSharedTeamAudit(
+	config *Config,
+	mount string,
+	audit TeamAuditConfig,
+) error {
+	for i := range config.Remotes {
+		if config.Remotes[i].Mount != mount {
+			continue
+		}
+		if !config.Remotes[i].Shared {
+			return fmt.Errorf("mount %q is not configured as shared", mount)
+		}
+		config.Remotes[i].TeamAudit = cloneTeamAuditConfig(&audit)
+		return config.Validate()
+	}
+	return fmt.Errorf("shared mount %q is not configured", mount)
+}
+
+// Validate checks invariants that security-sensitive shared-mount
+// decisions rely on. In particular, duplicate mount entries are rejected
+// rather than letting list order decide whether a mount is shared.
+func (c *Config) Validate() error {
+	if c == nil {
+		return errors.New("nil config")
+	}
+	seen := make(map[string]struct{}, len(c.Remotes))
+	for i, remote := range c.Remotes {
+		mount := strings.TrimSpace(remote.Mount)
+		if mount == "" {
+			return fmt.Errorf("remote %d has an empty mount", i)
+		}
+		if mount != remote.Mount {
+			return fmt.Errorf("remote %d mount %q contains surrounding whitespace", i, remote.Mount)
+		}
+		if _, ok := seen[mount]; ok {
+			return fmt.Errorf("duplicate mount %q", mount)
+		}
+		seen[mount] = struct{}{}
+		if remote.Shared {
+			if err := ValidateSharedMountName(mount); err != nil {
+				return fmt.Errorf("remote %d: %w", i, err)
+			}
+		}
+		if remote.TeamAudit != nil {
+			if !remote.Shared {
+				return fmt.Errorf(
+					"remote %d: team audit requires a shared mount", i)
+			}
+			if err := validateTeamAuditConfig(
+				*remote.TeamAudit, remote.URL,
+			); err != nil {
+				return fmt.Errorf("remote %d: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
+// Remote returns the uniquely configured remote for mount.
+func (c *Config) Remote(mount string) (StoreRemote, bool) {
+	if c == nil || c.Validate() != nil {
+		return StoreRemote{}, false
+	}
+	mount = strings.TrimSpace(mount)
+	for _, remote := range c.Remotes {
+		if remote.Mount == mount {
+			return cloneStoreRemote(remote), true
+		}
+	}
+	return StoreRemote{}, false
+}
+
+// IsSharedMount reports whether mount is explicitly and unambiguously
+// configured as shared. Root and invalid configs always fail closed.
+func (c *Config) IsSharedMount(mount string) bool {
+	mount = strings.TrimSpace(mount)
+	if mount == "" || mount == DefaultStoreMount {
+		return false
+	}
+	remote, ok := c.Remote(mount)
+	return ok && remote.Shared
 }
 
 // RemoteStyle picks the URL flavour the wizard should emit.
@@ -224,6 +527,333 @@ func (c *Config) UpdateRemote(mount, url string) {
 	c.Remotes = append(c.Remotes, StoreRemote{Mount: mount, URL: url})
 }
 
+// UpdateSharedRemote replaces (or appends) the remote entry for a shared
+// non-root mount while preserving its LastSync timestamp.
+func (c *Config) UpdateSharedRemote(mount, url string) error {
+	if err := ValidateSharedMountName(mount); err != nil {
+		return err
+	}
+	for i := range c.Remotes {
+		if c.Remotes[i].Mount == mount {
+			if !c.Remotes[i].Shared {
+				return fmt.Errorf("mount %q is already configured as personal", mount)
+			}
+			c.Remotes[i].URL = url
+			c.Remotes[i].Shared = true
+			return nil
+		}
+	}
+	c.Remotes = append(c.Remotes, StoreRemote{Mount: mount, URL: url, Shared: true})
+	return nil
+}
+
+// MergeSharedFrom retains shared remotes when a personal sync wizard
+// rebuilds the personal portion of the configuration.
+func (c *Config) MergeSharedFrom(previous *Config) error {
+	if c == nil || previous == nil {
+		return nil
+	}
+	if err := previous.Validate(); err != nil {
+		return err
+	}
+	for _, remote := range previous.Remotes {
+		if !remote.Shared {
+			continue
+		}
+		if existing, ok := c.Remote(remote.Mount); ok {
+			if !existing.Shared || existing.URL != remote.URL {
+				return fmt.Errorf("shared mount %q conflicts with wizard result", remote.Mount)
+			}
+			for i := range c.Remotes {
+				if c.Remotes[i].Mount == remote.Mount {
+					c.Remotes[i] = cloneStoreRemote(remote)
+					break
+				}
+			}
+			continue
+		}
+		c.Remotes = append(c.Remotes, cloneStoreRemote(remote))
+	}
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	// The wizard reconstructs the personal portion from scratch. Carry
+	// forward the revision from the state it was based on so Save can
+	// detect another writer that completed while the wizard was open.
+	c.Revision = previous.Revision
+	return nil
+}
+
+// NormalizeTeamAuditFingerprint validates a 40-hex OpenPGP primary
+// fingerprint and returns its canonical uppercase representation.
+func NormalizeTeamAuditFingerprint(fingerprint string) (string, error) {
+	normalized := strings.ToUpper(strings.TrimSpace(fingerprint))
+	if len(normalized) != 40 {
+		return "", errors.New("invalid team audit signing fingerprint")
+	}
+	for _, char := range normalized {
+		if !((char >= '0' && char <= '9') ||
+			(char >= 'A' && char <= 'F')) {
+			return "", errors.New("invalid team audit signing fingerprint")
+		}
+	}
+	return normalized, nil
+}
+
+func normalizeTeamAuditConfig(audit TeamAuditConfig) (TeamAuditConfig, error) {
+	if err := validateTeamAuditRemoteURL(audit.URL); err != nil {
+		return TeamAuditConfig{}, err
+	}
+	fingerprint, err := NormalizeTeamAuditFingerprint(
+		audit.SigningFingerprint)
+	if err != nil {
+		return TeamAuditConfig{}, err
+	}
+	audit.SigningFingerprint = fingerprint
+	return audit, nil
+}
+
+func validateTeamAuditConfig(audit TeamAuditConfig, storeURL string) error {
+	normalized, err := normalizeTeamAuditConfig(audit)
+	if err != nil {
+		return err
+	}
+	if normalized.SigningFingerprint != audit.SigningFingerprint {
+		return errors.New(
+			"team audit signing fingerprint must use canonical uppercase")
+	}
+	if sameGitRemote(audit.URL, storeURL) {
+		return errors.New("team audit remote must differ from store remote")
+	}
+	return nil
+}
+
+func validateTeamAuditRemoteURL(remoteURL string) error {
+	invalid := func() error {
+		return errors.New("invalid team audit remote URL")
+	}
+	if remoteURL == "" || strings.TrimSpace(remoteURL) != remoteURL ||
+		strings.HasPrefix(remoteURL, "-") ||
+		strings.ContainsAny(remoteURL, "?#%") ||
+		strings.IndexFunc(remoteURL, func(char rune) bool {
+			return unicode.IsControl(char) || unicode.IsSpace(char)
+		}) >= 0 {
+		return invalid()
+	}
+	if filepath.IsAbs(remoteURL) {
+		if filepath.Clean(remoteURL) != remoteURL ||
+			remoteURL == string(filepath.Separator) {
+			return invalid()
+		}
+		return nil
+	}
+	if strings.HasPrefix(remoteURL, "git@") {
+		hostPath := strings.TrimPrefix(remoteURL, "git@")
+		host, remotePath, ok := strings.Cut(hostPath, ":")
+		if !ok || !validTeamAuditHost(host) ||
+			!validTeamAuditRemotePath(remotePath) {
+			return invalid()
+		}
+		return nil
+	}
+
+	parsed, err := url.Parse(remoteURL)
+	if err != nil || parsed.Opaque != "" || parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return invalid()
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "file":
+		localPath := filepath.FromSlash(parsed.Path)
+		if parsed.Host != "" || parsed.User != nil ||
+			!filepath.IsAbs(localPath) ||
+			filepath.Clean(localPath) != localPath ||
+			localPath == string(filepath.Separator) {
+			return invalid()
+		}
+	case "https":
+		if parsed.Hostname() == "" || parsed.User != nil ||
+			!validTeamAuditHost(parsed.Hostname()) ||
+			!validTeamAuditRemotePath(parsed.Path) {
+			return invalid()
+		}
+	case "ssh":
+		if parsed.Hostname() == "" ||
+			!validTeamAuditHost(parsed.Hostname()) ||
+			!validTeamAuditRemotePath(parsed.Path) {
+			return invalid()
+		}
+		if parsed.User != nil {
+			if !validTeamAuditUsername(parsed.User.Username()) {
+				return invalid()
+			}
+			if _, hasPassword := parsed.User.Password(); hasPassword {
+				return invalid()
+			}
+		}
+	default:
+		return invalid()
+	}
+	return nil
+}
+
+func validTeamAuditHost(host string) bool {
+	segments := strings.Split(host, ".")
+	if len(segments) == 0 {
+		return false
+	}
+	for _, segment := range segments {
+		if segment == "" || strings.HasPrefix(segment, "-") ||
+			strings.HasSuffix(segment, "-") {
+			return false
+		}
+		for _, char := range segment {
+			if !((char >= 'a' && char <= 'z') ||
+				(char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') ||
+				char == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validTeamAuditUsername(username string) bool {
+	if username == "" {
+		return false
+	}
+	for _, char := range username {
+		if !((char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '.' || char == '_' || char == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func validTeamAuditRemotePath(remotePath string) bool {
+	trimmed := strings.TrimPrefix(remotePath, "/")
+	if trimmed == "" || strings.HasSuffix(remotePath, "/") ||
+		strings.Contains(trimmed, "//") ||
+		strings.HasPrefix(trimmed, "-") {
+		return false
+	}
+	for _, segment := range strings.Split(trimmed, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+		for _, char := range segment {
+			if !((char >= 'a' && char <= 'z') ||
+				(char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') ||
+				char == '.' || char == '_' || char == '-' ||
+				char == '~') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sameGitRemote(first string, second string) bool {
+	if first == second {
+		return true
+	}
+	firstIdentity, firstOK := gitRemoteIdentity(first)
+	secondIdentity, secondOK := gitRemoteIdentity(second)
+	return firstOK && secondOK && firstIdentity == secondIdentity
+}
+
+func gitRemoteIdentity(remoteURL string) (string, bool) {
+	if filepath.IsAbs(remoteURL) {
+		return "local:" + filepath.Clean(remoteURL), true
+	}
+	if strings.HasPrefix(remoteURL, "git@") {
+		hostPath := strings.TrimPrefix(remoteURL, "git@")
+		host, remotePath, ok := strings.Cut(hostPath, ":")
+		if !ok || host == "" || remotePath == "" {
+			return "", false
+		}
+		return networkGitRemoteIdentity(host, remotePath), true
+	}
+	parsed, err := url.Parse(remoteURL)
+	if err != nil {
+		return "", false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "file":
+		if parsed.Host != "" ||
+			!filepath.IsAbs(filepath.FromSlash(parsed.Path)) {
+			return "", false
+		}
+		return "local:" +
+			filepath.Clean(filepath.FromSlash(parsed.Path)), true
+	case "https", "ssh":
+		if parsed.Hostname() == "" || parsed.Path == "" {
+			return "", false
+		}
+		return networkGitRemoteIdentity(
+			parsed.Hostname(), parsed.Path,
+		), true
+	default:
+		return "", false
+	}
+}
+
+func networkGitRemoteIdentity(host string, remotePath string) string {
+	repository := strings.Trim(strings.TrimSpace(remotePath), "/")
+	repository = strings.TrimSuffix(repository, ".git")
+	return "network:" + strings.ToLower(host) + "/" + repository
+}
+
+func cloneTeamAuditConfig(config *TeamAuditConfig) *TeamAuditConfig {
+	if config == nil {
+		return nil
+	}
+	clone := *config
+	return &clone
+}
+
+func cloneStoreRemote(remote StoreRemote) StoreRemote {
+	remote.TeamAudit = cloneTeamAuditConfig(remote.TeamAudit)
+	return remote
+}
+
+func cloneStoreRemotes(remotes []StoreRemote) []StoreRemote {
+	clones := make([]StoreRemote, len(remotes))
+	for i := range remotes {
+		clones[i] = cloneStoreRemote(remotes[i])
+	}
+	return clones
+}
+
+// ValidateSharedMountName rejects aliases that could address the default
+// store or escape the top-level path segment used for an org mount.
+func ValidateSharedMountName(mount string) error {
+	if mount == "" || strings.TrimSpace(mount) != mount {
+		return fmt.Errorf("shared mount name is empty or padded")
+	}
+	if mount == DefaultStoreMount {
+		return fmt.Errorf("mount %q cannot be shared", DefaultStoreMount)
+	}
+	if len(mount) > 64 {
+		return fmt.Errorf("shared mount name is too long")
+	}
+	for i, r := range mount {
+		valid := r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			(i > 0 && (r == '-' || r == '_' || r == '.'))
+		if !valid {
+			return fmt.Errorf("shared mount %q contains invalid character %q", mount, r)
+		}
+	}
+	return nil
+}
+
 // MarkSynced stamps LastSync=now on the remote for the given mount.
 // No-op if the mount is unknown.
 func (c *Config) MarkSynced(mount string, at time.Time) {
@@ -281,7 +911,11 @@ func PushAll(ctx context.Context, r Runner) error {
 	if len(cfg.Remotes) == 0 {
 		return nil
 	}
-	for _, rem := range cfg.Remotes {
+	return pushRemotes(ctx, r, cfg.Remotes)
+}
+
+func pushRemotes(ctx context.Context, r Runner, remotes []StoreRemote) error {
+	for _, rem := range remotes {
 		if _, err := GopassSync(ctx, r, rem.Mount); err != nil {
 			return fmt.Errorf("sync %s: %w", rem.Mount, err)
 		}
@@ -334,7 +968,16 @@ func AutoSync(ctx context.Context, r Runner, trigger string) (skipped bool, err 
 	if cfg == nil || len(cfg.Remotes) == 0 {
 		return true, nil
 	}
-	if err := PushAll(ctx, r); err != nil {
+	personal := make([]StoreRemote, 0, len(cfg.Remotes))
+	for _, remote := range cfg.Remotes {
+		if !remote.Shared {
+			personal = append(personal, remote)
+		}
+	}
+	if len(personal) == 0 {
+		return true, nil
+	}
+	if err := pushRemotes(ctx, r, personal); err != nil {
 		return false, err
 	}
 	return false, nil
@@ -455,6 +1098,96 @@ func GopassRecipientsAdd(ctx context.Context, r Runner, mount, fingerprint strin
 	return r.Run(ctx, "gopass", args...)
 }
 
+// GopassRecipientsRemove runs
+// `gopass recipients remove --store <mount> <fpr>`.
+func GopassRecipientsRemove(ctx context.Context, r Runner, mount, fingerprint string) ([]byte, error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	args := []string{"recipients", "remove"}
+	if mount != "" && mount != DefaultStoreMount {
+		args = append(args, "--store", mount)
+	}
+	args = append(args, fingerprint)
+	return r.Run(ctx, "gopass", args...)
+}
+
+// GopassRecipientsAddConfirmed is the non-interactive counterpart used
+// only after mys has already obtained explicit human confirmation.
+// gopass's --yes is a global flag and must precede the subcommand.
+func GopassRecipientsAddConfirmed(ctx context.Context, r Runner, mount, fingerprint string) ([]byte, error) {
+	return gopassRecipientsConfirmed(ctx, r, "add", mount, fingerprint)
+}
+
+// GopassRecipientsRemoveConfirmed is the non-interactive counterpart
+// used by an already-confirmed exact-set reconciliation.
+func GopassRecipientsRemoveConfirmed(ctx context.Context, r Runner, mount, fingerprint string) ([]byte, error) {
+	return gopassRecipientsConfirmed(ctx, r, "remove", mount, fingerprint)
+}
+
+func gopassRecipientsConfirmed(ctx context.Context, r Runner, action, mount, fingerprint string) ([]byte, error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	args := []string{"--yes", "recipients", action}
+	if mount != "" && mount != DefaultStoreMount {
+		args = append(args, "--store", mount)
+	}
+	args = append(args, fingerprint)
+	return r.Run(ctx, "gopass", args...)
+}
+
+// GopassMountPath resolves the live on-disk path reported by gopass for
+// mount. The configured path must be a real directory, not a symlink.
+// Callers use this instead of trusting a stale path in sync.yaml.
+func GopassMountPath(ctx context.Context, r Runner, mount string) (string, error) {
+	configured, err := gopassConfiguredMountPath(ctx, r, mount)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(configured)
+	if err != nil {
+		return "", fmt.Errorf("stat gopass mount %q: %w", mountLabel(mount), err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("gopass mount %q path must not be a symlink", mountLabel(mount))
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("gopass mount %q path is not a directory", mountLabel(mount))
+	}
+	resolved, err := filepath.EvalSymlinks(configured)
+	if err != nil {
+		return "", fmt.Errorf("resolve gopass mount %q path: %w", mountLabel(mount), err)
+	}
+	return filepath.Abs(resolved)
+}
+
+func gopassConfiguredMountPath(ctx context.Context, r Runner, mount string) (string, error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	key := "mounts.path"
+	if mount != "" && mount != DefaultStoreMount {
+		key = "mounts." + mount + ".path"
+	}
+	out, err := r.Run(ctx, "gopass", "config", key)
+	if err != nil {
+		return "", fmt.Errorf("read gopass mount %q path: %w", mountLabel(mount), err)
+	}
+	configured := strings.TrimSpace(string(out))
+	if configured == "" {
+		return "", fmt.Errorf("gopass mount %q has no configured path", mountLabel(mount))
+	}
+	return filepath.Abs(configured)
+}
+
+func mountLabel(mount string) string {
+	if mount == "" {
+		return DefaultStoreMount
+	}
+	return mount
+}
+
 // GopassGitRemoteAdd runs `gopass git remote add <name> <url>` on the
 // given mount.
 //
@@ -541,7 +1274,7 @@ func ReconcileWithRemote(ctx context.Context, r Runner, mount, fingerprint strin
 			// Add this key as a reader on top of whatever recipients
 			// the remote store already had. gopass writes a commit
 			// for this, so the push below has fresh local content.
-			if _, err := GopassRecipientsAdd(ctx, r, mount, fingerprint); err != nil {
+			if _, err := GopassRecipientsAddConfirmed(ctx, r, mount, fingerprint); err != nil {
 				return fmt.Errorf("add recipient %s after adopt: %w", fingerprint, err)
 			}
 		}
@@ -607,7 +1340,67 @@ func GhRepoCreate(ctx context.Context, r Runner, owner, name string) ([]byte, er
 		return nil, fmt.Errorf("gh CLI not found — install via `brew install gh` and run `gh auth login`")
 	}
 	slug := owner + "/" + name
-	return r.Run(ctx, "gh", "repo", "create", slug, "--private", "--confirm")
+	return r.Run(ctx, "gh", "repo", "create", slug, "--private")
+}
+
+// RepoVisibility is GitHub's repository visibility enum.
+type RepoVisibility string
+
+const (
+	RepoVisibilityPrivate  RepoVisibility = "PRIVATE"
+	RepoVisibilityPublic   RepoVisibility = "PUBLIC"
+	RepoVisibilityInternal RepoVisibility = "INTERNAL"
+)
+
+// GhRepoVisibility returns the authenticated user's confirmed view of a
+// repository's visibility. A recognized GitHub not-found response is the only
+// case reported as exists=false; auth, network, API, and malformed-output
+// failures remain errors so security-sensitive callers can fail closed.
+func GhRepoVisibility(
+	ctx context.Context,
+	r Runner,
+	owner string,
+	name string,
+) (visibility RepoVisibility, exists bool, err error) {
+	if r == nil {
+		r = ExecRunner{}
+	}
+	if _, err := exec.LookPath("gh"); err != nil {
+		return "", false, fmt.Errorf(
+			"gh CLI not found — install via `brew install gh`",
+		)
+	}
+	slug := owner + "/" + name
+	out, err := r.Run(
+		ctx,
+		"gh",
+		"repo",
+		"view",
+		slug,
+		"--json",
+		"visibility",
+		"--jq",
+		".visibility",
+	)
+	if err != nil {
+		if ghRepoNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("query repository visibility: %w", err)
+	}
+	visibility = RepoVisibility(
+		strings.ToUpper(strings.TrimSpace(string(out))),
+	)
+	switch visibility {
+	case RepoVisibilityPrivate,
+		RepoVisibilityPublic,
+		RepoVisibilityInternal:
+		return visibility, true, nil
+	default:
+		return "", false, errors.New(
+			"query repository visibility: unexpected response",
+		)
+	}
 }
 
 // GhCurrentUser returns the login name of the authenticated `gh` user.
@@ -640,11 +1433,17 @@ func GhRepoExists(ctx context.Context, r Runner, owner, name string) (bool, erro
 	if err != nil {
 		// `gh repo view` exits non-zero for „not found"; treat that as
 		// „does not exist" but surface other errors (auth, network).
-		msg := err.Error()
-		if strings.Contains(msg, "Could not resolve") || strings.Contains(msg, "not found") || strings.Contains(msg, "HTTP 404") {
+		if ghRepoNotFound(err) {
 			return false, nil
 		}
 		return false, err
 	}
 	return true, nil
+}
+
+func ghRepoNotFound(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "Could not resolve") ||
+		strings.Contains(message, "not found") ||
+		strings.Contains(message, "HTTP 404")
 }

@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/SaschaHenning/my-secrets/internal/store"
 )
 
 // runDoctor invokes the doctor command with the given args and captures
@@ -96,5 +99,151 @@ func TestDoctorFailExitOnFailingCheck(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+type fakeDoctorRotationApp struct {
+	entries     []*store.Entry
+	readErr     error
+	closeErr    error
+	closed      bool
+	closeCtxErr error
+	hasDeadline bool
+	closeCalls  int
+}
+
+func (application *fakeDoctorRotationApp) DoctorRotationEntries(
+	context.Context,
+) ([]*store.Entry, error) {
+	return application.entries, application.readErr
+}
+
+func (application *fakeDoctorRotationApp) Close(ctx context.Context) error {
+	application.closed = true
+	application.closeCalls++
+	application.closeCtxErr = ctx.Err()
+	_, application.hasDeadline = ctx.Deadline()
+	return application.closeErr
+}
+
+func TestAppRotationProviderUsesRequesterAndClosesApp(t *testing.T) {
+	application := &fakeDoctorRotationApp{
+		entries: []*store.Entry{{Path: "jasp/a"}},
+	}
+	var gotRequester string
+	provider := appRotationProvider{
+		requester: "claude-code",
+		open: func(
+			_ context.Context,
+			requester string,
+		) (doctorRotationApp, error) {
+			gotRequester = requester
+			return application, nil
+		},
+	}
+
+	entries, err := provider.Entries(context.Background())
+	if err != nil {
+		t.Fatalf("Entries: %v", err)
+	}
+	if gotRequester != "claude-code" {
+		t.Fatalf("requester = %q, want claude-code", gotRequester)
+	}
+	if len(entries) != 1 || entries[0].Path != "jasp/a" {
+		t.Fatalf("entries = %#v", entries)
+	}
+	if !application.closed {
+		t.Fatal("app was not closed")
+	}
+	if application.closeCalls != 1 {
+		t.Fatalf("close calls = %d, want 1", application.closeCalls)
+	}
+}
+
+func TestAppRotationProviderPropagatesOpenAndReadErrors(t *testing.T) {
+	openFailure := appRotationProvider{
+		open: func(
+			context.Context,
+			string,
+		) (doctorRotationApp, error) {
+			return nil, errors.New("open failed")
+		},
+	}
+	if _, err := openFailure.Entries(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "open failed") {
+		t.Fatalf("open error = %v", err)
+	}
+
+	application := &fakeDoctorRotationApp{readErr: errors.New("read failed")}
+	readFailure := appRotationProvider{
+		open: func(
+			context.Context,
+			string,
+		) (doctorRotationApp, error) {
+			return application, nil
+		},
+	}
+	if _, err := readFailure.Entries(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "read failed") {
+		t.Fatalf("read error = %v", err)
+	}
+	if !application.closed {
+		t.Fatal("app was not closed after read failure")
+	}
+
+	closeFailure := &fakeDoctorRotationApp{
+		entries:  []*store.Entry{{Path: "jasp/secret"}},
+		closeErr: errors.New("close failed"),
+	}
+	provider := appRotationProvider{
+		open: func(
+			context.Context,
+			string,
+		) (doctorRotationApp, error) {
+			return closeFailure, nil
+		},
+	}
+	if entries, err := provider.Entries(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "close failed") {
+		t.Fatalf("close error = %v", err)
+	} else if entries != nil {
+		t.Fatalf("entries returned with close failure: %+v", entries)
+	}
+}
+
+func TestAppRotationProviderClosesWithDetachedBoundedContext(t *testing.T) {
+	application := &fakeDoctorRotationApp{
+		entries: []*store.Entry{{Path: "jasp/a"}},
+	}
+	provider := appRotationProvider{
+		open: func(
+			context.Context,
+			string,
+		) (doctorRotationApp, error) {
+			return application, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	entries, err := provider.Entries(ctx)
+
+	if err != nil {
+		t.Fatalf("Entries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Path != "jasp/a" {
+		t.Fatalf("entries = %+v", entries)
+	}
+	if application.closeCalls != 1 {
+		t.Fatalf("close calls = %d, want 1", application.closeCalls)
+	}
+	if application.closeCtxErr != nil {
+		t.Fatalf(
+			"close inherited caller cancellation: %v",
+			application.closeCtxErr,
+		)
+	}
+	if !application.hasDeadline {
+		t.Fatal("close context has no bounded deadline")
 	}
 }

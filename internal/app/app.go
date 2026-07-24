@@ -13,7 +13,9 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/caller"
@@ -41,67 +43,277 @@ var autoSyncTimeout = 5 * time.Second
 // which falls back to the exec runner.
 var autoSyncRunner syncpkg.Runner
 
+const (
+	storeCleanupTimeout      = 5 * time.Second
+	teamAuditFinalizeTimeout = 5 * time.Second
+)
+
 // App wires everything together.
 type App struct {
 	Store    store.Interface
 	Audit    *audit.Log
 	Policy   *policy.Policy
 	Override string // explicit --requester value for this invocation
+	// SuppressAutoSync disables the normal best-effort personal-store
+	// auto-sync for this App instance. Administrative batch flows use it
+	// when they hold their own mount lock and perform one explicit sync
+	// after all writes.
+	SuppressAutoSync bool
 	// Stderr is where user-visible warnings (auto-sync failure, etc.)
 	// are written. Nil falls back to os.Stderr. Tests inject a
 	// *bytes.Buffer here to assert on the output.
 	Stderr io.Writer
+	// teamReads is enabled by Open. Nil preserves the historical static-policy
+	// behavior for explicitly constructed test Apps.
+	teamReads *teamReadRuntime
+	// warningMu keeps writes to a shared bytes.Buffer or response stream
+	// coherent when long-lived Web/MCP Apps serve concurrent requests.
+	warningMu  sync.Mutex
+	closeOnce  sync.Once
+	closeErr   error
+	auditClose func(context.Context) error
+}
+
+type appOpenDependencies struct {
+	openStore  func(context.Context) (store.Interface, error)
+	openAudit  func() (*audit.Log, error)
+	loadPolicy func() (*policy.Policy, error)
+	closeAudit func(context.Context, *audit.Log) error
+	teamReads  func() *teamReadRuntime
+}
+
+func productionAppOpenDependencies() appOpenDependencies {
+	return appOpenDependencies{
+		openStore: func(ctx context.Context) (store.Interface, error) {
+			return store.Open(ctx)
+		},
+		openAudit: func() (*audit.Log, error) {
+			return audit.Open("")
+		},
+		loadPolicy: func() (*policy.Policy, error) {
+			return policy.Load("")
+		},
+		closeAudit: func(_ context.Context, log *audit.Log) error {
+			return log.Close()
+		},
+		teamReads: productionTeamReadRuntime,
+	}
 }
 
 // Open opens the store + audit DB + policy in one call. Callers are
 // responsible for calling Close when done.
 func Open(ctx context.Context, override string) (*App, error) {
-	st, err := store.Open(ctx)
-	if err != nil {
-		return nil, err
+	return openApp(ctx, override, productionAppOpenDependencies())
+}
+
+func openApp(
+	ctx context.Context,
+	override string,
+	dependencies appOpenDependencies,
+) (*App, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	al, err := audit.Open("")
-	if err != nil {
-		_ = st.Close(ctx)
-		return nil, err
+	closeAudit := dependencies.closeAudit
+	if closeAudit == nil {
+		closeAudit = func(_ context.Context, log *audit.Log) error {
+			return log.Close()
+		}
 	}
-	pol, err := policy.Load("")
-	if err != nil {
-		_ = st.Close(ctx)
-		_ = al.Close()
-		return nil, err
+	if dependencies.openStore == nil {
+		return nil, errors.New("store opener is required")
 	}
-	return &App{Store: st, Audit: al, Policy: pol, Override: override}, nil
+	st, err := dependencies.openStore(ctx)
+	if err != nil {
+		return nil, errors.Join(
+			err,
+			closeOpenResources(ctx, st, nil, closeAudit),
+		)
+	}
+	if st == nil {
+		return nil, errors.New("store opener returned nil")
+	}
+	if dependencies.openAudit == nil {
+		return nil, errors.Join(
+			errors.New("audit opener is required"),
+			closeOpenResources(ctx, st, nil, closeAudit),
+		)
+	}
+	al, err := dependencies.openAudit()
+	if err != nil {
+		return nil, errors.Join(
+			err,
+			closeOpenResources(ctx, st, al, closeAudit),
+		)
+	}
+	if al == nil {
+		return nil, errors.Join(
+			errors.New("audit opener returned nil"),
+			closeOpenResources(ctx, st, nil, closeAudit),
+		)
+	}
+	if dependencies.loadPolicy == nil {
+		return nil, errors.Join(
+			errors.New("policy loader is required"),
+			closeOpenResources(ctx, st, al, closeAudit),
+		)
+	}
+	pol, err := dependencies.loadPolicy()
+	if err == nil && pol == nil {
+		err = ErrPolicyUnavailable
+	}
+	if err != nil {
+		return nil, errors.Join(
+			err,
+			closeOpenResources(ctx, st, al, closeAudit),
+		)
+	}
+	var teamReads *teamReadRuntime
+	if dependencies.teamReads != nil {
+		teamReads = dependencies.teamReads()
+	}
+	return &App{
+		Store:     st,
+		Audit:     al,
+		Policy:    pol,
+		Override:  override,
+		teamReads: teamReads,
+		auditClose: func(closeCtx context.Context) error {
+			return closeAudit(closeCtx, al)
+		},
+	}, nil
 }
 
 // OpenAuditOnly is used by commands (`audit tail`, `web`) that do not need
 // to decrypt secrets. It skips the gopass store to avoid unlocking GPG.
 func OpenAuditOnly() (*App, error) {
-	al, err := audit.Open("")
-	if err != nil {
-		return nil, err
-	}
-	pol, err := policy.Load("")
-	if err != nil {
-		_ = al.Close()
-		return nil, err
-	}
-	return &App{Audit: al, Policy: pol}, nil
+	return openAuditOnlyWithDependencies(
+		context.Background(),
+		productionAppOpenDependencies(),
+	)
 }
 
-func (a *App) Close(ctx context.Context) error {
-	var errs []error
-	if a.Store != nil {
-		if err := a.Store.Close(ctx); err != nil {
-			errs = append(errs, err)
+func openAuditOnlyWithDependencies(
+	ctx context.Context,
+	dependencies appOpenDependencies,
+) (*App, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	closeAudit := dependencies.closeAudit
+	if closeAudit == nil {
+		closeAudit = func(_ context.Context, log *audit.Log) error {
+			return log.Close()
 		}
 	}
-	if a.Audit != nil {
-		if err := a.Audit.Close(); err != nil {
-			errs = append(errs, err)
+	if dependencies.openAudit == nil {
+		return nil, errors.New("audit opener is required")
+	}
+	al, err := dependencies.openAudit()
+	if err != nil {
+		return nil, errors.Join(
+			err,
+			closeOpenResources(ctx, nil, al, closeAudit),
+		)
+	}
+	if al == nil {
+		return nil, errors.New("audit opener returned nil")
+	}
+	if dependencies.loadPolicy == nil {
+		return nil, errors.Join(
+			errors.New("policy loader is required"),
+			closeOpenResources(ctx, nil, al, closeAudit),
+		)
+	}
+	pol, err := dependencies.loadPolicy()
+	if err == nil && pol == nil {
+		err = ErrPolicyUnavailable
+	}
+	if err != nil {
+		return nil, errors.Join(
+			err,
+			closeOpenResources(ctx, nil, al, closeAudit),
+		)
+	}
+	return &App{
+		Audit:  al,
+		Policy: pol,
+		auditClose: func(closeCtx context.Context) error {
+			return closeAudit(closeCtx, al)
+		},
+	}, nil
+}
+
+func closeOpenResources(
+	ctx context.Context,
+	st store.Interface,
+	log *audit.Log,
+	closeAudit func(context.Context, *audit.Log) error,
+) error {
+	var errs []error
+	if st != nil {
+		storeCloseCtx, cancel := detachedCleanupContext(
+			ctx,
+			storeCleanupTimeout,
+		)
+		errs = append(errs, st.Close(storeCloseCtx))
+		cancel()
+	}
+	if log != nil {
+		if closeAudit == nil {
+			errs = append(errs, errors.New("audit closer is required"))
+		} else {
+			auditCloseCtx, cancel := detachedCleanupContext(
+				ctx,
+				storeCleanupTimeout,
+			)
+			errs = append(errs, closeAudit(auditCloseCtx, log))
+			cancel()
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (a *App) Close(ctx context.Context) error {
+	a.closeOnce.Do(func() {
+		var errs []error
+		if a.Store != nil {
+			closeCtx, cancel := detachedCleanupContext(
+				ctx,
+				storeCleanupTimeout,
+			)
+			if err := a.Store.Close(closeCtx); err != nil {
+				errs = append(errs, err)
+			}
+			cancel()
+		}
+		if a.auditClose != nil {
+			closeCtx, cancel := detachedCleanupContext(
+				ctx,
+				storeCleanupTimeout,
+			)
+			if err := a.auditClose(closeCtx); err != nil {
+				errs = append(errs, err)
+			}
+			cancel()
+		} else if a.Audit != nil {
+			if err := a.Audit.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		a.closeErr = errors.Join(errs...)
+	})
+	return a.closeErr
+}
+
+func detachedCleanupContext(
+	ctx context.Context,
+	timeout time.Duration,
+) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
 // ErrDenied is returned when the scope policy rejects a request.
@@ -147,19 +359,48 @@ func cleanSecretPath(p string) error {
 }
 
 // Get fetches a decrypted entry, respecting policy + writing audit.
-func (a *App) Get(ctx context.Context, path string) (*store.Entry, error) {
-	d := caller.Identify(a.Override)
+func (a *App) Get(
+	ctx context.Context,
+	path string,
+) (entry *store.Entry, resultErr error) {
+	d := a.callerDetail()
 	if err := cleanSecretPath(path); err != nil {
 		a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultDenied, err.Error())
 		return nil, &ErrDenied{Path: path, Reason: err.Error()}
 	}
-	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			entry = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	decision, err := operation.authorize(path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultDenied, decision.Reason)
 		return nil, &ErrDenied{Path: path, Reason: decision.Reason}
 	}
-	e, err := a.Store.Get(ctx, path)
+	preparation, err := operation.prepareReads(ctx, []string{path})
 	if err != nil {
+		a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	e, err := operation.store.Get(ctx, path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	if err := preparation.finalize(ctx, []observedRead{{
+		path: path, action: "get",
+	}}); err != nil {
 		a.writeAudit(ctx, audit.ActionGet, path, d, audit.ResultError, err.Error())
 		return nil, err
 	}
@@ -174,30 +415,76 @@ func (a *App) Get(ctx context.Context, path string) (*store.Entry, error) {
 // identifiable. Non-TOTP entries produce a descriptive error plus an
 // error-result audit row.
 func (a *App) GenerateTOTP(ctx context.Context, path string, now time.Time) (string, int, error) {
-	d := caller.Identify(a.Override)
+	details, err := a.GenerateTOTPDetails(ctx, path, now)
+	return details.Code, details.SecondsLeft, err
+}
+
+// TOTPDetails contains the generated code and non-secret display metadata
+// obtained from the same single decryption.
+type TOTPDetails struct {
+	Code        string
+	SecondsLeft int
+	Issuer      string
+	Label       string
+}
+
+// GenerateTOTPDetails is the single-read TOTP API used by callers that also
+// need issuer and label. It avoids a second direct Store.Get bypass.
+func (a *App) GenerateTOTPDetails(
+	ctx context.Context,
+	path string,
+	now time.Time,
+) (details TOTPDetails, resultErr error) {
+	d := a.callerDetail()
 	if err := cleanSecretPath(path); err != nil {
 		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultDenied, err.Error())
-		return "", 0, &ErrDenied{Path: path, Reason: err.Error()}
+		return TOTPDetails{}, &ErrDenied{Path: path, Reason: err.Error()}
 	}
-	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
-	if !decision.Allowed {
-		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultDenied, decision.Reason)
-		return "", 0, &ErrDenied{Path: path, Reason: decision.Reason}
-	}
-	e, err := a.Store.Get(ctx, path)
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
 	if err != nil {
 		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, err.Error())
-		return "", 0, err
+		return TOTPDetails{}, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			details = TOTPDetails{}
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	decision, err := operation.authorize(path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, err.Error())
+		return TOTPDetails{}, err
+	}
+	if !decision.Allowed {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultDenied, decision.Reason)
+		return TOTPDetails{}, &ErrDenied{Path: path, Reason: decision.Reason}
+	}
+	preparation, err := operation.prepareReads(ctx, []string{path})
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, err.Error())
+		return TOTPDetails{}, err
+	}
+	e, err := operation.store.Get(ctx, path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, err.Error())
+		return TOTPDetails{}, err
+	}
+	if err := preparation.finalize(ctx, []observedRead{{
+		path: path, action: "totp_generate",
+	}}); err != nil {
+		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, err.Error())
+		return TOTPDetails{}, err
 	}
 	if e.Kind != store.KindTOTP {
 		msg := fmt.Sprintf("path %q is not a totp entry", path)
 		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, msg)
-		return "", 0, errors.New(msg)
+		return TOTPDetails{}, errors.New(msg)
 	}
 	alg, algErr := totppkg.ParseAlgorithm(e.TOTPAlgorithm)
 	if algErr != nil {
 		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, algErr.Error())
-		return "", 0, algErr
+		return TOTPDetails{}, algErr
 	}
 	digits, digErr := totppkg.ParseDigits(fmt.Sprintf("%d", e.TOTPDigits))
 	if digErr != nil {
@@ -206,7 +493,7 @@ func (a *App) GenerateTOTP(ctx context.Context, path string, now time.Time) (str
 			digits, _ = totppkg.ParseDigits("")
 		} else {
 			a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, digErr.Error())
-			return "", 0, digErr
+			return TOTPDetails{}, digErr
 		}
 	}
 	period := uint(e.TOTPPeriod)
@@ -221,25 +508,55 @@ func (a *App) GenerateTOTP(ctx context.Context, path string, now time.Time) (str
 	}, now)
 	if err != nil {
 		a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultError, err.Error())
-		return "", 0, err
+		return TOTPDetails{}, err
 	}
 	a.writeAudit(ctx, audit.ActionTOTPGenerate, path, d, audit.ResultOK, reason)
-	return code, secondsLeft, nil
+	return TOTPDetails{
+		Code:        code,
+		SecondsLeft: secondsLeft,
+		Issuer:      e.TOTPIssuer,
+		Label:       e.TOTPLabel,
+	}, nil
 }
 
 // List returns paths filtered by the caller's policy. Paths that would be
 // denied are silently filtered out of the result; a single audit entry is
 // written for the list action itself.
-func (a *App) List(ctx context.Context, org string) ([]string, error) {
-	d := caller.Identify(a.Override)
-	paths, err := a.Store.List(ctx, org)
+func (a *App) List(
+	ctx context.Context,
+	org string,
+) (pathsResult []string, resultErr error) {
+	d := a.callerDetail()
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionList, orgPath(org), d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			pathsResult = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	paths, err := operation.store.List(ctx, org)
 	if err != nil {
 		a.writeAudit(ctx, audit.ActionList, orgPath(org), d, audit.ResultError, err.Error())
 		return nil, err
 	}
 	filtered := make([]string, 0, len(paths))
 	for _, p := range paths {
-		if a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p).Allowed {
+		if cleanSecretPath(p) != nil {
+			continue
+		}
+		decision, decisionErr := operation.authorize(p)
+		if decisionErr != nil {
+			a.writeAudit(
+				ctx, audit.ActionList, orgPath(org), d,
+				audit.ResultError, decisionErr.Error(),
+			)
+			return nil, decisionErr
+		}
+		if decision.Allowed {
 			filtered = append(filtered, p)
 		}
 	}
@@ -285,46 +602,38 @@ func (a *App) Orgs(ctx context.Context) ([]string, error) {
 // "last read" (audit.LastAccessByPath, filtered to ActionGet) meaningful.
 // This mirrors the existing SearchByDomain, which has the same
 // one-row-per-call shape for the same reason.
-func (a *App) BrowseDetailed(ctx context.Context, org string) ([]*store.Entry, error) {
-	d := caller.Identify(a.Override)
-	paths, err := a.Store.List(ctx, org)
+func (a *App) BrowseDetailed(
+	ctx context.Context,
+	org string,
+) (resultEntries []*store.Entry, resultErr error) {
+	d := a.callerDetail()
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
 	if err != nil {
 		a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultError, err.Error())
 		return nil, err
 	}
-	entries := make([]*store.Entry, 0, len(paths))
-	for _, p := range paths {
-		// Request cancelled mid-decrypt — e.g. the browser aborted the
-		// /entries load because the user navigated away before the
-		// whole store finished decrypting. Returning the entries
-		// decrypted so far as if the list were complete is exactly the
-		// "entries silently vanish on a quick back-click" bug: the web
-		// entriesCache would store that truncated result and serve it as
-		// good. Fail instead, so nothing partial is ever cached. The
-		// error audit row uses a detached context because ctx itself is
-		// already cancelled and would drop the write.
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			resultEntries = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	paths, err := operation.store.List(ctx, org)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	entries, err := operation.decryptBatch(ctx, paths, "list_detail")
+	if err != nil {
+		auditContext := ctx
 		if ctx.Err() != nil {
-			a.writeAudit(context.Background(), audit.ActionListDetail, orgPath(org), d, audit.ResultError, ctx.Err().Error())
-			return nil, ctx.Err()
+			auditContext = context.Background()
 		}
-		if !a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p).Allowed {
-			continue
-		}
-		e, gerr := a.Store.Get(ctx, p)
-		if gerr != nil {
-			// Distinguish "this one entry is genuinely undecryptable"
-			// (tolerate, skip it) from "the whole request was cancelled"
-			// (fatal — never a partial-as-success). ctx.Err() is the
-			// reliable signal: the store may wrap the cancellation error
-			// as a plain string that errors.Is won't match, but a
-			// cancelled request always makes ctx.Err() non-nil.
-			if ctx.Err() != nil {
-				a.writeAudit(context.Background(), audit.ActionListDetail, orgPath(org), d, audit.ResultError, ctx.Err().Error())
-				return nil, ctx.Err()
-			}
-			continue
-		}
-		entries = append(entries, e)
+		a.writeAudit(
+			auditContext, audit.ActionListDetail, orgPath(org), d,
+			audit.ResultError, err.Error(),
+		)
+		return nil, err
 	}
 	a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultOK,
 		fmt.Sprintf("%d entries", len(entries)))
@@ -336,19 +645,48 @@ func (a *App) BrowseDetailed(ctx context.Context, org string) ([]*store.Entry, e
 // NOT ActionGet: the web UI's masked entry-detail page uses Inspect, so
 // simply viewing an entry's metadata does not count as reading it. Only
 // the explicit reveal action (App.Get) does.
-func (a *App) Inspect(ctx context.Context, path string) (*store.Entry, error) {
-	d := caller.Identify(a.Override)
+func (a *App) Inspect(
+	ctx context.Context,
+	path string,
+) (entry *store.Entry, resultErr error) {
+	d := a.callerDetail()
 	if err := cleanSecretPath(path); err != nil {
 		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultDenied, err.Error())
 		return nil, &ErrDenied{Path: path, Reason: err.Error()}
 	}
-	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			entry = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	decision, err := operation.authorize(path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultDenied, decision.Reason)
 		return nil, &ErrDenied{Path: path, Reason: decision.Reason}
 	}
-	e, err := a.Store.Get(ctx, path)
+	preparation, err := operation.prepareReads(ctx, []string{path})
 	if err != nil {
+		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	e, err := operation.store.Get(ctx, path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	if err := preparation.finalize(ctx, []observedRead{{
+		path: path, action: "inspect",
+	}}); err != nil {
 		a.writeAudit(ctx, audit.ActionListDetail, path, d, audit.ResultError, err.Error())
 		return nil, err
 	}
@@ -361,13 +699,32 @@ func (a *App) Inspect(ctx context.Context, path string) (*store.Entry, error) {
 // same way as every other path-taking method: a denied path shouldn't
 // leak how many times it was ever changed, any more than it should leak
 // its metadata (App.Inspect) or its value (App.Get).
-func (a *App) History(ctx context.Context, path string, limit int) ([]history.Revision, error) {
-	d := caller.Identify(a.Override)
+func (a *App) History(
+	ctx context.Context,
+	path string,
+	limit int,
+) (revisions []history.Revision, resultErr error) {
+	d := a.callerDetail()
 	if err := cleanSecretPath(path); err != nil {
 		a.writeAudit(ctx, audit.ActionHistory, path, d, audit.ResultDenied, err.Error())
 		return nil, &ErrDenied{Path: path, Reason: err.Error()}
 	}
-	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
+	operation, err := a.beginAccessOperation(ctx, d, true, false)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionHistory, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			revisions = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	decision, err := operation.authorize(path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionHistory, path, d, audit.ResultError, err.Error())
+		return nil, err
+	}
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionHistory, path, d, audit.ResultDenied, decision.Reason)
 		return nil, &ErrDenied{Path: path, Reason: decision.Reason}
@@ -394,17 +751,46 @@ type storeSearcher interface {
 // written per rejected path so operators can see exactly which secrets a
 // caller attempted to reach.
 func (a *App) Search(ctx context.Context, query string) ([]string, error) {
+	if a.teamReads != nil {
+		return a.searchObserved(ctx, query)
+	}
 	return a.searchWith(ctx, query, a.Store)
 }
 
-func (a *App) searchWith(ctx context.Context, query string, ss storeSearcher) ([]string, error) {
-	d := caller.Identify(a.Override)
+func (a *App) searchWith(
+	ctx context.Context,
+	query string,
+	ss storeSearcher,
+) (pathsResult []string, resultErr error) {
+	d := a.callerDetail()
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		a.writeAudit(
+			ctx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, searchAuditStagePrepare),
+		)
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			pathsResult = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
 	// Cache reasons for denied paths so we do not have to call Evaluate
 	// twice per path. The closure collects them as a side effect while
 	// the store walks the list.
 	denyReasons := make(map[string]string)
 	allow := func(p string) bool {
-		dec := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p)
+		if cleanSecretPath(p) != nil {
+			denyReasons[p] = errInvalidPath.Error()
+			return false
+		}
+		dec, err := operation.authorize(p)
+		if err != nil {
+			denyReasons[p] = err.Error()
+			return false
+		}
 		if !dec.Allowed {
 			denyReasons[p] = dec.Reason
 			return false
@@ -413,21 +799,173 @@ func (a *App) searchWith(ctx context.Context, query string, ss storeSearcher) ([
 	}
 	allowed, denied, err := ss.Search(ctx, query, allow)
 	if err != nil {
-		a.writeAudit(ctx, audit.ActionSearch, "", d, audit.ResultError, err.Error())
+		a.writeAudit(
+			ctx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, searchAuditStageExecute),
+		)
 		return nil, err
 	}
 	// Per-path denied audit rows.
 	for _, p := range denied {
 		reason := denyReasons[p]
 		if reason == "" {
-			reason = a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p).Reason
+			decision, decisionErr := operation.authorize(p)
+			if decisionErr != nil {
+				reason = decisionErr.Error()
+			} else {
+				reason = decision.Reason
+			}
 		}
 		a.writeAudit(ctx, audit.ActionSearch, p, d, audit.ResultDenied, reason)
 	}
 	total := len(allowed) + len(denied)
 	a.writeAudit(ctx, audit.ActionSearch, "", d, audit.ResultOK,
-		fmt.Sprintf("query=%q %d of %d visible", query, len(allowed), total))
+		fmt.Sprintf("%s %d of %d visible", searchAuditMetadata(query), len(allowed), total))
 	return allowed, nil
+}
+
+func (a *App) searchObserved(
+	ctx context.Context,
+	query string,
+) (pathsResult []string, resultErr error) {
+	d := a.callerDetail()
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		a.writeAudit(
+			ctx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, searchAuditStagePrepare),
+		)
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			pathsResult = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	paths, err := operation.store.List(ctx, "")
+	if err != nil {
+		a.writeAudit(
+			ctx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, searchAuditStageList),
+		)
+		return nil, err
+	}
+	authorized, decisions, err := operation.authorizedPaths(paths)
+	if err != nil {
+		a.writeAudit(
+			ctx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, searchAuditStageAuthorize),
+		)
+		return nil, err
+	}
+	authorizedSet := make(map[string]struct{}, len(authorized))
+	for _, path := range authorized {
+		authorizedSet[path] = struct{}{}
+	}
+	preparation, err := operation.prepareReads(ctx, authorized)
+	if err != nil {
+		a.writeAudit(
+			ctx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, searchAuditStagePreflight),
+		)
+		return nil, err
+	}
+
+	denyReasons := make(map[string]string)
+	allow := func(path string) bool {
+		if _, ok := authorizedSet[path]; ok {
+			return true
+		}
+		if decision, ok := decisions[path]; ok {
+			denyReasons[path] = decision.Reason
+		} else {
+			denyReasons[path] = "path was not authorized before search"
+		}
+		return false
+	}
+	observed := make([]observedRead, 0, len(authorized))
+	observe := func(path string) {
+		observed = append(observed, observedRead{
+			path: path, action: "search",
+		})
+	}
+	allowed, denied, searchErr := operation.store.SearchObserved(
+		ctx,
+		query,
+		allow,
+		observe,
+	)
+	recordErr := preparation.finalize(ctx, observed)
+	combinedErr := errors.Join(searchErr, recordErr)
+	if combinedErr != nil {
+		stage := searchAuditStageExecute
+		if recordErr != nil {
+			stage = searchAuditStageRecord
+		}
+		auditCtx := ctx
+		if ctx.Err() != nil {
+			auditCtx = context.Background()
+		}
+		a.writeAudit(
+			auditCtx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, stage),
+		)
+		return nil, combinedErr
+	}
+	for _, path := range allowed {
+		if _, ok := authorizedSet[path]; !ok {
+			a.writeAudit(
+				ctx, audit.ActionSearch, "", d,
+				audit.ResultError, searchAuditFailure(query, searchAuditStageAuthorize),
+			)
+			return nil, ErrPolicyUnavailable
+		}
+	}
+	for _, path := range denied {
+		reason := denyReasons[path]
+		if reason == "" {
+			reason = "path denied before search"
+		}
+		a.writeAudit(
+			ctx, audit.ActionSearch, path, d,
+			audit.ResultDenied, reason,
+		)
+	}
+	total := len(allowed) + len(denied)
+	a.writeAudit(
+		ctx, audit.ActionSearch, "", d, audit.ResultOK,
+		fmt.Sprintf("%s %d of %d visible", searchAuditMetadata(query), len(allowed), total),
+	)
+	return allowed, nil
+}
+
+type searchAuditStage string
+
+const (
+	searchAuditStagePrepare   searchAuditStage = "prepare"
+	searchAuditStageList      searchAuditStage = "list"
+	searchAuditStageAuthorize searchAuditStage = "authorize"
+	searchAuditStagePreflight searchAuditStage = "preflight"
+	searchAuditStageExecute   searchAuditStage = "execute"
+	searchAuditStageRecord    searchAuditStage = "record"
+	searchAuditStageDecrypt   searchAuditStage = "decrypt"
+)
+
+// searchAuditMetadata records only non-sensitive query metadata. Search input
+// may be a pasted password, token, or credential-bearing URL, so neither raw
+// nor normalized query content is safe for a persistent audit log.
+func searchAuditMetadata(query string) string {
+	trimmed := strings.TrimSpace(query)
+	return fmt.Sprintf(
+		"query=redacted query_len=%d query_runes=%d",
+		len(trimmed),
+		utf8.RuneCountInString(trimmed),
+	)
+}
+
+func searchAuditFailure(query string, stage searchAuditStage) string {
+	return fmt.Sprintf("%s stage=%s failed", searchAuditMetadata(query), stage)
 }
 
 // Add writes a new entry after policy check. Add is defined as a rotation
@@ -436,13 +974,30 @@ func (a *App) searchWith(ctx context.Context, query string, ss storeSearcher) ([
 // a non-zero RotatedAt before calling Add have that value overwritten —
 // the timestamp is a book-keeping field maintained by the app layer, not
 // user input.
-func (a *App) Add(ctx context.Context, e *store.Entry) error {
-	d := caller.Identify(a.Override)
+func (a *App) Add(ctx context.Context, e *store.Entry) (resultErr error) {
+	d := a.callerDetail()
+	if e == nil {
+		err := errors.New("entry is required")
+		a.writeAudit(ctx, audit.ActionAdd, "", d, audit.ResultDenied, err.Error())
+		return err
+	}
 	if err := cleanSecretPath(e.Path); err != nil {
 		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultDenied, err.Error())
 		return &ErrDenied{Path: e.Path, Reason: err.Error()}
 	}
-	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, e.Path)
+	operation, err := a.beginAccessOperation(ctx, d, false, true)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultError, err.Error())
+		return err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, operation.close(ctx))
+	}()
+	decision, err := operation.authorize(e.Path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultError, err.Error())
+		return err
+	}
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultDenied, decision.Reason)
 		return &ErrDenied{Path: e.Path, Reason: decision.Reason}
@@ -454,7 +1009,11 @@ func (a *App) Add(ctx context.Context, e *store.Entry) error {
 	if e.Domain == "" && e.URL != "" {
 		e.Domain = store.DeriveDomain(e.URL)
 	}
-	if err := a.Store.Set(ctx, e); err != nil {
+	if err := operation.store.Set(ctx, e); err != nil {
+		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultError, err.Error())
+		return err
+	}
+	if err := operation.close(ctx); err != nil {
 		a.writeAudit(ctx, audit.ActionAdd, e.Path, d, audit.ResultError, err.Error())
 		return err
 	}
@@ -466,13 +1025,29 @@ func (a *App) Add(ctx context.Context, e *store.Entry) error {
 // Rotate writes a new password for an existing entry. It preserves all
 // metadata (including RotateAfter) and stamps RotatedAt to the current
 // UTC time so that --stale filters and doctor checks reset.
-func (a *App) Rotate(ctx context.Context, path, newPassword string) error {
-	d := caller.Identify(a.Override)
+func (a *App) Rotate(
+	ctx context.Context,
+	path string,
+	newPassword string,
+) (resultErr error) {
+	d := a.callerDetail()
 	if err := cleanSecretPath(path); err != nil {
 		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultDenied, err.Error())
 		return &ErrDenied{Path: path, Reason: err.Error()}
 	}
-	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
+	operation, err := a.beginAccessOperation(ctx, d, false, true)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultError, err.Error())
+		return err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, operation.close(ctx))
+	}()
+	decision, err := operation.authorize(path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultError, err.Error())
+		return err
+	}
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultDenied, decision.Reason)
 		return &ErrDenied{Path: path, Reason: decision.Reason}
@@ -481,14 +1056,29 @@ func (a *App) Rotate(ctx context.Context, path, newPassword string) error {
 	// the Set() call alongside the existing metadata. We bypass
 	// App.Get's audit row because the rotate audit row already captures
 	// this operation; emitting a separate get row would double-count.
-	existing, err := a.Store.Get(ctx, path)
+	preparation, err := operation.prepareReads(ctx, []string{path})
 	if err != nil {
+		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultError, err.Error())
+		return err
+	}
+	existing, err := operation.store.Get(ctx, path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultError, err.Error())
+		return err
+	}
+	if err := preparation.finalize(ctx, []observedRead{{
+		path: path, action: "rotate_read",
+	}}); err != nil {
 		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultError, err.Error())
 		return err
 	}
 	existing.Password = newPassword
 	existing.RotatedAt = time.Now().UTC()
-	if err := a.Store.Set(ctx, existing); err != nil {
+	if err := operation.store.Set(ctx, existing); err != nil {
+		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultError, err.Error())
+		return err
+	}
+	if err := operation.close(ctx); err != nil {
 		a.writeAudit(ctx, audit.ActionRotate, path, d, audit.ResultError, err.Error())
 		return err
 	}
@@ -498,18 +1088,34 @@ func (a *App) Rotate(ctx context.Context, path, newPassword string) error {
 }
 
 // Remove deletes an entry after policy check.
-func (a *App) Remove(ctx context.Context, path string) error {
-	d := caller.Identify(a.Override)
+func (a *App) Remove(ctx context.Context, path string) (resultErr error) {
+	d := a.callerDetail()
 	if err := cleanSecretPath(path); err != nil {
 		a.writeAudit(ctx, audit.ActionRemove, path, d, audit.ResultDenied, err.Error())
 		return &ErrDenied{Path: path, Reason: err.Error()}
 	}
-	decision := a.Policy.Evaluate(string(d.Kind), d.AgentLabel, path)
+	operation, err := a.beginAccessOperation(ctx, d, false, true)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionRemove, path, d, audit.ResultError, err.Error())
+		return err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, operation.close(ctx))
+	}()
+	decision, err := operation.authorize(path)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionRemove, path, d, audit.ResultError, err.Error())
+		return err
+	}
 	if !decision.Allowed {
 		a.writeAudit(ctx, audit.ActionRemove, path, d, audit.ResultDenied, decision.Reason)
 		return &ErrDenied{Path: path, Reason: decision.Reason}
 	}
-	if err := a.Store.Remove(ctx, path); err != nil {
+	if err := operation.store.Remove(ctx, path); err != nil {
+		a.writeAudit(ctx, audit.ActionRemove, path, d, audit.ResultError, err.Error())
+		return err
+	}
+	if err := operation.close(ctx); err != nil {
 		a.writeAudit(ctx, audit.ActionRemove, path, d, audit.ResultError, err.Error())
 		return err
 	}
@@ -535,7 +1141,7 @@ func (a *App) Remove(ctx context.Context, path string) error {
 // A 5-second timeout is imposed on top of the caller's context so a
 // hanging `git push` cannot block the CLI indefinitely.
 func (a *App) AutoSync(ctx context.Context, trigger string) {
-	if NoSyncFlag {
+	if a.SuppressAutoSync || NoSyncFlag {
 		return
 	}
 	ctx2, cancel := context.WithTimeout(ctx, autoSyncTimeout)
@@ -549,6 +1155,8 @@ func (a *App) AutoSync(ctx context.Context, trigger string) {
 		reason := fmt.Sprintf("auto-sync after %s: %s", trigger, err.Error())
 		a.writeAudit(ctx, audit.ActionSyncPush, "", d, audit.ResultError, reason)
 		w := a.stderr()
+		a.warningMu.Lock()
+		defer a.warningMu.Unlock()
 		fmt.Fprintf(w, "warning: auto-sync failed (%s) — run \"mys sync push\" manually when online\n", err.Error())
 		return
 	}
@@ -586,30 +1194,50 @@ type DomainMatch = store.DomainMatch
 // with a tier breakdown in the reason; no per-path rows are written for
 // this read-only metadata walk (each Get() inside would produce its own
 // row, which would spam the log on big stores).
-func (a *App) SearchByDomain(ctx context.Context, query string, includeSimilar bool) (matches []DomainMatch, similar []DomainMatch, err error) {
+func (a *App) SearchByDomain(
+	ctx context.Context,
+	query string,
+	includeSimilar bool,
+) (matches []DomainMatch, similar []DomainMatch, resultErr error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil, nil
 	}
-	d := caller.Identify(a.Override)
-	paths, err := a.Store.List(ctx, "")
+	d := a.callerDetail()
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
 	if err != nil {
-		a.writeAudit(ctx, audit.ActionSearch, "", d, audit.ResultError, err.Error())
+		a.writeAudit(
+			ctx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, searchAuditStagePrepare),
+		)
+		return nil, nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			matches = nil
+			similar = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	paths, err := operation.store.List(ctx, "")
+	if err != nil {
+		a.writeAudit(
+			ctx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, searchAuditStageList),
+		)
+		return nil, nil, err
+	}
+	entries, err := operation.decryptBatch(ctx, paths, "search_domain")
+	if err != nil {
+		a.writeAudit(
+			ctx, audit.ActionSearch, "", d,
+			audit.ResultError, searchAuditFailure(query, searchAuditStageDecrypt),
+		)
 		return nil, nil, err
 	}
 	matches = make([]DomainMatch, 0)
 	similar = make([]DomainMatch, 0)
 	var exact, subdomain, substring, fuzzy int
-	for _, p := range paths {
-		// Policy pre-filter. Denied paths are silently skipped — the
-		// aggregate audit row at the end still records the search, and
-		// a denied caller never sees which paths exist.
-		if !a.Policy.Evaluate(string(d.Kind), d.AgentLabel, p).Allowed {
-			continue
-		}
-		e, gerr := a.Store.Get(ctx, p)
-		if gerr != nil {
-			continue
-		}
+	for _, e := range entries {
 		tier, hint, ok := store.MatchDomain(query, e.Domain)
 		if !ok {
 			continue
@@ -634,19 +1262,42 @@ func (a *App) SearchByDomain(ctx context.Context, query string, includeSimilar b
 			}
 		}
 	}
-	// Log the canonicalised form of the query rather than the raw user
-	// input. If the user typed a full URL with credentials in it, or a
-	// password by mistake, the plain-string form would otherwise end up
-	// in the append-only audit DB (review finding I7). The normalised
-	// value carries enough information for audit review.
-	logged := store.NormalizeDomain(query)
-	if logged == "" {
-		logged = fmt.Sprintf("len=%d", len(strings.TrimSpace(query)))
-	}
-	reason := fmt.Sprintf("domain=%q exact=%d subdomain=%d substring=%d fuzzy=%d similar=%t",
-		logged, exact, subdomain, substring, fuzzy, includeSimilar)
+	reason := fmt.Sprintf(
+		"%s exact=%d subdomain=%d substring=%d fuzzy=%d similar=%t",
+		searchAuditMetadata(query),
+		exact,
+		subdomain,
+		substring,
+		fuzzy,
+		includeSimilar,
+	)
 	a.writeAudit(ctx, audit.ActionSearch, "", d, audit.ResultOK, reason)
 	return matches, similar, nil
+}
+
+// DoctorRotationEntries returns every policy-visible entry needed by the
+// rotation-overdue doctor check. It is intentionally separate from
+// BrowseDetailed so the signed team audit records the purpose-specific
+// doctor_rotation action while still batching once per shared mount.
+func (a *App) DoctorRotationEntries(
+	ctx context.Context,
+) (entries []*store.Entry, resultErr error) {
+	d := a.callerDetail()
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			entries = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	paths, err := operation.store.List(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	return operation.decryptBatch(ctx, paths, "doctor_rotation")
 }
 
 // AuditInit records a one-time init event.
