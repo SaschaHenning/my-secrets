@@ -132,7 +132,7 @@ arbeitsfähigen Zustand:
    neugestartet. Sonst: kurzer Hinweis, kein Abbruch.
 4. **Policy + Audit-DB** — schreibt
    `~/.config/my-secrets/scope-policy.yaml` (Default-Regeln: AI-Caller
-   dürfen `jasp/**` und `zuhause/**`, nicht `private/**`) und legt
+   dürfen `work/**` und `home/**`, nicht `private/**`) und legt
    `~/.local/share/my-secrets/audit.sqlite` an.
 5. **Claude-Skill** — nur wenn `--install-skill` gesetzt. Neu: im
    interaktiven Modus fragt `mys init`, ob der Skill **global**
@@ -153,7 +153,7 @@ mys init --yes                          # fehlt user.name/email in git config �
 mys init --yes --no-passphrase          # Key ohne Passphrase (via pinentry-mac)
 
 # Explizite Angaben:
-mys init --name "Sascha" --email garry@jasp.eu
+mys init --name "Your Name" --email you@example.com
 
 # Skill direkt mit einziehen:
 mys init --install-skill                 # global (default)
@@ -196,10 +196,10 @@ Jeder Zugriff landet als `actor_kind=ai` im Audit-Log.
 
 ```bash
 # Ein Secret anlegen
-echo "test-pw" | mys add zuhause/test --kind password --user me
+echo "test-pw" | mys add home/test --kind password --user me
 
 # Lesen (Password standardmäßig maskiert)
-mys get zuhause/test
+mys get home/test
 
 # Audit-Log anschauen
 mys audit tail

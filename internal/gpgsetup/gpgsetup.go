@@ -35,7 +35,7 @@ type KeyInfo struct {
 	// KeyID is the last 16 characters of Fingerprint. Kept as a
 	// convenience for callers that want the short form.
 	KeyID string
-	// UID is the primary user id string, e.g. "Sascha Henning <garry@jasp.eu>".
+	// UID is the primary user id string, e.g. "Your Name <you@example.com>".
 	// Empty if the key has no user ids attached.
 	UID string
 	// Algorithm is the colon-format algo code (e.g. "22" for EdDSA).

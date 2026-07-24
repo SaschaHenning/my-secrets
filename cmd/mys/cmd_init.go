@@ -174,7 +174,7 @@ func runInit(ctx context.Context, opts *initOptions) error {
 	// Final ready message.
 	fmt.Fprintln(opts.Out)
 	fmt.Fprintln(opts.Out, "mys is ready. Try:")
-	fmt.Fprintln(opts.Out, "  mys add zuhause/wifi --user admin")
+	fmt.Fprintln(opts.Out, "  mys add home/wifi --user admin")
 	fmt.Fprintln(opts.Out, "  mys doctor")
 	fmt.Fprintln(opts.Out, "  mys sync setup")
 	return nil

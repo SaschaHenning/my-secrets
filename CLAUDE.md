@@ -30,7 +30,7 @@ See `docs/plan.html` for the full planning overview with three evaluated archite
 - **Storage**: gopass imported as Go library (no subprocess), GPG keys in the macOS Keychain, unlocked via `pinentry-touchid` (Secure Enclave / Touch ID).
 - **Audit log**: local SQLite database, append-only, one row per read/write/list/delete operation.
 - **Caller identification**: PPID walk up to PID 1, env-var inspection (`CLAUDECODE=1`, `ANTHROPIC_*`, `TERM_PROGRAM`), optional explicit `--requester` flag set by the Claude skill.
-- **Org scoping**: gopass folder structure maps to orgs (`jasp/`, `zuhause/`, `private/`), a `scope-policy.yaml` defines which caller classes may access which orgs.
+- **Org scoping**: gopass folder structure maps to orgs (`work/`, `home/`, `private/`), a `scope-policy.yaml` defines which caller classes may access which orgs.
 - **Web UI**: small embedded HTTP server on localhost, reads the audit DB and gopass store read-only, gated behind Touch ID.
 - **MCP server**: the binary can run in MCP mode over stdio. Claude Code should prefer MCP; scripts and shells may use the `mys` CLI with explicit consumer-safe output. Both routes use the same audited App path.
 - **Bitwarden sync** (optional, explicit, one-way): exports to Bitwarden JSON format; no live cloud backend.

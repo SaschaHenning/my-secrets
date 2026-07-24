@@ -501,8 +501,8 @@
 
     <h3>Org-Scoping via gopass-Ordner</h3>
 <pre class="diagram">store/
-  jasp/…         recipients: gpg-key-mac, gpg-key-yubi
-  zuhause/…      recipients: gpg-key-mac
+  work/…         recipients: gpg-key-mac, gpg-key-yubi
+  home/…      recipients: gpg-key-mac
   private/…      recipients: gpg-key-mac  (deny für claude-code)</pre>
     <p>gopass erzwingt Recipients pro Ordner über <code>.gpg-id</code>-Dateien. Der Wrapper liest zusätzlich <code>scope-policy.yaml</code> und blockiert Zugriffe außerhalb des Scopes.</p>
 
@@ -535,7 +535,7 @@
 <div class="next-steps">
   <div class="checklist-item"><input type="checkbox" id="n1"><label for="n1">GitHub-Issue „Credential-Manager MVP" anlegen mit Acceptance-Kriterien aus der Anforderungsliste oben</label></div>
   <div class="checklist-item"><input type="checkbox" id="n2"><label for="n2">Homebrew-Setup verifizieren: <code>gnupg</code>, <code>gopass</code>, <code>pinentry-touchid</code>, <code>datasette</code></label></div>
-  <div class="checklist-item"><input type="checkbox" id="n3"><label for="n3">gopass-Store initialisieren mit Ordnern <code>jasp/</code>, <code>zuhause/</code>, <code>private/</code></label></div>
+  <div class="checklist-item"><input type="checkbox" id="n3"><label for="n3">gopass-Store initialisieren mit Ordnern <code>work/</code>, <code>home/</code>, <code>private/</code></label></div>
   <div class="checklist-item"><input type="checkbox" id="n4"><label for="n4">Go-Wrapper <code>zhpass</code> schreiben (CLI-Modus): get/list/search/add/rotate, PPID-Detection, Audit-Writer</label></div>
   <div class="checklist-item"><input type="checkbox" id="n5"><label for="n5">Scope-Policy-YAML-Schema definieren und Enforcement einbauen</label></div>
   <div class="checklist-item"><input type="checkbox" id="n6"><label for="n6">MCP-Server-Modus für <code>zhpass</code> (Stdio-Transport), Tool-Schemas <code>creds.get</code> / <code>creds.list</code> / <code>creds.search</code></label></div>
