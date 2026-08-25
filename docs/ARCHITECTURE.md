@@ -53,8 +53,9 @@ operation through an in-process orchestrator.
 └─────────────────────────────────────────────────────────────┘
                                 │
                                 ▼
-                      ~/.password-store
-                      (GPG-encrypted files)
+              gopass store on disk (GPG-encrypted files)
+              ~/.local/share/gopass/stores/root
+              (gopass's XDG default, not pass's ~/.password-store)
                                 │
                                 ▼
                       gpg-agent → Keychain (+ optional Touch ID)
