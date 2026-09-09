@@ -24,6 +24,7 @@ import (
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
+	"github.com/SaschaHenning/my-secrets/internal/gopassinit"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 	syncpkg "github.com/SaschaHenning/my-secrets/internal/sync"
 )
@@ -115,7 +116,13 @@ func Serve(ctx context.Context, a *app.App, port int, stdout io.Writer) error {
 // serveWith is the testable core of Serve. ttl and tick are parameterised
 // so tests can run the full HTTP stack with sub-second timings.
 func serveWith(ctx context.Context, a *app.App, port int, stdout io.Writer, ttl, tick time.Duration) error {
+	// background tracks the cache's goroutines (warm, stale refresh, store
+	// watcher). The defers run LIFO — cancel() stops them, Wait() then
+	// blocks until they are out of the store and audit DB, so serveWith
+	// cannot return into App.Close while a decrypt is still running.
+	var background sync.WaitGroup
 	cancelCtx, cancel := context.WithCancel(ctx)
+	defer background.Wait()
 	defer cancel()
 
 	a.AuditWebOpen(cancelCtx, fmt.Sprintf("127.0.0.1:%d", port))
@@ -136,13 +143,14 @@ func serveWith(ctx context.Context, a *app.App, port int, stdout io.Writer, ttl,
 	// Gated routes. Every handler here goes through authGate, which
 	// redirects to /login on a missing / stale cookie.
 	entries := newEntriesCache()
-	// Pre-warm the full-store decrypt in the background so the first
-	// /entries load or search is instant rather than a tens-of-seconds
-	// wait. Only started when the app has a store (mys web does; audit-
-	// only openings don't). Uses context.Background internally, so it is
-	// independent of any request and is not tied to cancelCtx's lifetime.
+	entries.bindLifetime(cancelCtx, &background)
+	// Pre-warm the full-store decrypt so the first /entries load is
+	// instant, and watch the store so an out-of-band write shows up in
+	// seconds. Only when the app has a store (mys web does; audit-only
+	// openings don't).
 	if a.Store != nil {
-		go entries.warm(a)
+		entries.goBackground(func(ctx context.Context) { entries.warm(ctx, a) })
+		entries.goBackground(func(ctx context.Context) { watchStore(ctx, a, entries) })
 	}
 	mux.Handle("/", authGate(store, handleIndex(a)))
 	mux.Handle("/audit", authGate(store, handleAudit(a)))
@@ -581,19 +589,47 @@ const entriesCacheTTL = 2 * time.Minute
 // warm() pre-populates it at server startup so even that first cold load
 // is usually already done by the time the user navigates.
 //
-// Background refresh/warm use context.Background so they can't be
-// cancelled by (or leak) any single request. Only successful decrypts
-// are cached; an error leaves the previous good result in place (a
-// transient failure never wedges /entries).
+// Background refresh/warm run on the server's lifetime context, never a
+// request's. Only successful decrypts are cached; an error leaves the
+// previous good result in place (a transient failure never wedges
+// /entries).
 type entriesCache struct {
 	mu         sync.Mutex
 	at         time.Time
 	entries    []*store.Entry
 	refreshing bool
+	// lifetime cancels background work at shutdown, tracker lets serveWith
+	// wait for it before App.Close pulls the store and audit DB out from
+	// under a running decrypt. Both nil in tests (plain goroutines then).
+	lifetime context.Context
+	tracker  *sync.WaitGroup
 }
 
 func newEntriesCache() *entriesCache {
 	return &entriesCache{}
+}
+
+// bindLifetime ties everything this cache starts to the server. Called
+// once, before the first get/warm.
+func (c *entriesCache) bindLifetime(ctx context.Context, tracker *sync.WaitGroup) {
+	c.lifetime, c.tracker = ctx, tracker
+}
+
+// goBackground runs fn in a goroutine shutdown can cancel and wait for.
+func (c *entriesCache) goBackground(fn func(context.Context)) {
+	ctx := c.lifetime
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.tracker == nil {
+		go fn(ctx)
+		return
+	}
+	c.tracker.Add(1)
+	go func() {
+		defer c.tracker.Done()
+		fn(ctx)
+	}()
 }
 
 func (c *entriesCache) get(ctx context.Context, a *app.App) ([]*store.Entry, error) {
@@ -602,7 +638,7 @@ func (c *entriesCache) get(ctx context.Context, a *app.App) ([]*store.Entry, err
 	stale := cached == nil || time.Since(c.at) >= entriesCacheTTL
 	if cached != nil && stale && !c.refreshing {
 		c.refreshing = true
-		go c.refresh(a)
+		c.goBackground(func(ctx context.Context) { c.refresh(ctx, a) })
 	}
 	c.mu.Unlock()
 
@@ -631,19 +667,19 @@ func (c *entriesCache) load(ctx context.Context, a *app.App) ([]*store.Entry, er
 // refresh re-decrypts in the background (stale-while-revalidate), keeping
 // the existing result on error. Its refreshing flag is cleared even if
 // load panics/errs so a failed refresh never blocks future ones.
-func (c *entriesCache) refresh(a *app.App) {
+func (c *entriesCache) refresh(ctx context.Context, a *app.App) {
 	defer func() {
 		c.mu.Lock()
 		c.refreshing = false
 		c.mu.Unlock()
 	}()
-	_, _ = c.load(context.Background(), a)
+	_, _ = c.load(ctx, a)
 }
 
 // warm pre-populates the cache at server startup so the first /entries
 // load or search doesn't pay the full-store decrypt. No-op if already
 // populated or a load is in flight.
-func (c *entriesCache) warm(a *app.App) {
+func (c *entriesCache) warm(ctx context.Context, a *app.App) {
 	c.mu.Lock()
 	skip := c.entries != nil || c.refreshing
 	if !skip {
@@ -653,7 +689,97 @@ func (c *entriesCache) warm(a *app.App) {
 	if skip {
 		return
 	}
-	c.refresh(a) // reuses refresh's refreshing-flag cleanup
+	c.refresh(ctx, a) // reuses refresh's refreshing-flag cleanup
+}
+
+// applyChange folds an out-of-band store change into the cached set:
+// removed paths are dropped and new or rewritten paths are decrypted in
+// ONE batch (App.BrowseDetailedPaths — one aggregated audit row, never a
+// per-path read). Reports false when the change was not taken and the
+// caller should retry; the previous good set stays served.
+func (c *entriesCache) applyChange(ctx context.Context, a *app.App, change storeChange) bool {
+	c.mu.Lock()
+	if c.refreshing {
+		c.mu.Unlock()
+		return false
+	}
+	// Cold and idle: no load is in flight, so whichever load comes next
+	// reads the store as it is now. Nothing to merge into, nothing lost.
+	if c.entries == nil {
+		c.mu.Unlock()
+		return true
+	}
+	c.refreshing = true
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.refreshing = false
+		c.mu.Unlock()
+	}()
+
+	updated, err := a.BrowseDetailedPaths(ctx, change.Changed)
+	if err != nil {
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = mergeEntries(c.entries, updated, change)
+	// c.at is deliberately left alone: an incremental merge only covers
+	// what the watcher can see (the watched store's *.gpg files), so the
+	// full-refresh TTL has to keep running on its own schedule as the
+	// safety net for everything it cannot.
+	return true
+}
+
+// mergeEntries rebuilds the cached set from the previous one plus the
+// freshly decrypted entries, sorted by path so the page renders exactly
+// as after a full load. Every touched path is dropped before the
+// decrypted ones go back in: a changed path the decrypt did not return is
+// policy-hidden or already gone, and a full load would skip it too.
+func mergeEntries(current, updated []*store.Entry, change storeChange) []*store.Entry {
+	byPath := make(map[string]*store.Entry, len(current)+len(updated))
+	for _, e := range current {
+		byPath[e.Path] = e
+	}
+	for _, p := range change.Changed {
+		delete(byPath, p)
+	}
+	for _, p := range change.Removed {
+		delete(byPath, p)
+	}
+	for _, e := range updated {
+		byPath[e.Path] = e
+	}
+	merged := make([]*store.Entry, 0, len(byPath))
+	for _, e := range byPath {
+		merged = append(merged, e)
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Path < merged[j].Path })
+	return merged
+}
+
+// watchStore keeps the entries cache in step with out-of-band store
+// writes — `mys add` in a terminal, `mys sync pull` — within seconds
+// instead of within entriesCacheTTL. No-op when the store directory
+// cannot be resolved; the TTL refresh then stays the only path in.
+func watchStore(ctx context.Context, a *app.App, cache *entriesCache) {
+	root, err := gopassinit.DefaultStoreDir()
+	if err != nil || root == "" {
+		return
+	}
+	watcher := &storeWatcher{
+		root:     root,
+		poll:     storePollInterval,
+		debounce: storeDebounce,
+		retryCap: storeRetryCap,
+		apply: func(change storeChange) bool {
+			// The server's context, never a request's: a store change
+			// belongs to no request, but it must still stop at shutdown.
+			return cache.applyChange(ctx, a, change)
+		},
+	}
+	watcher.run(ctx)
 }
 
 func handleEntries(a *app.App, cache *entriesCache) http.HandlerFunc {
