@@ -478,6 +478,22 @@ func TestHandleEntriesRefresh_AppliesAndRedirects(t *testing.T) {
 	}
 }
 
+// TestHandleEntriesRefresh_RejectsNonPost: the refresh is a state change,
+// so it answers a GET with 405 and Allow, like every other method-gated
+// handler here — not with a redirect that would make it look bookmarkable.
+func TestHandleEntriesRefresh_RejectsNonPost(t *testing.T) {
+	r := httptest.NewRequest("GET", "/entries/refresh", nil)
+	w := httptest.NewRecorder()
+	handleEntriesRefresh(newEntriesCache(), nil)(w, r)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", w.Code)
+	}
+	if got := w.Header().Get("Allow"); got != "POST" {
+		t.Errorf("Allow = %q, want POST", got)
+	}
+}
+
 // TestHandleEntriesRefresh_WaitsOutAFullRefresh: a full refresh already
 // running re-reads the whole store anyway. The button waits for it
 // rather than starting a second decrypt beside it, and gives up at

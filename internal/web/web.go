@@ -832,13 +832,14 @@ var refreshWaitBudget = 30 * time.Second
 // The check goes through the watcher, whose lock the poll loop shares.
 func handleEntriesRefresh(cache *entriesCache, watcher *storeWatcher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		target := "/entries"
 		if q := strings.TrimSpace(r.FormValue("q")); q != "" {
 			target += "?q=" + url.QueryEscape(q)
-		}
-		if r.Method != http.MethodPost {
-			http.Redirect(w, r, target, http.StatusSeeOther)
-			return
 		}
 		extendWriteDeadline(w, refreshWaitBudget)
 		ctx, cancel := context.WithTimeout(r.Context(), refreshWaitBudget)

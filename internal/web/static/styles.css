@@ -246,10 +246,24 @@ kbd {
   cursor: pointer;
 }
 .btn-refresh:hover { border-color: var(--accent); color: var(--accent); }
-/* Phone: the actions wrap onto their own line, so spread them across it
-   instead of leaving the stamp hanging next to the button. */
+/* Phone: hold the whole sticky block near 100px. Two wrapped lines in the
+   header and a second row for the bar's actions ate a quarter of the
+   viewport, which the list needs more than the search field needs width. */
 @media (max-width: 600px) {
-  .bar-actions { margin-left: 0; width: 100%; justify-content: space-between; }
+  header { padding: 0.55rem 1rem; gap: 1rem; }
+  header h1 { font-size: 0.95rem; white-space: nowrap; }
+  nav a { margin-right: 0.7rem; font-size: 0.8rem; }
+  main { padding: 1rem; }
+  .searchbar { flex-wrap: nowrap; gap: 0.5rem; padding: 0.5rem 0; }
+  .searchbar #search, .searchbar #home-search {
+    flex: 1 1 5rem;
+    min-width: 0; /* without this a flex item refuses to shrink past its content */
+    font-size: 0.9rem;
+    padding: 0.5rem 0.7rem;
+  }
+  .bar-actions { margin-left: 0; gap: 0.5rem; }
+  .freshness { font-size: 0.7rem; }
+  .btn-refresh { padding: 0.4rem 0.7rem; font-size: 0.8rem; }
 }
 
 /* Scroll a too-wide entries table inside its own group instead of
