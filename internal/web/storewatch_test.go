@@ -3,13 +3,20 @@ package web
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 )
@@ -246,12 +253,11 @@ func TestStoreWatcher_BacksOffWhileApplyFails(t *testing.T) {
 		apply:    recorder.apply,
 	}
 
-	state := &pollState{}
-	if got := watcher.step(state); got != watcher.poll {
+	if got := watcher.step(); got != watcher.poll {
 		t.Fatalf("baseline round = %v, want the poll interval %v", got, watcher.poll)
 	}
 	writeSecretFile(t, root, "jasp/new", "1")
-	if got := watcher.step(state); got != watcher.debounce {
+	if got := watcher.step(); got != watcher.debounce {
 		t.Fatalf("round that saw the change = %v, want the debounce %v", got, watcher.debounce)
 	}
 
@@ -262,7 +268,7 @@ func TestStoreWatcher_BacksOffWhileApplyFails(t *testing.T) {
 		400 * time.Millisecond, // capped
 	}
 	for i, wantDelay := range want {
-		if got := watcher.step(state); got != wantDelay {
+		if got := watcher.step(); got != wantDelay {
 			t.Errorf("retry %d delay = %v, want %v", i+1, got, wantDelay)
 		}
 	}
@@ -271,14 +277,14 @@ func TestStoreWatcher_BacksOffWhileApplyFails(t *testing.T) {
 	recorder.failNow = false
 	recorder.mu.Unlock()
 
-	if got := watcher.step(state); got != watcher.poll {
+	if got := watcher.step(); got != watcher.poll {
 		t.Errorf("after a successful apply = %v, want the poll interval %v", got, watcher.poll)
 	}
-	if !state.pending.empty() {
-		t.Errorf("a successful apply must consume the change, still pending: %+v", state.pending)
+	if !watcher.state.pending.empty() {
+		t.Errorf("a successful apply must consume the change, still pending: %+v", watcher.state.pending)
 	}
-	if state.backoff != 0 {
-		t.Errorf("backoff = %v after success, want reset to 0", state.backoff)
+	if watcher.state.backoff != 0 {
+		t.Errorf("backoff = %v after success, want reset to 0", watcher.state.backoff)
 	}
 }
 
@@ -371,6 +377,195 @@ func TestServeWith_WaitsForBackgroundDecrypt(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if got := f.GetCallCount(); got != settled {
 		t.Errorf("store still being read after serveWith returned: %d → %d Get calls", settled, got)
+	}
+}
+
+// TestHandleEntries_RendersStickyBar: the sticky bar's affordances are
+// server-rendered, so they exist without JavaScript — the freshness stamp
+// (only once the cache has actually loaded) and the refresh button with
+// the search carried in a hidden field.
+func TestHandleEntries_RendersStickyBar(t *testing.T) {
+	a, _ := newFakeApp(t, "human", sampleWebEntries()...)
+	r := httptest.NewRequest("GET", "/entries?q=jasp", nil)
+	w := httptest.NewRecorder()
+	handleEntries(a, newEntriesCache())(w, r)
+
+	body := w.Body.String()
+	for _, want := range []string{
+		`class="searchbar"`,
+		`action="/entries/refresh"`,
+		`name="q" value="jasp"`,
+		"Aktualisieren",
+		"Prüft den Store sofort auf Änderungen",
+		"Stand ",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("entries page missing %q", want)
+		}
+	}
+}
+
+// newTestWatcher builds a watcher over root that applies into cache.
+func newTestWatcher(root string, cache *entriesCache, a *app.App) *storeWatcher {
+	return &storeWatcher{
+		root:     root,
+		poll:     10 * time.Millisecond,
+		debounce: 10 * time.Millisecond,
+		retryCap: 20 * time.Millisecond,
+		apply: func(change storeChange) bool {
+			return cache.applyChange(context.Background(), a, change)
+		},
+	}
+}
+
+func postRefresh(t *testing.T, cache *entriesCache, watcher *storeWatcher, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	body := strings.NewReader(url.Values{"q": {query}}.Encode())
+	r := httptest.NewRequest("POST", "/entries/refresh", body)
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	handleEntriesRefresh(cache, watcher)(w, r)
+	return w
+}
+
+// TestHandleEntriesRefresh_AppliesAndRedirects: the „Aktualisieren"
+// button checks the store on the spot — a secret added seconds ago is in
+// the list right after the redirect — and hands the search back so the
+// filtered view survives the round trip.
+func TestHandleEntriesRefresh_AppliesAndRedirects(t *testing.T) {
+	root := t.TempDir()
+	writeSecretFile(t, root, "jasp/a", "1")
+	a, f := cacheTestApp(t, &store.Entry{Path: "jasp/a", Org: "jasp"})
+	cache := newEntriesCache()
+	if _, err := cache.get(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	watcher := newTestWatcher(root, cache, a)
+	watcher.checkNow() // take the baseline, exactly like the poll loop's first round
+
+	// A `mys add` lands: the file appears and the store gains the entry.
+	writeSecretFile(t, root, "jasp/new", "2")
+	if err := f.Set(context.Background(), &store.Entry{Path: "jasp/new", Org: "jasp", Username: "fresh"}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := cache.freshness()
+	w := postRefresh(t, cache, watcher, "jasp")
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", w.Code)
+	}
+	if got := w.Header().Get("Location"); got != "/entries?q=jasp" {
+		t.Errorf("Location = %q, want /entries?q=jasp", got)
+	}
+
+	got, _ := cache.get(context.Background(), a)
+	paths := make([]string, 0, len(got))
+	for _, e := range got {
+		paths = append(paths, e.Path)
+	}
+	if want := []string{"jasp/a", "jasp/new"}; !reflect.DeepEqual(paths, want) {
+		t.Errorf("after refresh cache = %v, want %v", paths, want)
+	}
+	if !cache.freshness().After(before) {
+		t.Error("freshness stamp not advanced by the applied change")
+	}
+
+	// Pressing it again with nothing to do must not decrypt again.
+	decrypts := f.GetCallCount()
+	postRefresh(t, cache, watcher, "")
+	if f.GetCallCount() != decrypts {
+		t.Errorf("second refresh re-decrypted: %d → %d Get calls", decrypts, f.GetCallCount())
+	}
+}
+
+// TestHandleEntriesRefresh_WaitsOutAFullRefresh: a full refresh already
+// running re-reads the whole store anyway. The button waits for it
+// rather than starting a second decrypt beside it, and gives up at
+// refreshWaitBudget instead of blocking the request forever.
+func TestHandleEntriesRefresh_WaitsOutAFullRefresh(t *testing.T) {
+	root := t.TempDir()
+	writeSecretFile(t, root, "jasp/a", "1")
+	a, f := cacheTestApp(t, &store.Entry{Path: "jasp/a", Org: "jasp"})
+	cache := newEntriesCache()
+	if _, err := cache.get(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	watcher := newTestWatcher(root, cache, a)
+	watcher.checkNow()
+
+	prev := refreshWaitBudget
+	refreshWaitBudget = 150 * time.Millisecond
+	t.Cleanup(func() { refreshWaitBudget = prev })
+
+	cache.mu.Lock()
+	cache.refreshing = true
+	cache.mu.Unlock()
+
+	writeSecretFile(t, root, "jasp/new", "2")
+	if err := f.Set(context.Background(), &store.Entry{Path: "jasp/new", Org: "jasp"}); err != nil {
+		t.Fatal(err)
+	}
+	decrypts := f.GetCallCount()
+
+	start := time.Now()
+	w := postRefresh(t, cache, watcher, "")
+	waited := time.Since(start)
+
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303 even when it could not apply", w.Code)
+	}
+	if got := w.Header().Get("Location"); got != "/entries" {
+		t.Errorf("Location = %q, want /entries", got)
+	}
+	if waited < refreshWaitBudget {
+		t.Errorf("returned after %v, want it to wait out the budget %v", waited, refreshWaitBudget)
+	}
+	if f.GetCallCount() != decrypts {
+		t.Errorf("ran a second decrypt beside the in-flight refresh: %d → %d", decrypts, f.GetCallCount())
+	}
+	// The change stays queued, so the poll loop still applies it later.
+	watcher.mu.Lock()
+	pending := watcher.state.pending
+	watcher.mu.Unlock()
+	if want := []string{"jasp/new"}; !reflect.DeepEqual(pending.Changed, want) {
+		t.Errorf("pending = %v, want it still queued as %v", pending.Changed, want)
+	}
+}
+
+// TestStoreWatcher_ButtonAndLoopNeverApplyTogether: the button and the
+// poll loop share the watcher's lock, so two applies can never overlap —
+// which would mean two concurrent decrypt batches over the same paths.
+func TestStoreWatcher_ButtonAndLoopNeverApplyTogether(t *testing.T) {
+	root := t.TempDir()
+	writeSecretFile(t, root, "jasp/a", "1")
+
+	var inFlight atomic.Int32
+	var overlaps atomic.Int32
+	watcher := &storeWatcher{
+		root:     root,
+		poll:     time.Millisecond,
+		debounce: time.Millisecond,
+		retryCap: 5 * time.Millisecond,
+		apply: func(storeChange) bool {
+			if inFlight.Add(1) > 1 {
+				overlaps.Add(1)
+			}
+			time.Sleep(2 * time.Millisecond)
+			inFlight.Add(-1)
+			return true
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go watcher.run(ctx)
+
+	for i := range 40 {
+		writeSecretFile(t, root, fmt.Sprintf("jasp/n%d", i), "x")
+		watcher.checkNow()
+	}
+	cancel()
+
+	if got := overlaps.Load(); got != 0 {
+		t.Errorf("%d overlapping applies — the poll loop and the button ran together", got)
 	}
 }
 

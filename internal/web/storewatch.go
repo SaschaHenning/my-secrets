@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -161,10 +162,13 @@ type storeWatcher struct {
 	// watcher keeps it pending and retries, so a write landing during a
 	// refresh is never silently dropped.
 	apply func(storeChange) bool
+	// mu serialises whole rounds: the poll loop and the „Aktualisieren"
+	// button must never hand the same pending change to apply twice.
+	mu    sync.Mutex
+	state pollState
 }
 
-// pollState is the watcher loop's state, split out so a single round can
-// be driven from a test without timing. backoff doubles per failed apply
+// pollState is the watcher loop's state. backoff doubles per failed apply
 // and resets once one succeeds.
 type pollState struct {
 	last    storeFingerprint
@@ -176,7 +180,6 @@ type pollState struct {
 // only a baseline — a store that exists at startup must not look like one
 // where every entry was just added.
 func (w *storeWatcher) run(ctx context.Context) {
-	var state pollState
 	timer := time.NewTimer(w.poll)
 	defer timer.Stop()
 	for {
@@ -185,37 +188,76 @@ func (w *storeWatcher) run(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		timer.Reset(w.step(&state))
+		timer.Reset(w.step())
 	}
 }
 
 // step runs one poll round and returns how long to wait before the next:
 // the debounce window while a change is settling, the current backoff
 // while an apply keeps failing, the poll interval otherwise.
-func (w *storeWatcher) step(state *pollState) time.Duration {
-	current, err := fingerprintStore(w.root)
+func (w *storeWatcher) step() time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	moving, err := w.observe()
 	if err != nil {
 		return w.poll
 	}
-	if state.last == nil {
-		state.last = current
-		return w.poll
-	}
-	if change := diffFingerprints(state.last, current); !change.empty() {
-		state.pending = state.pending.merge(change)
-		state.last = current
+	if moving {
 		return w.debounce // let the rest of the write burst land first
 	}
-	if state.pending.empty() {
+	if w.state.pending.empty() {
 		return w.poll
 	}
-	if !w.apply(state.pending) {
-		state.backoff = w.nextBackoff(state.backoff)
-		return state.backoff
+	if !w.applyPending() {
+		w.state.backoff = w.nextBackoff(w.state.backoff)
+		return w.state.backoff
 	}
-	state.pending = storeChange{}
-	state.backoff = 0
 	return w.poll
+}
+
+// checkNow runs one round immediately and applies what it finds, skipping
+// the debounce: the operator pressed the button, so there is no burst
+// left to wait out. Blocks while the poll loop holds a round.
+func (w *storeWatcher) checkNow() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, err := w.observe(); err != nil {
+		return
+	}
+	w.applyPending()
+}
+
+// observe fingerprints the store and merges any diff into the pending
+// change. Reports whether the store moved: wait out the rest of the burst.
+func (w *storeWatcher) observe() (bool, error) {
+	current, err := fingerprintStore(w.root)
+	if err != nil {
+		return false, err
+	}
+	if w.state.last == nil {
+		w.state.last = current
+		return false, nil
+	}
+	change := diffFingerprints(w.state.last, current)
+	if change.empty() {
+		return false, nil
+	}
+	w.state.pending = w.state.pending.merge(change)
+	w.state.last = current
+	return true, nil
+}
+
+// applyPending hands the queued change over, clearing it on success.
+func (w *storeWatcher) applyPending() bool {
+	if w.state.pending.empty() {
+		return true
+	}
+	if !w.apply(w.state.pending) {
+		return false
+	}
+	w.state.pending = storeChange{}
+	w.state.backoff = 0
+	return true
 }
 
 // nextBackoff doubles the retry delay from one debounce window to retryCap.

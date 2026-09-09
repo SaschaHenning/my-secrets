@@ -16,10 +16,19 @@
 <main>
 
 <section>
-  <label for="search" class="sr-only">Search entries</label>
-  <input type="search" id="search" value="{{.Query}}" placeholder="path, domain, username, tag…" aria-label="Search entries" autofocus autocomplete="off">
+  <div class="searchbar">
+    <label for="search" class="sr-only">Search entries</label>
+    <input type="search" id="search" value="{{.Query}}" placeholder="path, domain, username, tag…" aria-label="Search entries" autofocus autocomplete="off">
+    <div class="bar-actions">
+      {{if .Stand}}<span class="freshness" title="Zeitpunkt des letzten Ladens oder der letzten erkannten Store-Änderung">Stand {{.Stand}}</span>{{end}}
+      <form method="post" action="/entries/refresh" id="refresh-form">
+        <input type="hidden" name="q" value="{{.Query}}">
+        <button type="submit" class="btn-refresh" title="Prüft den Store sofort auf Änderungen">Aktualisieren</button>
+      </form>
+    </div>
+  </div>
   {{if .Groups}}
-  <p class="kbd-hint"><kbd>↓</kbd><kbd>↑</kbd> auswählen · <kbd>Enter</kbd> Passwort kopieren · <kbd>⇧ Enter</kbd> öffnen · <kbd>⌥ Enter</kbd> Nutzername · <kbd>Esc</kbd> Suche zurücksetzen</p>
+  <p class="kbd-hint"><kbd>/</kbd> Suche fokussieren · <kbd>↓</kbd><kbd>↑</kbd> auswählen · <kbd>Enter</kbd> Passwort kopieren · <kbd>⇧ Enter</kbd> öffnen · <kbd>⌥ Enter</kbd> Nutzername · <kbd>Esc</kbd> Suche zurücksetzen</p>
   {{end}}
 
   {{if not .Groups}}
@@ -87,6 +96,16 @@
     var focus = function () { input.focus(); };
     if (!input.value) focus();
     window.addEventListener('pageshow', function (e) { if (e.persisted && !input.value) focus(); });
+
+    // Carry the live client-side filter through the refresh round trip —
+    // the hidden field only holds the ?q= the page was loaded with.
+    var refreshForm = document.getElementById('refresh-form');
+    if (refreshForm) {
+      refreshForm.addEventListener('submit', function () {
+        var carry = refreshForm.querySelector('input[name="q"]');
+        if (carry) carry.value = input.value;
+      });
+    }
     // Copy buttons (data-copy-username / data-copy-password) are handled
     // globally by /static/app.js.
   })();
