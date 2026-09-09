@@ -640,6 +640,72 @@ func (a *App) BrowseDetailed(
 	return entries, nil
 }
 
+// BrowseDetailedPaths decrypts exactly the given paths and returns the
+// same full metadata BrowseDetailed does, for callers that already know
+// which entries changed (the web UI's store watcher) and must not pay a
+// whole-store re-decrypt to pick them up.
+//
+// Audit shape is deliberately identical to BrowseDetailed: ONE aggregated
+// ActionListDetail row per call, never one ActionGet row per path — a
+// background refresh must not make "last read" (audit.LastAccessByPath,
+// filtered to ActionGet) claim the user read those entries. Paths that
+// policy hides, or that are malformed, are dropped silently by
+// decryptBatch, so a missing path means "not visible", not "unchanged".
+func (a *App) BrowseDetailedPaths(
+	ctx context.Context,
+	paths []string,
+) (resultEntries []*store.Entry, resultErr error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	target := orgPath(sharedOrg(paths))
+	d := a.callerDetail()
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		a.writeAudit(ctx, audit.ActionListDetail, target, d, audit.ResultError, err.Error())
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			resultEntries = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	entries, err := operation.decryptBatch(ctx, paths, "list_detail")
+	if err != nil {
+		auditContext := ctx
+		if ctx.Err() != nil {
+			auditContext = context.Background()
+		}
+		a.writeAudit(
+			auditContext, audit.ActionListDetail, target, d,
+			audit.ResultError, err.Error(),
+		)
+		return nil, err
+	}
+	a.writeAudit(ctx, audit.ActionListDetail, target, d, audit.ResultOK,
+		fmt.Sprintf("%d of %d changed entries", len(entries), len(paths)))
+	return entries, nil
+}
+
+// sharedOrg returns the org every path belongs to, or "" when they span
+// more than one — the audit row then covers the whole store, like
+// BrowseDetailed(ctx, "").
+func sharedOrg(paths []string) string {
+	shared := ""
+	for i, p := range paths {
+		org := store.OrgOf(p)
+		if i == 0 {
+			shared = org
+			continue
+		}
+		if org != shared {
+			return ""
+		}
+	}
+	return shared
+}
+
 // Inspect decrypts a single entry for metadata display — Kind, Tags,
 // Domain, etc. Like BrowseDetailed, this writes an ActionListDetail row,
 // NOT ActionGet: the web UI's masked entry-detail page uses Inspect, so

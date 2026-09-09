@@ -1,6 +1,10 @@
 // Package gopassinit bootstraps a fresh gopass store against a specific
-// GPG key id. It is only used by `mys init`; once the store exists,
-// the rest of my-secrets talks to gopass as a Go library.
+// GPG key id. Bootstrapping is only used by `mys init`; once the store
+// exists, the rest of my-secrets talks to gopass as a Go library.
+// DefaultStoreDir is the exception: it is the shared answer to "where
+// does the store live on disk", used by anything that has to look at the
+// store as files rather than through the library (the web UI's store
+// watcher).
 //
 // Bootstrapping requires the `gopass` binary on PATH because the init
 // flow touches global config (~/.config/gopass/config), the store

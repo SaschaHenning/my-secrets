@@ -686,7 +686,7 @@ func TestEntriesCache_WarmPrepopulates(t *testing.T) {
 	a, f := cacheTestApp(t, &store.Entry{Path: "jasp/a", Org: "jasp"}, &store.Entry{Path: "jasp/b", Org: "jasp"})
 	cache := newEntriesCache()
 
-	cache.warm(a)
+	cache.warm(context.Background(), a)
 	after := f.GetCallCount()
 	if after == 0 {
 		t.Fatal("warm should have decrypted the store")

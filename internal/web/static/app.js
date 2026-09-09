@@ -59,6 +59,35 @@
   });
 })();
 
+// Publish the header's real height as --header-h so the sticky search bar
+// sits flush under it at any width. CSS cannot read it, and a fixed value
+// drifts the moment the header wraps on a narrow screen.
+(function () {
+  var header = document.querySelector('header');
+  if (!header) return;
+  function publish() {
+    document.documentElement.style.setProperty('--header-h', header.offsetHeight + 'px');
+  }
+  publish();
+  if (window.ResizeObserver) new ResizeObserver(publish).observe(header);
+  else window.addEventListener('resize', publish);
+})();
+
+// "/" focuses the page's search box from anywhere. Ignored while typing
+// in a field, so a slash inside a query still reaches the input.
+(function () {
+  var box = document.getElementById('search') || document.getElementById('home-search');
+  if (!box) return;
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+    var el = document.activeElement;
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+    e.preventDefault();
+    box.focus();
+    box.select();
+  });
+})();
+
 // Keyboard-first navigation of the entries table: find a password with
 // zero mouse. Active only on /entries (gated on #search), so the start
 // page's form-wrapped search box keeps its plain Enter → /entries?q=

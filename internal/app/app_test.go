@@ -1791,6 +1791,54 @@ func TestBrowseDetailed_NoPerPathGetRows(t *testing.T) {
 	}
 }
 
+// TestBrowseDetailedPaths_FiltersAndAggregatesLikeBrowseDetailed: the
+// incremental variant the web UI's store watcher uses must keep both
+// BrowseDetailed guarantees — a policy-hidden or malformed path is never
+// returned, and the call costs exactly one aggregated list_detail row and
+// no ActionGet row at all. A watcher firing on every store write is
+// precisely the thing that would ruin "last read" otherwise.
+func TestBrowseDetailedPaths_FiltersAndAggregatesLikeBrowseDetailed(t *testing.T) {
+	a, _ := appWithFake(t, "claude-code", sampleEntries()...)
+	ctx := context.Background()
+	entries, err := a.BrowseDetailedPaths(ctx, []string{"jasp/github", "private/bank", "../escape"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Path != "jasp/github" {
+		t.Fatalf("want only the visible path decrypted, got %+v", entries)
+	}
+	if entries[0].Username != "alice" {
+		t.Errorf("want decrypted metadata, got %+v", entries[0])
+	}
+	getRows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionGet, Limit: 50})
+	if len(getRows) != 0 {
+		t.Fatalf("BrowseDetailedPaths must not write ActionGet rows, got %d: %+v", len(getRows), getRows)
+	}
+	detailRows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionListDetail, Limit: 50})
+	if len(detailRows) != 1 {
+		t.Fatalf("want exactly 1 aggregated list_detail row, got %d", len(detailRows))
+	}
+}
+
+// TestBrowseDetailedPaths_EmptyIsANoop: no paths means no work and no
+// audit row — a watcher that polls forever must not fill the log with
+// "0 entries" rows.
+func TestBrowseDetailedPaths_EmptyIsANoop(t *testing.T) {
+	a, f := appWithFake(t, "human", sampleEntries()...)
+	ctx := context.Background()
+	entries, err := a.BrowseDetailedPaths(ctx, nil)
+	if err != nil || entries != nil {
+		t.Fatalf("want (nil, nil), got (%+v, %v)", entries, err)
+	}
+	if f.GetCallCount() != 0 {
+		t.Errorf("want no decrypts, got %d", f.GetCallCount())
+	}
+	rows, _ := a.Audit.Tail(ctx, audit.Filter{Action: audit.ActionListDetail, Limit: 50})
+	if len(rows) != 0 {
+		t.Errorf("want no audit rows, got %d", len(rows))
+	}
+}
+
 func TestBrowseDetailed_StoreError(t *testing.T) {
 	a, f := appWithFake(t, "human", sampleEntries()...)
 	f.ListErr = errors.New("nope")

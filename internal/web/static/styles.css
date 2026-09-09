@@ -26,6 +26,13 @@ header {
   display: flex;
   align-items: center;
   gap: 2rem;
+  /* Sticky so navigation stays reachable while a long entry list
+     scrolls. Needs an opaque background — rows would otherwise show
+     through it. */
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg);
 }
 header h1 { font-size: 1.1rem; font-weight: 700; }
 nav a {
@@ -137,7 +144,10 @@ table.audit code, .entries-table code { font-family: 'SF Mono', Menlo, monospace
 .entries-table a { color: var(--text); text-decoration: none; }
 .entries-table a:hover code { color: var(--accent); }
 .entry-actions { white-space: nowrap; }
-/* Keyboard-navigation highlight for the active row (↓/↑). */
+/* Keyboard-navigation highlight for the active row (↓/↑). The scroll
+   margin keeps a row scrolled into view clear of the sticky header and
+   search bar instead of under them. */
+.entry-row { scroll-margin-top: 8rem; }
 .entry-row.active > td { background: var(--surface2); }
 .entry-row.active > td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 .kbd-hint { color: var(--muted); font-size: 0.75rem; margin: 0.25rem 0 1rem; }
@@ -206,7 +216,61 @@ kbd {
 }
 #search:focus, #home-search:focus { outline: none; border-color: var(--accent); }
 
-.org-group { margin-bottom: 2rem; }
+/* Search bar: sticks directly under the sticky header, so search and
+   „Aktualisieren" stay reachable deep in a long list. --header-h is
+   measured by app.js because the header's height changes with the
+   viewport; the fallback holds until that runs. */
+.searchbar {
+  position: sticky;
+  top: var(--header-h, 3.6rem);
+  z-index: 10;
+  background: var(--bg);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1rem;
+}
+.searchbar #search, .searchbar #home-search { margin-bottom: 0; flex: 1 1 16rem; }
+.bar-actions { display: flex; align-items: center; gap: 0.6rem; margin-left: auto; }
+.freshness { color: var(--muted); font-size: 0.78rem; white-space: nowrap; }
+.btn-refresh {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 0.45rem 0.9rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.btn-refresh:hover { border-color: var(--accent); color: var(--accent); }
+/* Phone: hold the whole sticky block near 100px. Two wrapped lines in the
+   header and a second row for the bar's actions ate a quarter of the
+   viewport, which the list needs more than the search field needs width. */
+@media (max-width: 600px) {
+  header { padding: 0.55rem 1rem; gap: 1rem; }
+  header h1 { font-size: 0.95rem; white-space: nowrap; }
+  nav a { margin-right: 0.7rem; font-size: 0.8rem; }
+  main { padding: 1rem; }
+  .searchbar { flex-wrap: nowrap; gap: 0.5rem; padding: 0.5rem 0; }
+  .searchbar #search, .searchbar #home-search {
+    flex: 1 1 5rem;
+    min-width: 0; /* without this a flex item refuses to shrink past its content */
+    font-size: 0.9rem;
+    padding: 0.5rem 0.7rem;
+  }
+  .bar-actions { margin-left: 0; gap: 0.5rem; }
+  .freshness { font-size: 0.7rem; }
+  .btn-refresh { padding: 0.4rem 0.7rem; font-size: 0.8rem; }
+}
+
+/* Scroll a too-wide entries table inside its own group instead of
+   letting the whole page scroll sideways: page-level overflow slides out
+   from under the sticky header and search bar, which then look broken on
+   a phone. */
+.org-group { margin-bottom: 2rem; overflow-x: auto; }
 .kind-badge { background: var(--surface2); color: var(--text); }
 
 .tag-row { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; }
