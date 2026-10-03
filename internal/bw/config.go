@@ -1,7 +1,10 @@
 package bw
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,12 +38,6 @@ type Config struct {
 type OrgTarget struct {
 	OrganizationID string   `yaml:"organization_id"`
 	CollectionIDs  []string `yaml:"collection_ids"`
-}
-
-// Target returns the organization placement configured for org.
-func (c *Config) Target(org string) (OrgTarget, bool) {
-	t, ok := c.Organizations[org]
-	return t, ok
 }
 
 func (c *Config) validate() error {
@@ -102,7 +99,11 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("read bw config: %w", err)
 	}
 	var c Config
-	if err := yaml.Unmarshal(b, &c); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(b))
+	// A typo like "organisations" would otherwise silently push a team
+	// org into the personal vault.
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parse bw config: %w", err)
 	}
 	if c.Version == 0 {

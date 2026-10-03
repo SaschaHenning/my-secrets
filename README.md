@@ -500,13 +500,26 @@ Ordner sind in Bitwarden persönlich, Kollegen sehen nur Items in einer
 - Bestehende persönliche Spiegel-Items dieser Org werden per `bw move`
   in die Organisation verschoben. `--dry-run` zeigt Ziel-Organisation
   und Sammlungen je Item.
-- Items, die schon in einer Organisation liegen (auch von Hand
-  verschoben), bleiben dort; Updates behalten Organisation und
-  Sammlungen bei.
+- Gesucht wird in den `mys/*`-Ordnern und zusätzlich in jeder
+  konfigurierten Organisation, weil Ordner pro Person gelten. Aus einer
+  Organisation zählen nur Items, deren `mys-path` zu einer Org gehört,
+  die genau auf diese Organisation zeigt. Ein Kollege kann so kein Item
+  `zuhause/x` anlegen, in das der nächste Push ein privates Secret
+  schreibt.
+- Updates behalten Organisation und Sammlungen bei. Liegt ein Item in
+  einer Organisation, auf die seine Org nicht zeigt (oder ist die Org gar
+  nicht gemappt), überspringt `bw-push` es mit Warnung: kein Update,
+  kein Move.
 - Eine Änderung von `collection_ids` gilt nur für neue und frisch
   verschobene Items; bestehende Org-Items werden nicht umsortiert.
-- `--prune` verschiebt auch geteilte Items in den Papierkorb. Damit
-  verschwinden sie für alle Mitglieder der Sammlung.
+- `--prune` lässt Items in einer Organisation liegen und meldet nur ihre
+  Anzahl. Erst `--prune-shared` (zusätzlich zu `--prune`) verschiebt sie
+  in den Papierkorb; Plan und Rückfrage markieren sie als SHARED, denn
+  sie verschwinden für alle Mitglieder der Sammlung. `--yes` allein
+  reicht dafür nicht.
+- `bw.yaml` wird strikt gelesen: unbekannte Schlüssel (etwa
+  `organisations`) brechen ab. Ein Mapping für eine Org, die es im Store
+  nicht gibt, erzeugt eine Warnung.
 
 Ohne `organizations`-Eintrag bleibt alles im persönlichen Tresor. Die IDs
 zeigen `bw list organizations` und `bw list collections`.

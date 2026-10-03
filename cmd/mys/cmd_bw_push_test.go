@@ -171,9 +171,10 @@ func TestRunBwPush_DryRunShowsOrganizationTarget(t *testing.T) {
 	existing := &store.Entry{Path: "jasp/old", Org: "jasp", Password: "x"}
 	a := fakeApp(t, existing, &store.Entry{Path: "jasp/new", Org: "jasp", Password: "y"})
 	r := &stubBWRunner{Responses: map[string][]byte{
-		"status":                   unlockedStatus,
-		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
-		"list items --folderid f1": mirrorItemJSON(t, "f1", existing),
+		"status":                            unlockedStatus,
+		"list folders":                      []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1":          mirrorItemJSON(t, "f1", existing),
+		"list items --organizationid org-1": []byte(`[]`),
 	}}
 	cfg := &bw.Config{Organizations: map[string]bw.OrgTarget{
 		"jasp": {OrganizationID: "org-1", CollectionIDs: []string{"col-1"}},
@@ -199,6 +200,51 @@ func TestRunBwPush_DryRunShowsOrganizationTarget(t *testing.T) {
 	rows := bwPushRows(t, a)
 	if len(rows) != 1 || !strings.Contains(rows[0].Reason, "create=1") || !strings.Contains(rows[0].Reason, "move=1") {
 		t.Fatalf("rows = %+v, want dry-run row with create=1 move=1", rows)
+	}
+}
+
+func TestRunBwPush_SharedPruneIsMarkedAndUnknownMappingWarns(t *testing.T) {
+	a := fakeApp(t, &store.Entry{Path: "jasp/keep", Org: "jasp", Password: "x"})
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":       unlockedStatus,
+		"list folders": []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1": []byte(`[{"id":"i-gone","organizationId":"org-1","type":1,"name":"gone",
+			"fields":[{"name":"mys-path","value":"jasp/gone"}]}]`),
+		"list items --organizationid org-1": []byte(`[]`),
+	}}
+	cfg := &bw.Config{Organizations: map[string]bw.OrgTarget{
+		"jasp": {OrganizationID: "org-1", CollectionIDs: []string{"col-1"}},
+		"typo": {OrganizationID: "org-1", CollectionIDs: []string{"col-1"}},
+	}}
+	run := func(pruneShared bool) string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+			bwPushOptions{Session: "tok", DryRun: true, Prune: true, PruneShared: pruneShared, Config: cfg})
+		if err != nil {
+			t.Fatalf("runBwPush: %v", err)
+		}
+		if !strings.Contains(stderr.String(), `organizations.typo, but the store has no org "typo"`) {
+			t.Errorf("stderr = %q, want unknown-mapping warning", stderr.String())
+		}
+		return stdout.String()
+	}
+	if out := run(false); strings.Contains(out, "- jasp/gone") || !strings.Contains(out, "1 stale items inside an organization left alone") {
+		t.Errorf("--prune alone must not plan the shared prune:\n%s", out)
+	}
+	if out := run(true); !strings.Contains(out, "- jasp/gone (to trash, SHARED") {
+		t.Errorf("--prune-shared must mark the shared prune:\n%s", out)
+	}
+}
+
+func TestBwPushCmd_PruneSharedRequiresPrune(t *testing.T) {
+	req := ""
+	c := bwPushCmd(&req)
+	c.SetArgs([]string{"--prune-shared"})
+	c.SetOut(&bytes.Buffer{})
+	c.SetErr(&bytes.Buffer{})
+	if err := c.Execute(); err == nil || !strings.Contains(err.Error(), "--prune-shared requires --prune") {
+		t.Fatalf("err = %v, want flag validation error", err)
 	}
 }
 

@@ -61,20 +61,29 @@ func TestLoadConfig_Organizations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if tg, ok := c.Target("jasp"); !ok || tg.OrganizationID != "org-1" || len(tg.CollectionIDs) != 2 {
-		t.Errorf("Target(jasp) = %+v, %v", tg, ok)
-	}
-	if _, ok := c.Target("zuhause"); ok {
-		t.Error("unmapped org must have no target")
+	if tg, ok := c.Organizations["jasp"]; !ok || tg.OrganizationID != "org-1" || len(tg.CollectionIDs) != 2 {
+		t.Errorf("Organizations[jasp] = %+v, %v", tg, ok)
 	}
 	for name, body := range map[string]string{
 		"no collections":   "organizations:\n  jasp: { organization_id: org-1 }\n",
 		"empty collection": "organizations:\n  jasp: { organization_id: org-1, collection_ids: [\"\"] }\n",
 		"no organization":  "organizations:\n  jasp: { collection_ids: [col-1] }\n",
 		"nested org key":   "organizations:\n  jasp/stage: { organization_id: org-1, collection_ids: [col-1] }\n",
+		"misspelled key":   "organisations:\n  jasp: { organization_id: org-1, collection_ids: [col-1] }\n",
+		"unknown sub key":  "organizations:\n  jasp: { organization_id: org-1, collection: [col-1] }\n",
 	} {
 		if _, err := load(body); err == nil {
 			t.Errorf("%s: want validation error", name)
 		}
+	}
+}
+
+func TestLoadConfig_EmptyFileYieldsDefaults(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "bw.yaml")
+	if err := os.WriteFile(p, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := LoadConfig(p); err != nil || c.Version != 1 {
+		t.Fatalf("LoadConfig(empty) = %+v, %v", c, err)
 	}
 }

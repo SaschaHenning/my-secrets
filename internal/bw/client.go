@@ -190,6 +190,20 @@ func (c *Client) ListItemsInFolder(ctx context.Context, folderID string) ([]Item
 	return its, nil
 }
 
+// ListItemsInOrganization returns every item of one organization the
+// account can see, mirror-managed or not.
+func (c *Client) ListItemsInOrganization(ctx context.Context, organizationID string) ([]Item, error) {
+	out, err := c.r.Run(ctx, nil, c.env(), "list", "items", "--organizationid", organizationID)
+	if err != nil {
+		return nil, err
+	}
+	var its []Item
+	if err := json.Unmarshal(bytes.TrimSpace(out), &its); err != nil {
+		return nil, fmt.Errorf("parse bw items: %w", err)
+	}
+	return its, nil
+}
+
 // CreateFolder creates a folder and returns it with the server-assigned
 // id. Folder ids on the server are random — the deterministic UUIDv5
 // ids from FolderID exist only for file exports.

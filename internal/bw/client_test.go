@@ -183,7 +183,7 @@ func TestFetchRemoteState_OnlyNamespaceFoldersAreRead(t *testing.T) {
 		"list items --folderid f1": []byte(`[{"id":"i1","type":1,"name":"a","folderId":"f1"}]`),
 		"list items --folderid f3": []byte(`[]`),
 	}}
-	rs, err := FetchRemoteState(context.Background(), NewClient(r))
+	rs, err := FetchRemoteState(context.Background(), NewClient(r), nil)
 	if err != nil {
 		t.Fatalf("FetchRemoteState: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestFetchRemoteState_AlwaysFetchesWholeNamespace(t *testing.T) {
 		"list items --folderid f1": []byte(`[]`),
 		"list items --folderid f3": []byte(`[]`),
 	}}
-	rs, err := FetchRemoteState(context.Background(), NewClient(r))
+	rs, err := FetchRemoteState(context.Background(), NewClient(r), nil)
 	if err != nil {
 		t.Fatalf("FetchRemoteState: %v", err)
 	}
@@ -304,5 +304,31 @@ func TestExecutePush_MovesBeforeUpdates(t *testing.T) {
 	}
 	if sent.OrganizationID != "org-1" || sent.FolderID != "f1" {
 		t.Errorf("edit payload = %+v, want org-1 in folder f1", sent)
+	}
+}
+
+func TestFetchRemoteState_OrganizationItemsOnlyForTheirMappedOrg(t *testing.T) {
+	jaspInFolder := `{"id":"i-folder","organizationId":"org-1","fields":[{"name":"mys-path","value":"jasp/a"}]}`
+	r := &fakeRunner{Responses: map[string][]byte{
+		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1": []byte(`[` + jaspInFolder + `]`),
+		"list items --organizationid org-1": []byte(`[
+			` + jaspInFolder + `,
+			{"id":"i-nofolder","organizationId":"org-1","fields":[{"name":"mys-path","value":"jasp/b"}]},
+			{"id":"i-forged","organizationId":"org-1","fields":[{"name":"mys-path","value":"zuhause/x"}]},
+			{"id":"i-team","organizationId":"org-1","name":"team login"}
+		]`),
+	}}
+	targets := map[string]OrgTarget{"jasp": {OrganizationID: "org-1", CollectionIDs: []string{"col-1"}}}
+	rs, err := FetchRemoteState(context.Background(), NewClient(r), targets)
+	if err != nil {
+		t.Fatalf("FetchRemoteState: %v", err)
+	}
+	var ids []string
+	for _, it := range rs.Items {
+		ids = append(ids, it.ID)
+	}
+	if strings.Join(ids, ",") != "i-folder,i-nofolder" {
+		t.Fatalf("items = %v, want the folder item once plus the folderless jasp item; forged and foreign items dropped", ids)
 	}
 }
