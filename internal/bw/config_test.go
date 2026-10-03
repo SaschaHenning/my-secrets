@@ -39,6 +39,20 @@ func TestLoadConfig_ValidYAML(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_ExcludePaths(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "bw.yaml")
+	if err := os.WriteFile(p, []byte("exclude_paths: [jasp/a]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(p)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !c.Excluded("jasp/a") || c.Excluded("jasp/b") {
+		t.Errorf("Excluded mismatch for %v", c.ExcludePaths)
+	}
+}
+
 func TestLoadConfig_MalformedYAMLFails(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "bw.yaml")
 	if err := os.WriteFile(p, []byte(":\t not yaml ["), 0o600); err != nil {

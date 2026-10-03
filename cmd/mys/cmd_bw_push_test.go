@@ -270,6 +270,26 @@ func TestBwPushCmd_PruneSharedRequiresPrune(t *testing.T) {
 	}
 }
 
+func TestRunBwPush_SkipsExcludedPaths(t *testing.T) {
+	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"})
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":       unlockedStatus,
+		"list folders": []byte(`[]`),
+	}}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{Session: "tok", Yes: true, Config: &bw.Config{ExcludePaths: []string{"jasp/a"}}})
+	if err != nil {
+		t.Fatalf("runBwPush: %v", err)
+	}
+	if r.called("create item") {
+		t.Fatalf("calls = %v, want no item for an excluded path", r.Calls)
+	}
+	if !strings.Contains(stderr.String(), "skip jasp/a: listed in exclude_paths") {
+		t.Errorf("stderr = %q, want skip notice", stderr.String())
+	}
+}
+
 func TestRunBwPush_CreatesAndAudits(t *testing.T) {
 	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"})
 	r := &stubBWRunner{Responses: map[string][]byte{

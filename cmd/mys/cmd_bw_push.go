@@ -170,6 +170,10 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 		if p == cfg.PasswordPath() {
 			continue
 		}
+		if cfg.Excluded(p) {
+			fmt.Fprintf(stderr, "skip %s: listed in exclude_paths\n", p)
+			continue
+		}
 		e, err := a.Get(ctx, p)
 		if err != nil {
 			fmt.Fprintf(stderr, "skip %s: %v\n", p, err)

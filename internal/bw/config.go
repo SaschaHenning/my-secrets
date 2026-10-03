@@ -32,6 +32,19 @@ type Config struct {
 	// Bitwarden organization and collections its mirror items belong
 	// in. Orgs without an entry stay in the personal vault.
 	Organizations map[string]OrgTarget `yaml:"organizations,omitempty"`
+	// ExcludePaths are store paths that already live in Bitwarden as a
+	// hand-made item; mirroring them would put a second copy next to it.
+	ExcludePaths []string `yaml:"exclude_paths,omitempty"`
+}
+
+// Excluded reports whether path is listed in exclude_paths.
+func (c *Config) Excluded(path string) bool {
+	for _, p := range c.ExcludePaths {
+		if p == path {
+			return true
+		}
+	}
+	return false
 }
 
 // OrgTarget is the Bitwarden organization placement for one mys org.
