@@ -479,7 +479,8 @@ Item liegt im Ordner `mys/<org>` und trägt das Custom-Field `mys-path`;
 darüber werden Items bei jedem Lauf wiedergefunden. Items außerhalb von
 `mys/*` liest und ändert der Befehl nie. Vorher einmal pro Gerät
 `bw login`; das Master-Passwort kommt aus dem Store
-(`private/bitwarden/master-password`). AI-Caller sind hart gesperrt.
+(`private/bitwarden/master-password`). AI-Caller dürfen spiegeln, aber nie
+`--prune` ausführen (Entscheidung 2026-10-03, #109).
 
 Konfiguration in `~/.config/my-secrets/bw.yaml`, alle Schlüssel optional:
 

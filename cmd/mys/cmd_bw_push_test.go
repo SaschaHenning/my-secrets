@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,7 +77,7 @@ func bwPushRows(t *testing.T, a *app.App) []audit.Entry {
 	return rows
 }
 
-func TestBwPushCmd_RefusesAICallersAndAuditsIt(t *testing.T) {
+func TestBwPushCmd_RefusesAIPruneAndAuditsIt(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "audit.sqlite")
 	prev := openAuditOnly
 	openAuditOnly = func() (*app.App, error) {
@@ -90,11 +91,11 @@ func TestBwPushCmd_RefusesAICallersAndAuditsIt(t *testing.T) {
 
 	req := "ai"
 	c := bwPushCmd(&req)
-	c.SetArgs([]string{})
+	c.SetArgs([]string{"--prune"})
 	c.SetOut(&bytes.Buffer{})
 	c.SetErr(&bytes.Buffer{})
 	if err := c.Execute(); err == nil || !strings.Contains(err.Error(), "refused for AI callers") {
-		t.Errorf("err = %v, want AI refusal", err)
+		t.Errorf("err = %v, want AI prune refusal", err)
 	}
 	l, err := audit.Open(dbPath)
 	if err != nil {
@@ -107,6 +108,27 @@ func TestBwPushCmd_RefusesAICallersAndAuditsIt(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Result != audit.ResultDenied {
 		t.Fatalf("rows = %+v, want exactly one denied bw_push row", rows)
+	}
+}
+
+func TestBwPushCmd_AllowsAIPushWithoutPrune(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgDir := filepath.Join(home, ".config", "my-secrets")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "bw.yaml"), []byte("bogus_key: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req := "ai"
+	c := bwPushCmd(&req)
+	c.SetArgs([]string{"--dry-run"})
+	c.SetOut(&bytes.Buffer{})
+	c.SetErr(&bytes.Buffer{})
+	err := c.Execute()
+	if err == nil || strings.Contains(err.Error(), "refused") {
+		t.Errorf("err = %v, want the guard passed and a config error", err)
 	}
 }
 
