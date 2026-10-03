@@ -49,7 +49,7 @@ an entry, items stay in the personal vault.
 --prune moves items whose mys-path no longer exists in the store to the
 Bitwarden trash (soft delete only). Items inside an organization are only
 pruned with --prune-shared as well, because trashing them removes them
-for every member of the collection. AI callers cannot invoke this command.`,
+for every member of the collection. AI callers may push but never prune.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -63,17 +63,16 @@ for every member of the collection. AI callers cannot invoke this command.`,
 			if opts.PruneShared && !opts.Prune {
 				return fmt.Errorf("--prune-shared requires --prune")
 			}
-			// Deny AI-flagged callers outright — with a forensic audit
-			// row, same contract as bw-export: a bulk mirror of the
-			// store is exactly what an AI caller must never trigger.
+			// AI callers may mirror (operator decision 2026-10-03, #109) but
+			// never trash: a prune empties shared collections for the team.
 			detected := caller.Identify(*requester)
-			if detected.Kind == caller.KindAI {
+			if detected.Kind == caller.KindAI && opts.Prune {
 				if aa, aerr := openAuditOnly(); aerr == nil {
 					aa.Override = *requester
-					aa.AuditBWPush(ctx, opts.Org, audit.ResultDenied, "bw-push refused for AI caller")
+					aa.AuditBWPush(ctx, opts.Org, audit.ResultDenied, "bw-push --prune refused for AI caller")
 					_ = aa.Close(ctx)
 				}
-				return fmt.Errorf("bw-push is refused for AI callers")
+				return fmt.Errorf("bw-push --prune is refused for AI callers")
 			}
 			cfg, err := bw.LoadConfig("")
 			if err != nil {
