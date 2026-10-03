@@ -37,6 +37,26 @@ type RemoteState struct {
 	Items   []Item
 	// FolderNames maps folder id → name for the fetched folders.
 	FolderNames map[string]string
+	// Blocked holds mys-paths whose only vault item sits in an
+	// organization the path's org is not mapped to. Push neither writes
+	// nor recreates them: a fresh personal copy would duplicate the item.
+	Blocked map[string]bool
+	// Warnings lists items dropped by the organization rule.
+	Warnings []string
+}
+
+// orgPlacementAllowed reports whether a mirror item may be touched: a
+// personal item always, an organization item only when its mys-path org
+// is mapped to exactly that organization. Any collection member can
+// write any mys-path, so without this rule a forged "zuhause/x" item
+// would receive a private secret, or --prune-shared would trash an item
+// of an unmapped team.
+func orgPlacementAllowed(it Item, targets map[string]OrgTarget) bool {
+	if it.OrganizationID == "" {
+		return true
+	}
+	t, mapped := targets[store.OrgOf(PathOf(it))]
+	return mapped && strings.EqualFold(t.OrganizationID, it.OrganizationID)
 }
 
 // FetchRemoteState lists the vault folders, keeps only the mys
@@ -54,7 +74,20 @@ func FetchRemoteState(ctx context.Context, c *Client, targets map[string]OrgTarg
 	if err != nil {
 		return RemoteState{}, err
 	}
-	rs := RemoteState{FolderNames: map[string]string{}}
+	rs := RemoteState{FolderNames: map[string]string{}, Blocked: map[string]bool{}}
+	keep := func(it Item, block bool) bool {
+		p := PathOf(it)
+		if p == "" || orgPlacementAllowed(it, targets) {
+			return true
+		}
+		if block {
+			rs.Blocked[p] = true
+		}
+		rs.Warnings = append(rs.Warnings, fmt.Sprintf(
+			"skip %s: Bitwarden item %s sits in organization %s, which %s is not mapped to — left untouched",
+			p, it.ID, it.OrganizationID, store.OrgOf(p)))
+		return false
+	}
 	for _, f := range all {
 		if !InNamespace(f.Name) {
 			continue
@@ -65,7 +98,11 @@ func FetchRemoteState(ctx context.Context, c *Client, targets map[string]OrgTarg
 		if err != nil {
 			return RemoteState{}, err
 		}
-		rs.Items = append(rs.Items, items...)
+		for _, it := range items {
+			if keep(it, true) {
+				rs.Items = append(rs.Items, it)
+			}
+		}
 	}
 	seen := map[string]bool{}
 	for _, it := range rs.Items {
@@ -81,16 +118,7 @@ func FetchRemoteState(ctx context.Context, c *Client, targets map[string]OrgTarg
 			return RemoteState{}, err
 		}
 		for _, it := range items {
-			if seen[it.ID] {
-				continue
-			}
-			// Any collection member can write any mys-path. Only a path
-			// whose org is mapped to exactly this organization may match,
-			// or a forged "zuhause/x" item would pull a private secret
-			// into the shared collection on the next push.
-			p := PathOf(it)
-			t, mapped := targets[store.OrgOf(p)]
-			if p == "" || !mapped || !strings.EqualFold(t.OrganizationID, orgID) {
+			if seen[it.ID] || PathOf(it) == "" || !keep(it, false) {
 				continue
 			}
 			seen[it.ID] = true
@@ -186,7 +214,7 @@ func (p PushPlan) HasWrites() bool {
 // to items whose mys-path belongs to that org: a filtered push must not
 // touch other orgs' stale items.
 func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote RemoteState, opts PlanOptions) PushPlan {
-	var plan PushPlan
+	plan := PushPlan{Warnings: slices.Clone(remote.Warnings)}
 	byPath := map[string][]Item{}
 	for _, it := range remote.Items {
 		p := PathOf(it)
@@ -206,6 +234,9 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 		desired, err := ItemFromEntry(e)
 		if err != nil {
 			plan.Warnings = append(plan.Warnings, fmt.Sprintf("skip %s: %v", e.Path, err))
+			continue
+		}
+		if remote.Blocked[e.Path] {
 			continue
 		}
 		folder := FolderName(orgOf(e))
@@ -229,15 +260,10 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 			}
 			move := false
 			switch {
-			case existing.OrganizationID != "" && !mapped:
+			case !orgPlacementAllowed(existing, opts.Targets):
 				plan.Warnings = append(plan.Warnings,
-					fmt.Sprintf("skip %s: Bitwarden item sits in organization %s, but %s is not mapped to it — not writing a personal secret into a shared collection",
+					fmt.Sprintf("skip %s: Bitwarden item sits in organization %s, which %s is not mapped to — left untouched",
 						e.Path, existing.OrganizationID, orgOf(e)))
-				continue
-			case existing.OrganizationID != "" && !strings.EqualFold(existing.OrganizationID, target.OrganizationID):
-				plan.Warnings = append(plan.Warnings,
-					fmt.Sprintf("skip %s: Bitwarden item sits in organization %s, but %s is mapped to %s",
-						e.Path, existing.OrganizationID, orgOf(e), target.OrganizationID))
 				continue
 			case existing.OrganizationID != "":
 				desired.OrganizationID = existing.OrganizationID
@@ -278,6 +304,9 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 				continue
 			}
 			if opts.Org != "" && store.OrgOf(p) != opts.Org {
+				continue
+			}
+			if !orgPlacementAllowed(it, opts.Targets) {
 				continue
 			}
 			if it.OrganizationID != "" && !opts.PruneShared {

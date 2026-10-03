@@ -7,6 +7,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/SaschaHenning/my-secrets/internal/store"
 )
 
 // fakeCall records one runner invocation.
@@ -330,5 +332,32 @@ func TestFetchRemoteState_OrganizationItemsOnlyForTheirMappedOrg(t *testing.T) {
 	}
 	if strings.Join(ids, ",") != "i-folder,i-nofolder" {
 		t.Fatalf("items = %v, want the folder item once plus the folderless jasp item; forged and foreign items dropped", ids)
+	}
+}
+
+func TestFetchRemoteState_UnmappedOrgItemInFolderIsDroppedAndNeverPruned(t *testing.T) {
+	r := &fakeRunner{Responses: map[string][]byte{
+		"list folders": []byte(`[{"id":"f1","name":"mys/zuhause"}]`),
+		"list items --folderid f1": []byte(`[
+			{"id":"i-b","organizationId":"org-b","type":1,"fields":[{"name":"mys-path","value":"zuhause/x"}]}
+		]`),
+		"list items --organizationid org-1": []byte(`[]`),
+	}}
+	targets := map[string]OrgTarget{"jasp": {OrganizationID: "org-1", CollectionIDs: []string{"col-1"}}}
+	rs, err := FetchRemoteState(context.Background(), NewClient(r), targets)
+	if err != nil {
+		t.Fatalf("FetchRemoteState: %v", err)
+	}
+	if len(rs.Items) != 0 || !rs.Blocked["zuhause/x"] || len(rs.Warnings) != 1 {
+		t.Fatalf("remote = %+v, want item dropped, path blocked, one warning", rs)
+	}
+	plan := BuildPushPlan(nil, map[string]bool{}, rs, PlanOptions{Prune: true, PruneShared: true, Targets: targets})
+	if plan.HasWrites() || len(plan.Warnings) != 1 || !strings.HasPrefix(plan.Warnings[0], "skip zuhause/x") {
+		t.Fatalf("plan = %+v, want no prune and the skip warning", plan)
+	}
+	e := &store.Entry{Path: "zuhause/x", Org: "zuhause", Password: "private"}
+	plan = BuildPushPlan([]*store.Entry{e}, map[string]bool{"zuhause/x": true}, rs, PlanOptions{Targets: targets})
+	if plan.HasWrites() {
+		t.Fatalf("plan = %+v, a blocked path must not be recreated next to the org item", plan)
 	}
 }
