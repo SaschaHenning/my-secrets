@@ -76,6 +76,14 @@ type PlannedWrite struct {
 	ID string
 }
 
+// PlannedMove is one personal-to-organization move decision.
+type PlannedMove struct {
+	ID             string
+	Path           string
+	OrganizationID string
+	CollectionIDs  []string
+}
+
 // PlannedPrune is one soft-delete decision.
 type PlannedPrune struct {
 	ID   string
@@ -88,6 +96,7 @@ type PushPlan struct {
 	CreateFolders []string
 	Creates       []PlannedWrite
 	Updates       []PlannedWrite
+	Moves         []PlannedMove
 	Prunes        []PlannedPrune
 	Unchanged     int
 	// Foreign counts namespace items without a mys-path field. Push
@@ -100,7 +109,7 @@ type PushPlan struct {
 
 // HasWrites reports whether executing the plan would change the vault.
 func (p PushPlan) HasWrites() bool {
-	return len(p.CreateFolders) > 0 || len(p.Creates) > 0 || len(p.Updates) > 0 || len(p.Prunes) > 0
+	return len(p.CreateFolders) > 0 || len(p.Creates) > 0 || len(p.Updates) > 0 || len(p.Moves) > 0 || len(p.Prunes) > 0
 }
 
 // BuildPushPlan diffs the desired store state against the remote
@@ -110,7 +119,11 @@ func (p PushPlan) HasWrites() bool {
 // the current filter. A non-empty org additionally restricts prunes to
 // items whose mys-path belongs to that org: a filtered push must not
 // touch other orgs' stale items.
-func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote RemoteState, prune bool, org string) PushPlan {
+//
+// targets maps a mys org to its Bitwarden organization placement: new
+// items are created there, existing personal items are moved there.
+// Items already inside an organization keep it, mapped or not.
+func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote RemoteState, prune bool, org string, targets map[string]OrgTarget) PushPlan {
 	var plan PushPlan
 	byPath := map[string][]Item{}
 	for _, it := range remote.Items {
@@ -135,9 +148,14 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 		}
 		folder := FolderName(orgOf(e))
 		desired.FolderID = "" // resolved against the live vault at execution
+		target, mapped := targets[orgOf(e)]
 		matches := byPath[e.Path]
 		switch len(matches) {
 		case 0:
+			if mapped {
+				desired.OrganizationID = target.OrganizationID
+				desired.CollectionIDs = target.CollectionIDs
+			}
 			plan.Creates = append(plan.Creates, PlannedWrite{Path: e.Path, Folder: folder, Item: desired})
 			neededFolders[folder] = true
 		case 1:
@@ -147,8 +165,29 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 					fmt.Sprintf("skip %s: existing Bitwarden item %q is not a login item", e.Path, existing.Name))
 				continue
 			}
+			move := false
+			switch {
+			case existing.OrganizationID != "":
+				desired.OrganizationID = existing.OrganizationID
+				desired.CollectionIDs = existing.CollectionIDs
+				if mapped && !strings.EqualFold(existing.OrganizationID, target.OrganizationID) {
+					plan.Warnings = append(plan.Warnings,
+						fmt.Sprintf("%s: Bitwarden item belongs to organization %s, config maps %s to %s — left in place",
+							e.Path, existing.OrganizationID, orgOf(e), target.OrganizationID))
+				}
+			case mapped:
+				move = true
+				desired.OrganizationID = target.OrganizationID
+				desired.CollectionIDs = target.CollectionIDs
+				plan.Moves = append(plan.Moves, PlannedMove{
+					ID: existing.ID, Path: e.Path,
+					OrganizationID: target.OrganizationID, CollectionIDs: target.CollectionIDs,
+				})
+			}
 			if contentEqual(desired, existing) && remote.FolderNames[existing.FolderID] == folder {
-				plan.Unchanged++
+				if !move {
+					plan.Unchanged++
+				}
 				continue
 			}
 			plan.Updates = append(plan.Updates, PlannedWrite{Path: e.Path, Folder: folder, Item: desired, ID: existing.ID})
@@ -228,11 +267,12 @@ type PushResult struct {
 	CreatedFolders int
 	Created        int
 	Updated        int
+	Moved          int
 	Pruned         int
 }
 
 // ExecutePush applies a plan: create missing folders, then create,
-// update and prune items. Folder ids are resolved from the live remote
+// move, update and prune items. Folder ids are resolved from the live remote
 // state plus the folders created here. The first error aborts the run —
 // the partial result is returned so the caller can audit exactly how
 // far the push got.
@@ -268,6 +308,16 @@ func ExecutePush(ctx context.Context, c *Client, plan PushPlan, remote RemoteSta
 			return res, fmt.Errorf("create %s: %w", w.Path, err)
 		}
 		res.Created++
+	}
+	// Moves must run before updates: an update of a moved item already
+	// carries the organization id, and bw edit on a still-personal item
+	// with an organization id re-encrypts it under the org key without
+	// moving it on the server.
+	for _, m := range plan.Moves {
+		if err := c.MoveItem(ctx, m.ID, m.OrganizationID, m.CollectionIDs); err != nil {
+			return res, fmt.Errorf("move %s: %w", m.Path, err)
+		}
+		res.Moved++
 	}
 	for _, w := range plan.Updates {
 		it, err := place(w)

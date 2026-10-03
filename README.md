@@ -466,6 +466,51 @@ mys bw-export --org jasp --out jasp-backup.json
 Schreibt eine Bitwarden-kompatible JSON-Datei, die du bei Bedarf manuell
 in Bitwarden importieren kannst. Einseitig — kein Live-Sync.
 
+## Bitwarden-Spiegel (`bw-push`)
+
+```bash
+mys bw-push --dry-run          # Plan zeigen, nichts schreiben
+mys bw-push --org jasp         # nur eine Org spiegeln
+mys bw-push --prune --yes      # verwaiste Spiegel-Items in den Papierkorb
+```
+
+`bw-push` spiegelt den Store einseitig per `bw` CLI in Bitwarden. Jedes
+Item liegt im Ordner `mys/<org>` und trägt das Custom-Field `mys-path`;
+darüber werden Items bei jedem Lauf wiedergefunden. Items außerhalb von
+`mys/*` liest und ändert der Befehl nie. Vorher einmal pro Gerät
+`bw login`; das Master-Passwort kommt aus dem Store
+(`private/bitwarden/master-password`). AI-Caller sind hart gesperrt.
+
+Konfiguration in `~/.config/my-secrets/bw.yaml`, alle Schlüssel optional:
+
+```yaml
+server_url: <URL deines Bitwarden-Servers>      # Lauf gegen anderen Server wird verweigert
+master_password_path: private/bitwarden/master-password
+organizations:
+  jasp:
+    organization_id: <uuid der Bitwarden-Organisation>
+    collection_ids: [<uuid der Sammlung>]
+```
+
+Ordner sind in Bitwarden persönlich, Kollegen sehen nur Items in einer
+**Organisation**. Mit einem `organizations`-Eintrag für eine Org gilt:
+
+- Neue Items entstehen direkt in der Organisation und den angegebenen
+  Sammlungen (mindestens eine Sammlung ist Pflicht).
+- Bestehende persönliche Spiegel-Items dieser Org werden per `bw move`
+  in die Organisation verschoben. `--dry-run` zeigt Ziel-Organisation
+  und Sammlungen je Item.
+- Items, die schon in einer Organisation liegen (auch von Hand
+  verschoben), bleiben dort; Updates behalten Organisation und
+  Sammlungen bei.
+- Eine Änderung von `collection_ids` gilt nur für neue und frisch
+  verschobene Items; bestehende Org-Items werden nicht umsortiert.
+- `--prune` verschiebt auch geteilte Items in den Papierkorb. Damit
+  verschwinden sie für alle Mitglieder der Sammlung.
+
+Ohne `organizations`-Eintrag bleibt alles im persönlichen Tresor. Die IDs
+zeigen `bw list organizations` und `bw list collections`.
+
 ## Git-Sync: persönliche und explizit geteilte Mounts
 
 ### Persönlicher Store: nur deine eigenen Geräte

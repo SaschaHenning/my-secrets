@@ -48,3 +48,33 @@ func TestLoadConfig_MalformedYAMLFails(t *testing.T) {
 		t.Fatal("want parse error for malformed yaml")
 	}
 }
+
+func TestLoadConfig_Organizations(t *testing.T) {
+	load := func(body string) (*Config, error) {
+		p := filepath.Join(t.TempDir(), "bw.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(p)
+	}
+	c, err := load("organizations:\n  jasp: { organization_id: org-1, collection_ids: [col-1, col-2] }\n")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if tg, ok := c.Target("jasp"); !ok || tg.OrganizationID != "org-1" || len(tg.CollectionIDs) != 2 {
+		t.Errorf("Target(jasp) = %+v, %v", tg, ok)
+	}
+	if _, ok := c.Target("zuhause"); ok {
+		t.Error("unmapped org must have no target")
+	}
+	for name, body := range map[string]string{
+		"no collections":   "organizations:\n  jasp: { organization_id: org-1 }\n",
+		"empty collection": "organizations:\n  jasp: { organization_id: org-1, collection_ids: [\"\"] }\n",
+		"no organization":  "organizations:\n  jasp: { collection_ids: [col-1] }\n",
+		"nested org key":   "organizations:\n  jasp/stage: { organization_id: org-1, collection_ids: [col-1] }\n",
+	} {
+		if _, err := load(body); err == nil {
+			t.Errorf("%s: want validation error", name)
+		}
+	}
+}

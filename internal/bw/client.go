@@ -237,6 +237,17 @@ func (c *Client) EditItem(ctx context.Context, id string, it Item) error {
 	return err
 }
 
+// MoveItem moves a personal-vault item into an organization and its
+// collections (`bw move`). The collection id list travels via stdin.
+func (c *Client) MoveItem(ctx context.Context, id, organizationID string, collectionIDs []string) error {
+	payload, err := encodePayload(collectionIDs)
+	if err != nil {
+		return err
+	}
+	_, err = c.r.Run(ctx, payload, c.env(), "move", id, organizationID)
+	return err
+}
+
 // DeleteItem soft-deletes an item (moves it to the Bitwarden trash).
 // There is deliberately no hard-delete: prune must stay recoverable.
 func (c *Client) DeleteItem(ctx context.Context, id string) error {

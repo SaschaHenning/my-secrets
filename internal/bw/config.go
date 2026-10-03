@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,7 +14,7 @@ import (
 const DefaultMasterPasswordPath = "private/bitwarden/master-password"
 
 // Config is the persisted Bitwarden mirror configuration,
-// ~/.config/my-secrets/bw.yaml. Both keys are optional.
+// ~/.config/my-secrets/bw.yaml. Every key is optional.
 type Config struct {
 	Version int `yaml:"version"`
 	// ServerURL pins the expected Bitwarden server. When set, push
@@ -24,6 +25,44 @@ type Config struct {
 	// MasterPasswordPath is the store path of the Bitwarden master
 	// password. Empty means DefaultMasterPasswordPath.
 	MasterPasswordPath string `yaml:"master_password_path,omitempty"`
+	// Organizations maps a mys org (top-level store prefix) to the
+	// Bitwarden organization and collections its mirror items belong
+	// in. Orgs without an entry stay in the personal vault.
+	Organizations map[string]OrgTarget `yaml:"organizations,omitempty"`
+}
+
+// OrgTarget is the Bitwarden organization placement for one mys org.
+type OrgTarget struct {
+	OrganizationID string   `yaml:"organization_id"`
+	CollectionIDs  []string `yaml:"collection_ids"`
+}
+
+// Target returns the organization placement configured for org.
+func (c *Config) Target(org string) (OrgTarget, bool) {
+	t, ok := c.Organizations[org]
+	return t, ok
+}
+
+func (c *Config) validate() error {
+	for org, t := range c.Organizations {
+		if org == "" || strings.Contains(org, "/") {
+			return fmt.Errorf("bw config: organizations key %q must be a top-level org name", org)
+		}
+		if t.OrganizationID == "" {
+			return fmt.Errorf("bw config: organizations.%s.organization_id is empty", org)
+		}
+		// bw move rejects an empty collection list, and an org item in no
+		// collection is invisible to every teammate without admin rights.
+		if len(t.CollectionIDs) == 0 {
+			return fmt.Errorf("bw config: organizations.%s.collection_ids needs at least one id", org)
+		}
+		for _, id := range t.CollectionIDs {
+			if id == "" {
+				return fmt.Errorf("bw config: organizations.%s.collection_ids contains an empty id", org)
+			}
+		}
+	}
+	return nil
 }
 
 // PasswordPath returns the configured master-password store path or the
@@ -68,6 +107,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if c.Version == 0 {
 		c.Version = 1
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
 	}
 	return &c, nil
 }

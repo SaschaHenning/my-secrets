@@ -68,6 +68,9 @@ type Item struct {
 	Favorite bool    `json:"favorite"`
 	Fields   []Field `json:"fields,omitempty"`
 	Login    *Login  `json:"login,omitempty"`
+	// OrganizationID and CollectionIDs are empty for personal-vault items.
+	OrganizationID string   `json:"organizationId,omitempty"`
+	CollectionIDs  []string `json:"collectionIds,omitempty"`
 }
 
 // Login carries the credential payload of a login item.

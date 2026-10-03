@@ -167,6 +167,41 @@ func TestRunBwPush_DryRunPlansButWritesNothing(t *testing.T) {
 	}
 }
 
+func TestRunBwPush_DryRunShowsOrganizationTarget(t *testing.T) {
+	existing := &store.Entry{Path: "jasp/old", Org: "jasp", Password: "x"}
+	a := fakeApp(t, existing, &store.Entry{Path: "jasp/new", Org: "jasp", Password: "y"})
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":                   unlockedStatus,
+		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1": mirrorItemJSON(t, "f1", existing),
+	}}
+	cfg := &bw.Config{Organizations: map[string]bw.OrgTarget{
+		"jasp": {OrganizationID: "org-1", CollectionIDs: []string{"col-1"}},
+	}}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{Session: "tok", DryRun: true, Config: cfg})
+	if err != nil {
+		t.Fatalf("runBwPush: %v", err)
+	}
+	if r.called("create") || r.called("move") || r.called("edit") {
+		t.Errorf("dry-run must not write: %v", r.Calls)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"+ jasp/new → organization org-1, collections col-1",
+		"> jasp/old (move from personal vault → organization org-1, collections col-1)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("plan output missing %q:\n%s", want, out)
+		}
+	}
+	rows := bwPushRows(t, a)
+	if len(rows) != 1 || !strings.Contains(rows[0].Reason, "create=1") || !strings.Contains(rows[0].Reason, "move=1") {
+		t.Fatalf("rows = %+v, want dry-run row with create=1 move=1", rows)
+	}
+}
+
 func TestRunBwPush_CreatesAndAudits(t *testing.T) {
 	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"})
 	r := &stubBWRunner{Responses: map[string][]byte{

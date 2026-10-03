@@ -271,3 +271,38 @@ func TestExecutePush_AbortsOnFirstErrorWithPartialResult(t *testing.T) {
 		t.Fatalf("calls = %v, must stop at first failure", r.callKeys())
 	}
 }
+
+func TestExecutePush_MovesBeforeUpdates(t *testing.T) {
+	r := &fakeRunner{Responses: map[string][]byte{}}
+	plan := PushPlan{
+		Moves: []PlannedMove{{ID: "i1", Path: "jasp/a", OrganizationID: "org-1", CollectionIDs: []string{"col-1"}}},
+		Updates: []PlannedWrite{{
+			Path: "jasp/a", Folder: "mys/jasp", ID: "i1",
+			Item: Item{Type: TypeLogin, Name: "a", OrganizationID: "org-1", CollectionIDs: []string{"col-1"}},
+		}},
+	}
+	remote := RemoteState{Folders: []Folder{{ID: "f1", Name: "mys/jasp"}}}
+	res, err := ExecutePush(context.Background(), NewClient(r), plan, remote)
+	if err != nil {
+		t.Fatalf("ExecutePush: %v", err)
+	}
+	if res.Moved != 1 || res.Updated != 1 {
+		t.Fatalf("res = %+v", res)
+	}
+	keys := r.callKeys()
+	if len(keys) != 2 || keys[0] != "move i1 org-1" || keys[1] != "edit item i1" {
+		t.Fatalf("calls = %v, want move before edit", keys)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(string(r.Calls[0].Stdin))
+	if string(raw) != `["col-1"]` {
+		t.Errorf("move stdin = %s, want collection id array", raw)
+	}
+	raw, _ = base64.StdEncoding.DecodeString(string(r.Calls[1].Stdin))
+	var sent Item
+	if err := json.Unmarshal(raw, &sent); err != nil {
+		t.Fatalf("edit payload: %v", err)
+	}
+	if sent.OrganizationID != "org-1" || sent.FolderID != "f1" {
+		t.Errorf("edit payload = %+v, want org-1 in folder f1", sent)
+	}
+}
