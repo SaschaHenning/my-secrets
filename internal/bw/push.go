@@ -3,6 +3,8 @@ package bw
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -35,20 +37,57 @@ type RemoteState struct {
 	Items   []Item
 	// FolderNames maps folder id → name for the fetched folders.
 	FolderNames map[string]string
+	// Blocked holds mys-paths whose only vault item sits in an
+	// organization the path's org is not mapped to. Push neither writes
+	// nor recreates them: a fresh personal copy would duplicate the item.
+	Blocked map[string]bool
+	// Warnings lists items dropped by the organization rule.
+	Warnings []string
+}
+
+// orgPlacementAllowed reports whether a mirror item may be touched: a
+// personal item always, an organization item only when its mys-path org
+// is mapped to exactly that organization. Any collection member can
+// write any mys-path, so without this rule a forged "zuhause/x" item
+// would receive a private secret, or --prune-shared would trash an item
+// of an unmapped team.
+func orgPlacementAllowed(it Item, targets map[string]OrgTarget) bool {
+	if it.OrganizationID == "" {
+		return true
+	}
+	t, mapped := targets[store.OrgOf(PathOf(it))]
+	return mapped && strings.EqualFold(t.OrganizationID, it.OrganizationID)
 }
 
 // FetchRemoteState lists the vault folders, keeps only the mys
-// namespace, and fetches items folder by folder. Items outside the
-// namespace are never read. The whole namespace is always fetched —
-// even for an --org-filtered push — so mys-path matching sees an item
-// that was hand-moved into another mys/* folder instead of creating a
-// duplicate next to it.
-func FetchRemoteState(ctx context.Context, c *Client) (RemoteState, error) {
+// namespace, and fetches items folder by folder. The whole namespace is
+// always fetched — even for an --org-filtered push — so mys-path
+// matching sees an item that was hand-moved into another mys/* folder
+// instead of creating a duplicate next to it.
+//
+// The organizations in targets are fetched as well: folders are per
+// user, so a shared mirror item can sit outside every mys/* folder of
+// this account. Apart from these organizations, items outside the
+// namespace are never read.
+func FetchRemoteState(ctx context.Context, c *Client, targets map[string]OrgTarget) (RemoteState, error) {
 	all, err := c.ListFolders(ctx)
 	if err != nil {
 		return RemoteState{}, err
 	}
-	rs := RemoteState{FolderNames: map[string]string{}}
+	rs := RemoteState{FolderNames: map[string]string{}, Blocked: map[string]bool{}}
+	keep := func(it Item, block bool) bool {
+		p := PathOf(it)
+		if p == "" || orgPlacementAllowed(it, targets) {
+			return true
+		}
+		if block {
+			rs.Blocked[p] = true
+		}
+		rs.Warnings = append(rs.Warnings, fmt.Sprintf(
+			"skip %s: Bitwarden item %s sits in organization %s, which %s is not mapped to — left untouched",
+			p, it.ID, it.OrganizationID, store.OrgOf(p)))
+		return false
+	}
 	for _, f := range all {
 		if !InNamespace(f.Name) {
 			continue
@@ -59,7 +98,32 @@ func FetchRemoteState(ctx context.Context, c *Client) (RemoteState, error) {
 		if err != nil {
 			return RemoteState{}, err
 		}
-		rs.Items = append(rs.Items, items...)
+		for _, it := range items {
+			if keep(it, true) {
+				rs.Items = append(rs.Items, it)
+			}
+		}
+	}
+	seen := map[string]bool{}
+	for _, it := range rs.Items {
+		seen[it.ID] = true
+	}
+	orgIDs := map[string]bool{}
+	for _, t := range targets {
+		orgIDs[t.OrganizationID] = true
+	}
+	for _, orgID := range slices.Sorted(maps.Keys(orgIDs)) {
+		items, err := c.ListItemsInOrganization(ctx, orgID)
+		if err != nil {
+			return RemoteState{}, err
+		}
+		for _, it := range items {
+			if seen[it.ID] || PathOf(it) == "" || !keep(it, false) {
+				continue
+			}
+			seen[it.ID] = true
+			rs.Items = append(rs.Items, it)
+		}
 	}
 	return rs, nil
 }
@@ -76,10 +140,20 @@ type PlannedWrite struct {
 	ID string
 }
 
-// PlannedPrune is one soft-delete decision.
+// PlannedMove is one personal-to-organization move decision.
+type PlannedMove struct {
+	ID             string
+	Path           string
+	OrganizationID string
+	CollectionIDs  []string
+}
+
+// PlannedPrune is one soft-delete decision. A non-empty OrganizationID
+// marks a shared item: trashing it removes it for the whole collection.
 type PlannedPrune struct {
-	ID   string
-	Path string
+	ID             string
+	Path           string
+	OrganizationID string
 }
 
 // PushPlan is the full decision set of one push run. It carries paths
@@ -88,30 +162,59 @@ type PushPlan struct {
 	CreateFolders []string
 	Creates       []PlannedWrite
 	Updates       []PlannedWrite
+	Moves         []PlannedMove
 	Prunes        []PlannedPrune
 	Unchanged     int
 	// Foreign counts namespace items without a mys-path field. Push
 	// never touches them; they are bw-import material.
 	Foreign int
+	// SharedPruneSkipped counts stale organization items left alone
+	// because shared pruning was not requested.
+	SharedPruneSkipped int
 	// Warnings lists per-entry anomalies (unmappable entries, duplicate
 	// match keys). Path + cause only.
 	Warnings []string
 }
 
+// SharedPrunes counts the planned prunes of organization items.
+func (p PushPlan) SharedPrunes() int {
+	n := 0
+	for _, pr := range p.Prunes {
+		if pr.OrganizationID != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// PlanOptions steers BuildPushPlan.
+type PlanOptions struct {
+	// Prune trashes personal mirror items whose mys-path left the store.
+	Prune bool
+	// PruneShared extends Prune to items inside an organization.
+	PruneShared bool
+	// Org restricts prunes to items whose mys-path belongs to this org.
+	Org string
+	// Targets maps a mys org to its Bitwarden organization placement:
+	// new items are created there, existing personal items are moved
+	// there. Items already inside an organization keep it.
+	Targets map[string]OrgTarget
+}
+
 // HasWrites reports whether executing the plan would change the vault.
 func (p PushPlan) HasWrites() bool {
-	return len(p.CreateFolders) > 0 || len(p.Creates) > 0 || len(p.Updates) > 0 || len(p.Prunes) > 0
+	return len(p.CreateFolders) > 0 || len(p.Creates) > 0 || len(p.Updates) > 0 || len(p.Moves) > 0 || len(p.Prunes) > 0
 }
 
 // BuildPushPlan diffs the desired store state against the remote
 // namespace. storePaths must contain every path that exists in the
 // store (unfiltered by --org) — it is the safety net that keeps prune
 // from trashing mirror items whose entry still exists but fell outside
-// the current filter. A non-empty org additionally restricts prunes to
-// items whose mys-path belongs to that org: a filtered push must not
+// the current filter. A non-empty opts.Org additionally restricts prunes
+// to items whose mys-path belongs to that org: a filtered push must not
 // touch other orgs' stale items.
-func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote RemoteState, prune bool, org string) PushPlan {
-	var plan PushPlan
+func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote RemoteState, opts PlanOptions) PushPlan {
+	plan := PushPlan{Warnings: slices.Clone(remote.Warnings)}
 	byPath := map[string][]Item{}
 	for _, it := range remote.Items {
 		p := PathOf(it)
@@ -133,11 +236,19 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 			plan.Warnings = append(plan.Warnings, fmt.Sprintf("skip %s: %v", e.Path, err))
 			continue
 		}
+		if remote.Blocked[e.Path] {
+			continue
+		}
 		folder := FolderName(orgOf(e))
 		desired.FolderID = "" // resolved against the live vault at execution
+		target, mapped := opts.Targets[orgOf(e)]
 		matches := byPath[e.Path]
 		switch len(matches) {
 		case 0:
+			if mapped {
+				desired.OrganizationID = target.OrganizationID
+				desired.CollectionIDs = target.CollectionIDs
+			}
 			plan.Creates = append(plan.Creates, PlannedWrite{Path: e.Path, Folder: folder, Item: desired})
 			neededFolders[folder] = true
 		case 1:
@@ -147,8 +258,29 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 					fmt.Sprintf("skip %s: existing Bitwarden item %q is not a login item", e.Path, existing.Name))
 				continue
 			}
+			move := false
+			switch {
+			case !orgPlacementAllowed(existing, opts.Targets):
+				plan.Warnings = append(plan.Warnings,
+					fmt.Sprintf("skip %s: Bitwarden item sits in organization %s, which %s is not mapped to — left untouched",
+						e.Path, existing.OrganizationID, orgOf(e)))
+				continue
+			case existing.OrganizationID != "":
+				desired.OrganizationID = existing.OrganizationID
+				desired.CollectionIDs = existing.CollectionIDs
+			case mapped:
+				move = true
+				desired.OrganizationID = target.OrganizationID
+				desired.CollectionIDs = target.CollectionIDs
+				plan.Moves = append(plan.Moves, PlannedMove{
+					ID: existing.ID, Path: e.Path,
+					OrganizationID: target.OrganizationID, CollectionIDs: target.CollectionIDs,
+				})
+			}
 			if contentEqual(desired, existing) && remote.FolderNames[existing.FolderID] == folder {
-				plan.Unchanged++
+				if !move {
+					plan.Unchanged++
+				}
 				continue
 			}
 			plan.Updates = append(plan.Updates, PlannedWrite{Path: e.Path, Folder: folder, Item: desired, ID: existing.ID})
@@ -165,16 +297,23 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 	}
 	sort.Strings(plan.CreateFolders)
 
-	if prune {
+	if opts.Prune {
 		for _, it := range remote.Items {
 			p := PathOf(it)
 			if p == "" || storePaths[p] {
 				continue
 			}
-			if org != "" && store.OrgOf(p) != org {
+			if opts.Org != "" && store.OrgOf(p) != opts.Org {
 				continue
 			}
-			plan.Prunes = append(plan.Prunes, PlannedPrune{ID: it.ID, Path: p})
+			if !orgPlacementAllowed(it, opts.Targets) {
+				continue
+			}
+			if it.OrganizationID != "" && !opts.PruneShared {
+				plan.SharedPruneSkipped++
+				continue
+			}
+			plan.Prunes = append(plan.Prunes, PlannedPrune{ID: it.ID, Path: p, OrganizationID: it.OrganizationID})
 		}
 		sort.Slice(plan.Prunes, func(i, j int) bool { return plan.Prunes[i].Path < plan.Prunes[j].Path })
 	}
@@ -228,11 +367,12 @@ type PushResult struct {
 	CreatedFolders int
 	Created        int
 	Updated        int
+	Moved          int
 	Pruned         int
 }
 
 // ExecutePush applies a plan: create missing folders, then create,
-// update and prune items. Folder ids are resolved from the live remote
+// move, update and prune items. Folder ids are resolved from the live remote
 // state plus the folders created here. The first error aborts the run —
 // the partial result is returned so the caller can audit exactly how
 // far the push got.
@@ -268,6 +408,16 @@ func ExecutePush(ctx context.Context, c *Client, plan PushPlan, remote RemoteSta
 			return res, fmt.Errorf("create %s: %w", w.Path, err)
 		}
 		res.Created++
+	}
+	// Moves must run before updates: an update of a moved item already
+	// carries the organization id, and bw edit on a still-personal item
+	// with an organization id re-encrypts it under the org key without
+	// moving it on the server.
+	for _, m := range plan.Moves {
+		if err := c.MoveItem(ctx, m.ID, m.OrganizationID, m.CollectionIDs); err != nil {
+			return res, fmt.Errorf("move %s: %w", m.Path, err)
+		}
+		res.Moved++
 	}
 	for _, w := range plan.Updates {
 		it, err := place(w)

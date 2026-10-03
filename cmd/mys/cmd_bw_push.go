@@ -34,8 +34,22 @@ unlocked with the master password read from the store (default path
 via master_password_path; server_url pins the expected server). Run
 "bw login" once per machine beforehand — login is never automated.
 
+Team sharing: an "organizations" entry in bw.yaml maps a mys org to a
+Bitwarden organization and its collections, e.g.
+
+  organizations:
+    jasp: { organization_id: <uuid>, collection_ids: [<uuid>] }
+
+New items of that org are created inside the organization, existing
+personal mirror items are moved there (bw move), and items already in
+that organization keep their collections. An item that sits in an
+organization its org is not mapped to is skipped with a warning. Without
+an entry, items stay in the personal vault.
+
 --prune moves items whose mys-path no longer exists in the store to the
-Bitwarden trash (soft delete only). AI callers cannot invoke this command.`,
+Bitwarden trash (soft delete only). Items inside an organization are only
+pruned with --prune-shared as well, because trashing them removes them
+for every member of the collection. AI callers cannot invoke this command.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			if ctx == nil {
@@ -45,6 +59,9 @@ Bitwarden trash (soft delete only). AI callers cannot invoke this command.`,
 			// filter and the mys/<org> folder mapping diverge silently.
 			if strings.Contains(opts.Org, "/") {
 				return fmt.Errorf("--org must be a top-level org name (no '/'): %q", opts.Org)
+			}
+			if opts.PruneShared && !opts.Prune {
+				return fmt.Errorf("--prune-shared requires --prune")
 			}
 			// Deny AI-flagged callers outright — with a forensic audit
 			// row, same contract as bw-export: a bulk mirror of the
@@ -80,18 +97,20 @@ Bitwarden trash (soft delete only). AI callers cannot invoke this command.`,
 	c.Flags().StringVar(&opts.Org, "org", "", "mirror only this org")
 	c.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the plan without writing to Bitwarden")
 	c.Flags().BoolVar(&opts.Prune, "prune", false, "move items whose mys-path left the store to the Bitwarden trash")
+	c.Flags().BoolVar(&opts.PruneShared, "prune-shared", false, "with --prune, also trash stale items inside a Bitwarden organization (removes them for the whole team)")
 	c.Flags().BoolVar(&opts.Yes, "yes", false, "skip the interactive confirmation")
 	return c
 }
 
 // bwPushOptions carries the flag and environment inputs of one push run.
 type bwPushOptions struct {
-	Org     string
-	DryRun  bool
-	Prune   bool
-	Yes     bool
-	Session string
-	Config  *bw.Config
+	Org         string
+	DryRun      bool
+	Prune       bool
+	PruneShared bool
+	Yes         bool
+	Session     string
+	Config      *bw.Config
 }
 
 // runBwPush resolves the session, diffs store against vault namespace
@@ -169,15 +188,22 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 			return fail("store list", err)
 		}
 	}
+	storeOrgs := map[string]bool{}
 	for _, p := range allPaths {
 		storePaths[p] = true
+		storeOrgs[store.OrgOf(p)] = true
+	}
+	for org := range cfg.Organizations {
+		if !storeOrgs[org] {
+			fmt.Fprintf(stderr, "warning: bw.yaml maps organizations.%s, but the store has no org %q\n", org, org)
+		}
 	}
 	// Deliberately absent from the prune safety net: if an earlier run
 	// (or a hand copy) put the master password into the mirror, --prune
 	// heals that by trashing it even though the store entry exists.
 	delete(storePaths, cfg.PasswordPath())
 
-	remote, err := bw.FetchRemoteState(ctx, c)
+	remote, err := bw.FetchRemoteState(ctx, c, cfg.Organizations)
 	if err != nil {
 		return fail("vault read", err)
 	}
@@ -195,7 +221,9 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 			fmt.Fprintf(stderr, "warning: %s is policy-invisible for this caller — its mirror item is left alone\n", p)
 		}
 	}
-	plan := bw.BuildPushPlan(entries, storePaths, remote, opts.Prune, opts.Org)
+	plan := bw.BuildPushPlan(entries, storePaths, remote, bw.PlanOptions{
+		Prune: opts.Prune, PruneShared: opts.PruneShared, Org: opts.Org, Targets: cfg.Organizations,
+	})
 	for _, w := range plan.Warnings {
 		fmt.Fprintln(stderr, "warning:", w)
 	}
@@ -204,8 +232,8 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 	// warnings= keeps skipped entries visible in the audit trail — a
 	// no-op row must not read as "everything mirrored cleanly" when
 	// entries were skipped.
-	counts := fmt.Sprintf("server=%s create=%d update=%d prune=%d unchanged=%d warnings=%d",
-		st.ServerURL, len(plan.Creates), len(plan.Updates), len(plan.Prunes), plan.Unchanged, len(plan.Warnings))
+	counts := fmt.Sprintf("server=%s create=%d update=%d move=%d prune=%d prune_shared=%d unchanged=%d warnings=%d",
+		st.ServerURL, len(plan.Creates), len(plan.Updates), len(plan.Moves), len(plan.Prunes), plan.SharedPrunes(), plan.Unchanged, len(plan.Warnings))
 	if opts.DryRun {
 		a.AuditBWPush(ctx, opts.Org, audit.ResultOK, "dry-run "+counts)
 		fmt.Fprintln(stdout, "dry-run: no changes written")
@@ -216,8 +244,8 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 		fmt.Fprintln(stdout, "vault already in sync — nothing to do")
 		return nil
 	}
-	fmt.Fprintf(stdout, "push %d create / %d update / %d prune to %s as %s? [y/N] ",
-		len(plan.Creates), len(plan.Updates), len(plan.Prunes), st.ServerURL, st.UserEmail)
+	fmt.Fprintf(stdout, "push %d create / %d update / %d move / %d prune (%d SHARED) to %s as %s? [y/N] ",
+		len(plan.Creates), len(plan.Updates), len(plan.Moves), len(plan.Prunes), plan.SharedPrunes(), st.ServerURL, st.UserEmail)
 	ok, err := confirmAdd(stdin, stdout, opts.Yes)
 	if err != nil {
 		return err
@@ -230,12 +258,13 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 	if err != nil {
 		// Counts only, no err text — see the fail() comment above.
 		a.AuditBWPush(ctx, opts.Org, audit.ResultError,
-			fmt.Sprintf("push failed after folders=%d created=%d updated=%d pruned=%d", res.CreatedFolders, res.Created, res.Updated, res.Pruned))
+			fmt.Sprintf("push failed after folders=%d created=%d moved=%d updated=%d pruned=%d",
+				res.CreatedFolders, res.Created, res.Moved, res.Updated, res.Pruned))
 		return err
 	}
 	a.AuditBWPush(ctx, opts.Org, audit.ResultOK, counts)
-	fmt.Fprintf(stdout, "pushed: %d created, %d updated, %d pruned (%d unchanged)\n",
-		res.Created, res.Updated, res.Pruned, plan.Unchanged)
+	fmt.Fprintf(stdout, "pushed: %d created, %d updated, %d moved, %d pruned (%d unchanged)\n",
+		res.Created, res.Updated, res.Moved, res.Pruned, plan.Unchanged)
 	return nil
 }
 
@@ -246,17 +275,34 @@ func printPushPlan(w io.Writer, st bw.Status, plan bw.PushPlan) {
 		fmt.Fprintf(w, "  + folder %s\n", c)
 	}
 	for _, c := range plan.Creates {
-		fmt.Fprintf(w, "  + %s\n", c.Path)
+		fmt.Fprintf(w, "  + %s%s\n", c.Path, orgSuffix(c.Item.OrganizationID, c.Item.CollectionIDs))
+	}
+	for _, m := range plan.Moves {
+		fmt.Fprintf(w, "  > %s (move from personal vault%s)\n", m.Path, orgSuffix(m.OrganizationID, m.CollectionIDs))
 	}
 	for _, u := range plan.Updates {
 		fmt.Fprintf(w, "  ~ %s\n", u.Path)
 	}
 	for _, p := range plan.Prunes {
+		if p.OrganizationID != "" {
+			fmt.Fprintf(w, "  - %s (to trash, SHARED: removed for every member of organization %s)\n", p.Path, p.OrganizationID)
+			continue
+		}
 		fmt.Fprintf(w, "  - %s (to trash)\n", p.Path)
+	}
+	if plan.SharedPruneSkipped > 0 {
+		fmt.Fprintf(w, "  %d stale items inside an organization left alone (add --prune-shared to trash them)\n", plan.SharedPruneSkipped)
 	}
 	fmt.Fprintf(w, "  %d unchanged", plan.Unchanged)
 	if plan.Foreign > 0 {
 		fmt.Fprintf(w, ", %d foreign items in mys/* left untouched", plan.Foreign)
 	}
 	fmt.Fprintln(w)
+}
+
+func orgSuffix(orgID string, collectionIDs []string) string {
+	if orgID == "" {
+		return ""
+	}
+	return fmt.Sprintf(" → organization %s, collections %s", orgID, strings.Join(collectionIDs, ","))
 }

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/SaschaHenning/my-secrets/internal/store"
 )
 
 // fakeCall records one runner invocation.
@@ -183,7 +185,7 @@ func TestFetchRemoteState_OnlyNamespaceFoldersAreRead(t *testing.T) {
 		"list items --folderid f1": []byte(`[{"id":"i1","type":1,"name":"a","folderId":"f1"}]`),
 		"list items --folderid f3": []byte(`[]`),
 	}}
-	rs, err := FetchRemoteState(context.Background(), NewClient(r))
+	rs, err := FetchRemoteState(context.Background(), NewClient(r), nil)
 	if err != nil {
 		t.Fatalf("FetchRemoteState: %v", err)
 	}
@@ -212,7 +214,7 @@ func TestFetchRemoteState_AlwaysFetchesWholeNamespace(t *testing.T) {
 		"list items --folderid f1": []byte(`[]`),
 		"list items --folderid f3": []byte(`[]`),
 	}}
-	rs, err := FetchRemoteState(context.Background(), NewClient(r))
+	rs, err := FetchRemoteState(context.Background(), NewClient(r), nil)
 	if err != nil {
 		t.Fatalf("FetchRemoteState: %v", err)
 	}
@@ -269,5 +271,93 @@ func TestExecutePush_AbortsOnFirstErrorWithPartialResult(t *testing.T) {
 	}
 	if len(r.Calls) != 2 {
 		t.Fatalf("calls = %v, must stop at first failure", r.callKeys())
+	}
+}
+
+func TestExecutePush_MovesBeforeUpdates(t *testing.T) {
+	r := &fakeRunner{Responses: map[string][]byte{}}
+	plan := PushPlan{
+		Moves: []PlannedMove{{ID: "i1", Path: "jasp/a", OrganizationID: "org-1", CollectionIDs: []string{"col-1"}}},
+		Updates: []PlannedWrite{{
+			Path: "jasp/a", Folder: "mys/jasp", ID: "i1",
+			Item: Item{Type: TypeLogin, Name: "a", OrganizationID: "org-1", CollectionIDs: []string{"col-1"}},
+		}},
+	}
+	remote := RemoteState{Folders: []Folder{{ID: "f1", Name: "mys/jasp"}}}
+	res, err := ExecutePush(context.Background(), NewClient(r), plan, remote)
+	if err != nil {
+		t.Fatalf("ExecutePush: %v", err)
+	}
+	if res.Moved != 1 || res.Updated != 1 {
+		t.Fatalf("res = %+v", res)
+	}
+	keys := r.callKeys()
+	if len(keys) != 2 || keys[0] != "move i1 org-1" || keys[1] != "edit item i1" {
+		t.Fatalf("calls = %v, want move before edit", keys)
+	}
+	raw, _ := base64.StdEncoding.DecodeString(string(r.Calls[0].Stdin))
+	if string(raw) != `["col-1"]` {
+		t.Errorf("move stdin = %s, want collection id array", raw)
+	}
+	raw, _ = base64.StdEncoding.DecodeString(string(r.Calls[1].Stdin))
+	var sent Item
+	if err := json.Unmarshal(raw, &sent); err != nil {
+		t.Fatalf("edit payload: %v", err)
+	}
+	if sent.OrganizationID != "org-1" || sent.FolderID != "f1" {
+		t.Errorf("edit payload = %+v, want org-1 in folder f1", sent)
+	}
+}
+
+func TestFetchRemoteState_OrganizationItemsOnlyForTheirMappedOrg(t *testing.T) {
+	jaspInFolder := `{"id":"i-folder","organizationId":"org-1","fields":[{"name":"mys-path","value":"jasp/a"}]}`
+	r := &fakeRunner{Responses: map[string][]byte{
+		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1": []byte(`[` + jaspInFolder + `]`),
+		"list items --organizationid org-1": []byte(`[
+			` + jaspInFolder + `,
+			{"id":"i-nofolder","organizationId":"org-1","fields":[{"name":"mys-path","value":"jasp/b"}]},
+			{"id":"i-forged","organizationId":"org-1","fields":[{"name":"mys-path","value":"zuhause/x"}]},
+			{"id":"i-team","organizationId":"org-1","name":"team login"}
+		]`),
+	}}
+	targets := map[string]OrgTarget{"jasp": {OrganizationID: "org-1", CollectionIDs: []string{"col-1"}}}
+	rs, err := FetchRemoteState(context.Background(), NewClient(r), targets)
+	if err != nil {
+		t.Fatalf("FetchRemoteState: %v", err)
+	}
+	var ids []string
+	for _, it := range rs.Items {
+		ids = append(ids, it.ID)
+	}
+	if strings.Join(ids, ",") != "i-folder,i-nofolder" {
+		t.Fatalf("items = %v, want the folder item once plus the folderless jasp item; forged and foreign items dropped", ids)
+	}
+}
+
+func TestFetchRemoteState_UnmappedOrgItemInFolderIsDroppedAndNeverPruned(t *testing.T) {
+	r := &fakeRunner{Responses: map[string][]byte{
+		"list folders": []byte(`[{"id":"f1","name":"mys/zuhause"}]`),
+		"list items --folderid f1": []byte(`[
+			{"id":"i-b","organizationId":"org-b","type":1,"fields":[{"name":"mys-path","value":"zuhause/x"}]}
+		]`),
+		"list items --organizationid org-1": []byte(`[]`),
+	}}
+	targets := map[string]OrgTarget{"jasp": {OrganizationID: "org-1", CollectionIDs: []string{"col-1"}}}
+	rs, err := FetchRemoteState(context.Background(), NewClient(r), targets)
+	if err != nil {
+		t.Fatalf("FetchRemoteState: %v", err)
+	}
+	if len(rs.Items) != 0 || !rs.Blocked["zuhause/x"] || len(rs.Warnings) != 1 {
+		t.Fatalf("remote = %+v, want item dropped, path blocked, one warning", rs)
+	}
+	plan := BuildPushPlan(nil, map[string]bool{}, rs, PlanOptions{Prune: true, PruneShared: true, Targets: targets})
+	if plan.HasWrites() || len(plan.Warnings) != 1 || !strings.HasPrefix(plan.Warnings[0], "skip zuhause/x") {
+		t.Fatalf("plan = %+v, want no prune and the skip warning", plan)
+	}
+	e := &store.Entry{Path: "zuhause/x", Org: "zuhause", Password: "private"}
+	plan = BuildPushPlan([]*store.Entry{e}, map[string]bool{"zuhause/x": true}, rs, PlanOptions{Targets: targets})
+	if plan.HasWrites() {
+		t.Fatalf("plan = %+v, a blocked path must not be recreated next to the org item", plan)
 	}
 }

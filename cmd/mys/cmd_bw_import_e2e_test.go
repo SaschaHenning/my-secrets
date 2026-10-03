@@ -48,7 +48,7 @@ func TestBwImportE2E(t *testing.T) {
 	if err := c.Sync(ctx); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	remote, err := bw.FetchRemoteState(ctx, c)
+	remote, err := bw.FetchRemoteState(ctx, c, nil)
 	if err != nil {
 		t.Fatalf("fetch remote: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestBwImportE2E(t *testing.T) {
 	if err := c.Sync(ctx); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	after, err := bw.FetchRemoteState(ctx, c)
+	after, err := bw.FetchRemoteState(ctx, c, nil)
 	if err != nil {
 		t.Fatalf("fetch remote: %v", err)
 	}

@@ -466,6 +466,64 @@ mys bw-export --org jasp --out jasp-backup.json
 Schreibt eine Bitwarden-kompatible JSON-Datei, die du bei Bedarf manuell
 in Bitwarden importieren kannst. Einseitig — kein Live-Sync.
 
+## Bitwarden-Spiegel (`bw-push`)
+
+```bash
+mys bw-push --dry-run          # Plan zeigen, nichts schreiben
+mys bw-push --org jasp         # nur eine Org spiegeln
+mys bw-push --prune --yes      # verwaiste Spiegel-Items in den Papierkorb
+```
+
+`bw-push` spiegelt den Store einseitig per `bw` CLI in Bitwarden. Jedes
+Item liegt im Ordner `mys/<org>` und trägt das Custom-Field `mys-path`;
+darüber werden Items bei jedem Lauf wiedergefunden. Items außerhalb von
+`mys/*` liest und ändert der Befehl nie. Vorher einmal pro Gerät
+`bw login`; das Master-Passwort kommt aus dem Store
+(`private/bitwarden/master-password`). AI-Caller sind hart gesperrt.
+
+Konfiguration in `~/.config/my-secrets/bw.yaml`, alle Schlüssel optional:
+
+```yaml
+server_url: <URL deines Bitwarden-Servers>      # Lauf gegen anderen Server wird verweigert
+master_password_path: private/bitwarden/master-password
+organizations:
+  jasp:
+    organization_id: <uuid der Bitwarden-Organisation>
+    collection_ids: [<uuid der Sammlung>]
+```
+
+Ordner sind in Bitwarden persönlich, Kollegen sehen nur Items in einer
+**Organisation**. Mit einem `organizations`-Eintrag für eine Org gilt:
+
+- Neue Items entstehen direkt in der Organisation und den angegebenen
+  Sammlungen (mindestens eine Sammlung ist Pflicht).
+- Bestehende persönliche Spiegel-Items dieser Org werden per `bw move`
+  in die Organisation verschoben. `--dry-run` zeigt Ziel-Organisation
+  und Sammlungen je Item.
+- Gesucht wird in den `mys/*`-Ordnern und zusätzlich in jeder
+  konfigurierten Organisation, weil Ordner pro Person gelten. Aus einer
+  Organisation zählen nur Items, deren `mys-path` zu einer Org gehört,
+  die genau auf diese Organisation zeigt. Ein Kollege kann so kein Item
+  `zuhause/x` anlegen, in das der nächste Push ein privates Secret
+  schreibt.
+- Updates behalten Organisation und Sammlungen bei. Liegt ein Item in
+  einer Organisation, auf die seine Org nicht zeigt (oder ist die Org gar
+  nicht gemappt), überspringt `bw-push` es mit Warnung: kein Update,
+  kein Move.
+- Eine Änderung von `collection_ids` gilt nur für neue und frisch
+  verschobene Items; bestehende Org-Items werden nicht umsortiert.
+- `--prune` lässt Items in einer Organisation liegen und meldet nur ihre
+  Anzahl. Erst `--prune-shared` (zusätzlich zu `--prune`) verschiebt sie
+  in den Papierkorb; Plan und Rückfrage markieren sie als SHARED, denn
+  sie verschwinden für alle Mitglieder der Sammlung. `--yes` allein
+  reicht dafür nicht.
+- `bw.yaml` wird strikt gelesen: unbekannte Schlüssel (etwa
+  `organisations`) brechen ab. Ein Mapping für eine Org, die es im Store
+  nicht gibt, erzeugt eine Warnung.
+
+Ohne `organizations`-Eintrag bleibt alles im persönlichen Tresor. Die IDs
+zeigen `bw list organizations` und `bw list collections`.
+
 ## Git-Sync: persönliche und explizit geteilte Mounts
 
 ### Persönlicher Store: nur deine eigenen Geräte

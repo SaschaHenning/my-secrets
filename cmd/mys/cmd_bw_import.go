@@ -264,7 +264,7 @@ func runBwImport(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader,
 		storeEntries[p] = e
 	}
 
-	remote, err := bw.FetchRemoteState(ctx, c)
+	remote, err := bw.FetchRemoteState(ctx, c, nil)
 	if err != nil {
 		return fail("vault read", err)
 	}
