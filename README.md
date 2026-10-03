@@ -491,7 +491,12 @@ organizations:
   jasp:
     organization_id: <uuid der Bitwarden-Organisation>
     collection_ids: [<uuid der Sammlung>]
+exclude_paths:                                  # liegen schon als eigenes Item in Bitwarden
+  - jasp/stripe/secret-key-live
 ```
+
+`exclude_paths` nennt Store-Pfade, die schon als von Hand angelegtes Item in
+Bitwarden liegen. Der Push überspringt sie, damit keine zweite Kopie entsteht.
 
 Ordner sind in Bitwarden persönlich, Kollegen sehen nur Items in einer
 **Organisation**. Mit einem `organizations`-Eintrag für eine Org gilt:
