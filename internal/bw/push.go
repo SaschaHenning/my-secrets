@@ -71,8 +71,9 @@ func orgPlacementAllowed(it Item, targets map[string]OrgTarget) bool {
 //
 // The organizations in targets are fetched as well: folders are per
 // user, so a shared mirror item can sit outside every mys/* folder of
-// this account. Apart from these organizations, items outside the
-// namespace are never read.
+// this account. Apart from these organizations, live items outside the
+// namespace are never read; LoadTrash lists the whole trash but keeps
+// only entries that carry a mys-path.
 func FetchRemoteState(ctx context.Context, c *Client, targets map[string]OrgTarget) (RemoteState, error) {
 	all, err := c.ListFolders(ctx)
 	if err != nil {
@@ -132,35 +133,21 @@ func FetchRemoteState(ctx context.Context, c *Client, targets map[string]OrgTarg
 	return rs, nil
 }
 
-// LoadTrash reads the trashed items of the already fetched namespace
-// folders and the mapped organizations — the same scope as
-// FetchRemoteState. Push needs this so a path the operator deleted in
-// Bitwarden is not mistaken for a missing one and re-created.
+// LoadTrash reads the whole Bitwarden trash once, without a folder
+// filter: a trashed personal item loses its folderId, so a per-folder
+// listing would miss it and push would re-create the path. Only items
+// carrying a mys-path are kept, and the organization rule still applies.
+// Push needs this so a path the operator deleted in Bitwarden is not
+// mistaken for a missing one.
 func (rs *RemoteState) LoadTrash(ctx context.Context, c *Client, targets map[string]OrgTarget) error {
+	items, err := c.ListTrashedItems(ctx)
+	if err != nil {
+		return err
+	}
 	rs.Trashed = map[string]bool{}
-	collect := func(items []Item, err error) error {
-		if err != nil {
-			return err
-		}
-		for _, it := range items {
-			if p := PathOf(it); p != "" && orgPlacementAllowed(it, targets) {
-				rs.Trashed[p] = true
-			}
-		}
-		return nil
-	}
-	for _, f := range rs.Folders {
-		if err := collect(c.ListTrashedItemsInFolder(ctx, f.ID)); err != nil {
-			return err
-		}
-	}
-	orgIDs := map[string]bool{}
-	for _, t := range targets {
-		orgIDs[t.OrganizationID] = true
-	}
-	for _, orgID := range slices.Sorted(maps.Keys(orgIDs)) {
-		if err := collect(c.ListTrashedItemsInOrganization(ctx, orgID)); err != nil {
-			return err
+	for _, it := range items {
+		if p := PathOf(it); p != "" && orgPlacementAllowed(it, targets) {
+			rs.Trashed[p] = true
 		}
 	}
 	return nil

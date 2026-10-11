@@ -966,6 +966,11 @@ func TestIntegration_ImportAndAdd(t *testing.T) {
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "data"))
+	// An inherited GOPASS_CONFIG/GOPASS_HOMEDIR beats HOME and XDG_*.
+	for _, k := range []string{"GOPASS_CONFIG", "GOPASS_HOMEDIR"} {
+		t.Setenv(k, "")
+		os.Unsetenv(k)
+	}
 
 	// 1. Generate a passphrase-less test key in batch mode.
 	batchFile := filepath.Join(root, "keygen")

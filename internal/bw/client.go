@@ -188,14 +188,10 @@ func (c *Client) ListItemsInOrganization(ctx context.Context, organizationID str
 	return c.listItems(ctx, "--organizationid", organizationID)
 }
 
-// ListTrashedItemsInFolder returns the trashed items that were in one folder.
-func (c *Client) ListTrashedItemsInFolder(ctx context.Context, folderID string) ([]Item, error) {
-	return c.listItems(ctx, "--trash", "--folderid", folderID)
-}
-
-// ListTrashedItemsInOrganization returns the trashed items of one organization.
-func (c *Client) ListTrashedItemsInOrganization(ctx context.Context, organizationID string) ([]Item, error) {
-	return c.listItems(ctx, "--trash", "--organizationid", organizationID)
+// ListTrashedItems returns every trashed item the account can see. Trash
+// entries have no folderId, so they cannot be listed per folder.
+func (c *Client) ListTrashedItems(ctx context.Context) ([]Item, error) {
+	return c.listItems(ctx, "--trash")
 }
 
 func (c *Client) listItems(ctx context.Context, filter ...string) ([]Item, error) {

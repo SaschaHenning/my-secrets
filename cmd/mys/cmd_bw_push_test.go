@@ -302,10 +302,10 @@ func TestRunBwPush_SkipsPathOnlyInTrash(t *testing.T) {
 	e := &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"}
 	a := fakeApp(t, e)
 	r := &stubBWRunner{Responses: map[string][]byte{
-		"status":                           unlockedStatus,
-		"list folders":                     []byte(`[{"id":"f1","name":"mys/jasp"}]`),
-		"list items --folderid f1":         []byte(`[]`),
-		"list items --trash --folderid f1": trashedMirrorJSON(t, "f1", e),
+		"status":                   unlockedStatus,
+		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1": []byte(`[]`),
+		"list items --trash":       trashedMirrorJSON(t, "f1", e),
 	}}
 	var stdout, stderr bytes.Buffer
 	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
@@ -327,14 +327,57 @@ func TestRunBwPush_SkipsPathOnlyInTrash(t *testing.T) {
 	}
 }
 
+func TestRunBwPush_SkipsTrashedItemWithoutFolderID(t *testing.T) {
+	e := &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"}
+	a := fakeApp(t, e)
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":                   unlockedStatus,
+		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1": []byte(`[]`),
+		"list items --trash":       trashedMirrorJSON(t, "", e),
+	}}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{Session: "tok", Yes: true})
+	if err != nil {
+		t.Fatalf("runBwPush: %v", err)
+	}
+	if r.called("create item") {
+		t.Fatalf("calls = %v, want no create for a trashed item without folderId", r.Calls)
+	}
+	if !strings.Contains(stderr.String(), "skip jasp/a: deleted in Bitwarden (trash)") {
+		t.Errorf("stderr = %q, want trash skip notice", stderr.String())
+	}
+}
+
+func TestRunBwPush_AbortsWhenTrashListingFails(t *testing.T) {
+	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"})
+	r := &stubBWRunner{
+		Responses: map[string][]byte{
+			"status":                   unlockedStatus,
+			"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+			"list items --folderid f1": []byte(`[]`),
+		},
+		Errs: map[string]error{"list items --trash": errors.New("boom")},
+	}
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &bytes.Buffer{}, &bytes.Buffer{},
+		bwPushOptions{Session: "tok", Yes: true})
+	if err == nil {
+		t.Fatal("runBwPush succeeded, want an abort")
+	}
+	if r.called("create item") || r.called("create folder") || r.called("edit item") {
+		t.Fatalf("calls = %v, want no write after a failed trash read", r.Calls)
+	}
+}
+
 func TestRunBwPush_DryRunShowsTrashSkipCount(t *testing.T) {
 	e := &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"}
 	a := fakeApp(t, e)
 	r := &stubBWRunner{Responses: map[string][]byte{
-		"status":                           unlockedStatus,
-		"list folders":                     []byte(`[{"id":"f1","name":"mys/jasp"}]`),
-		"list items --folderid f1":         []byte(`[]`),
-		"list items --trash --folderid f1": trashedMirrorJSON(t, "f1", e),
+		"status":                   unlockedStatus,
+		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1": []byte(`[]`),
+		"list items --trash":       trashedMirrorJSON(t, "f1", e),
 	}}
 	var stdout bytes.Buffer
 	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &bytes.Buffer{},
@@ -351,11 +394,11 @@ func TestRunBwPush_UpdatesLiveItemWhenTrashedCopyExists(t *testing.T) {
 	old := &store.Entry{Path: "jasp/a", Org: "jasp", Password: "old"}
 	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "new"})
 	r := &stubBWRunner{Responses: map[string][]byte{
-		"status":                           unlockedStatus,
-		"list folders":                     []byte(`[{"id":"f1","name":"mys/jasp"}]`),
-		"list items --folderid f1":         mirrorItemJSON(t, "f1", old),
-		"list items --trash --folderid f1": trashedMirrorJSON(t, "f1", old),
-		"edit item a":                      []byte(`{}`),
+		"status":                   unlockedStatus,
+		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1": mirrorItemJSON(t, "f1", old),
+		"list items --trash":       trashedMirrorJSON(t, "f1", old),
+		"edit item a":              []byte(`{}`),
 	}}
 	var stdout, stderr bytes.Buffer
 	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
