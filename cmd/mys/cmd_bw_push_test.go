@@ -32,7 +32,10 @@ func (s *stubBWRunner) Run(_ context.Context, _ []byte, env []string, args ...st
 	if err := s.Errs[key]; err != nil {
 		return nil, err
 	}
-	return s.Responses[key], nil
+	if out, ok := s.Responses[key]; ok || !strings.Contains(key, "--trash") {
+		return out, nil
+	}
+	return []byte(`[]`), nil // trash listings default to empty
 }
 
 func (s *stubBWRunner) called(prefix string) bool {
@@ -287,6 +290,103 @@ func TestRunBwPush_SkipsExcludedPaths(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "skip jasp/a: listed in exclude_paths") {
 		t.Errorf("stderr = %q, want skip notice", stderr.String())
+	}
+}
+
+func trashedMirrorJSON(t *testing.T, folderID string, entries ...*store.Entry) []byte {
+	t.Helper()
+	return mirrorItemJSON(t, folderID, entries...)
+}
+
+func TestRunBwPush_SkipsPathOnlyInTrash(t *testing.T) {
+	e := &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"}
+	a := fakeApp(t, e)
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":                           unlockedStatus,
+		"list folders":                     []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1":         []byte(`[]`),
+		"list items --trash --folderid f1": trashedMirrorJSON(t, "f1", e),
+	}}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{Session: "tok", Yes: true})
+	if err != nil {
+		t.Fatalf("runBwPush: %v", err)
+	}
+	if r.called("create item") || r.called("edit item") || r.called("restore") || r.called("delete") {
+		t.Fatalf("calls = %v, want no write for a trashed-only path", r.Calls)
+	}
+	if !strings.Contains(stderr.String(), "skip jasp/a: deleted in Bitwarden (trash); restore it there to mirror again") {
+		t.Errorf("stderr = %q, want trash skip notice", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "1 skipped (deleted in Bitwarden trash)") {
+		t.Errorf("stdout = %q, want skipped count in the plan", stdout.String())
+	}
+	if rows := bwPushRows(t, a); len(rows) != 1 || !strings.Contains(rows[0].Reason, "trash_skipped=1") {
+		t.Errorf("rows = %+v, want trash_skipped=1", rows)
+	}
+}
+
+func TestRunBwPush_DryRunShowsTrashSkipCount(t *testing.T) {
+	e := &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"}
+	a := fakeApp(t, e)
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":                           unlockedStatus,
+		"list folders":                     []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1":         []byte(`[]`),
+		"list items --trash --folderid f1": trashedMirrorJSON(t, "f1", e),
+	}}
+	var stdout bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &bytes.Buffer{},
+		bwPushOptions{Session: "tok", DryRun: true})
+	if err != nil {
+		t.Fatalf("runBwPush: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "1 skipped (deleted in Bitwarden trash)") || !strings.Contains(stdout.String(), "dry-run") {
+		t.Errorf("stdout = %q, want dry-run with skip count", stdout.String())
+	}
+}
+
+func TestRunBwPush_UpdatesLiveItemWhenTrashedCopyExists(t *testing.T) {
+	old := &store.Entry{Path: "jasp/a", Org: "jasp", Password: "old"}
+	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "new"})
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":                           unlockedStatus,
+		"list folders":                     []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1":         mirrorItemJSON(t, "f1", old),
+		"list items --trash --folderid f1": trashedMirrorJSON(t, "f1", old),
+		"edit item a":                      []byte(`{}`),
+	}}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{Session: "tok", Yes: true})
+	if err != nil {
+		t.Fatalf("runBwPush: %v", err)
+	}
+	if !r.called("edit item a") || r.called("create item") {
+		t.Fatalf("calls = %v, want the live item updated and nothing created", r.Calls)
+	}
+	if strings.Contains(stderr.String(), "deleted in Bitwarden") {
+		t.Errorf("stderr = %q, want no trash skip for a path with a live item", stderr.String())
+	}
+}
+
+func TestRunBwPush_CreatesWhenTrashIsEmpty(t *testing.T) {
+	a := fakeApp(t, &store.Entry{Path: "jasp/a", Org: "jasp", Password: "s3cr3t"})
+	r := &stubBWRunner{Responses: map[string][]byte{
+		"status":                   unlockedStatus,
+		"list folders":             []byte(`[{"id":"f1","name":"mys/jasp"}]`),
+		"list items --folderid f1": []byte(`[]`),
+		"create item":              []byte(`{"id":"srv-i"}`),
+	}}
+	var stdout, stderr bytes.Buffer
+	err := runBwPush(context.Background(), a, bw.NewClient(r), &bytes.Buffer{}, &stdout, &stderr,
+		bwPushOptions{Session: "tok", Yes: true})
+	if err != nil {
+		t.Fatalf("runBwPush: %v", err)
+	}
+	if !r.called("create item") {
+		t.Fatalf("calls = %v, want a create", r.Calls)
 	}
 }
 

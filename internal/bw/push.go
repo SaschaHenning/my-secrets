@@ -43,6 +43,10 @@ type RemoteState struct {
 	Blocked map[string]bool
 	// Warnings lists items dropped by the organization rule.
 	Warnings []string
+	// Trashed holds mys-paths with an item in the Bitwarden trash, filled
+	// by LoadTrash. Push reads it only to respect a deliberate delete; it
+	// never restores, purges or edits a trashed item.
+	Trashed map[string]bool
 }
 
 // orgPlacementAllowed reports whether a mirror item may be touched: a
@@ -128,6 +132,40 @@ func FetchRemoteState(ctx context.Context, c *Client, targets map[string]OrgTarg
 	return rs, nil
 }
 
+// LoadTrash reads the trashed items of the already fetched namespace
+// folders and the mapped organizations — the same scope as
+// FetchRemoteState. Push needs this so a path the operator deleted in
+// Bitwarden is not mistaken for a missing one and re-created.
+func (rs *RemoteState) LoadTrash(ctx context.Context, c *Client, targets map[string]OrgTarget) error {
+	rs.Trashed = map[string]bool{}
+	collect := func(items []Item, err error) error {
+		if err != nil {
+			return err
+		}
+		for _, it := range items {
+			if p := PathOf(it); p != "" && orgPlacementAllowed(it, targets) {
+				rs.Trashed[p] = true
+			}
+		}
+		return nil
+	}
+	for _, f := range rs.Folders {
+		if err := collect(c.ListTrashedItemsInFolder(ctx, f.ID)); err != nil {
+			return err
+		}
+	}
+	orgIDs := map[string]bool{}
+	for _, t := range targets {
+		orgIDs[t.OrganizationID] = true
+	}
+	for _, orgID := range slices.Sorted(maps.Keys(orgIDs)) {
+		if err := collect(c.ListTrashedItemsInOrganization(ctx, orgID)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // PlannedWrite is one create/update decision: the desired item plus the
 // folder it belongs in. FolderID is left empty on the item and resolved
 // against the live vault at execution time, because server folder ids
@@ -165,6 +203,8 @@ type PushPlan struct {
 	Moves         []PlannedMove
 	Prunes        []PlannedPrune
 	Unchanged     int
+	// TrashSkipped lists paths whose only Bitwarden item is in the trash.
+	TrashSkipped []string
 	// Foreign counts namespace items without a mys-path field. Push
 	// never touches them; they are bw-import material.
 	Foreign int
@@ -245,6 +285,10 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 		matches := byPath[e.Path]
 		switch len(matches) {
 		case 0:
+			if remote.Trashed[e.Path] {
+				plan.TrashSkipped = append(plan.TrashSkipped, e.Path)
+				continue
+			}
 			if mapped {
 				desired.OrganizationID = target.OrganizationID
 				desired.CollectionIDs = target.CollectionIDs

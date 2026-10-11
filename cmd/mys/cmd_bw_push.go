@@ -210,6 +210,9 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 	if err != nil {
 		return fail("vault read", err)
 	}
+	if err := remote.LoadTrash(ctx, c, cfg.Organizations); err != nil {
+		return fail("vault trash read", err)
+	}
 	// Policy-invisible paths count as "still present": a caller whose
 	// scope policy hides an org sees its paths missing from List — that
 	// must never let --prune trash the org's mirror items.
@@ -230,13 +233,16 @@ func runBwPush(ctx context.Context, a *app.App, c *bw.Client, stdin io.Reader, s
 	for _, w := range plan.Warnings {
 		fmt.Fprintln(stderr, "warning:", w)
 	}
+	for _, p := range plan.TrashSkipped {
+		fmt.Fprintf(stderr, "skip %s: deleted in Bitwarden (trash); restore it there to mirror again\n", p)
+	}
 	printPushPlan(stdout, st, plan)
 
 	// warnings= keeps skipped entries visible in the audit trail — a
 	// no-op row must not read as "everything mirrored cleanly" when
 	// entries were skipped.
-	counts := fmt.Sprintf("server=%s create=%d update=%d move=%d prune=%d prune_shared=%d unchanged=%d warnings=%d",
-		st.ServerURL, len(plan.Creates), len(plan.Updates), len(plan.Moves), len(plan.Prunes), plan.SharedPrunes(), plan.Unchanged, len(plan.Warnings))
+	counts := fmt.Sprintf("server=%s create=%d update=%d move=%d prune=%d prune_shared=%d unchanged=%d trash_skipped=%d warnings=%d",
+		st.ServerURL, len(plan.Creates), len(plan.Updates), len(plan.Moves), len(plan.Prunes), plan.SharedPrunes(), plan.Unchanged, len(plan.TrashSkipped), len(plan.Warnings))
 	if opts.DryRun {
 		a.AuditBWPush(ctx, opts.Org, audit.ResultOK, "dry-run "+counts)
 		fmt.Fprintln(stdout, "dry-run: no changes written")
@@ -297,6 +303,9 @@ func printPushPlan(w io.Writer, st bw.Status, plan bw.PushPlan) {
 		fmt.Fprintf(w, "  %d stale items inside an organization left alone (add --prune-shared to trash them)\n", plan.SharedPruneSkipped)
 	}
 	fmt.Fprintf(w, "  %d unchanged", plan.Unchanged)
+	if n := len(plan.TrashSkipped); n > 0 {
+		fmt.Fprintf(w, ", %d skipped (deleted in Bitwarden trash)", n)
+	}
 	if plan.Foreign > 0 {
 		fmt.Fprintf(w, ", %d foreign items in mys/* left untouched", plan.Foreign)
 	}

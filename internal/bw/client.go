@@ -179,21 +179,27 @@ func (c *Client) ListFolders(ctx context.Context) ([]Folder, error) {
 // ever call this for folders inside the mys namespace, which is what
 // keeps the rest of the personal vault unread.
 func (c *Client) ListItemsInFolder(ctx context.Context, folderID string) ([]Item, error) {
-	out, err := c.r.Run(ctx, nil, c.env(), "list", "items", "--folderid", folderID)
-	if err != nil {
-		return nil, err
-	}
-	var its []Item
-	if err := json.Unmarshal(bytes.TrimSpace(out), &its); err != nil {
-		return nil, fmt.Errorf("parse bw items: %w", err)
-	}
-	return its, nil
+	return c.listItems(ctx, "--folderid", folderID)
 }
 
 // ListItemsInOrganization returns every item of one organization the
 // account can see, mirror-managed or not.
 func (c *Client) ListItemsInOrganization(ctx context.Context, organizationID string) ([]Item, error) {
-	out, err := c.r.Run(ctx, nil, c.env(), "list", "items", "--organizationid", organizationID)
+	return c.listItems(ctx, "--organizationid", organizationID)
+}
+
+// ListTrashedItemsInFolder returns the trashed items that were in one folder.
+func (c *Client) ListTrashedItemsInFolder(ctx context.Context, folderID string) ([]Item, error) {
+	return c.listItems(ctx, "--trash", "--folderid", folderID)
+}
+
+// ListTrashedItemsInOrganization returns the trashed items of one organization.
+func (c *Client) ListTrashedItemsInOrganization(ctx context.Context, organizationID string) ([]Item, error) {
+	return c.listItems(ctx, "--trash", "--organizationid", organizationID)
+}
+
+func (c *Client) listItems(ctx context.Context, filter ...string) ([]Item, error) {
+	out, err := c.r.Run(ctx, nil, c.env(), append([]string{"list", "items"}, filter...)...)
 	if err != nil {
 		return nil, err
 	}
