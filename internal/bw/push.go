@@ -43,6 +43,10 @@ type RemoteState struct {
 	Blocked map[string]bool
 	// Warnings lists items dropped by the organization rule.
 	Warnings []string
+	// Trashed holds mys-paths with an item in the Bitwarden trash, filled
+	// by LoadTrash. Push reads it only to respect a deliberate delete; it
+	// never restores, purges or edits a trashed item.
+	Trashed map[string]bool
 }
 
 // orgPlacementAllowed reports whether a mirror item may be touched: a
@@ -67,8 +71,9 @@ func orgPlacementAllowed(it Item, targets map[string]OrgTarget) bool {
 //
 // The organizations in targets are fetched as well: folders are per
 // user, so a shared mirror item can sit outside every mys/* folder of
-// this account. Apart from these organizations, items outside the
-// namespace are never read.
+// this account. Apart from these organizations, live items outside the
+// namespace are never read; LoadTrash lists the whole trash but keeps
+// only entries that carry a mys-path.
 func FetchRemoteState(ctx context.Context, c *Client, targets map[string]OrgTarget) (RemoteState, error) {
 	all, err := c.ListFolders(ctx)
 	if err != nil {
@@ -128,6 +133,26 @@ func FetchRemoteState(ctx context.Context, c *Client, targets map[string]OrgTarg
 	return rs, nil
 }
 
+// LoadTrash reads the whole Bitwarden trash once, without a folder
+// filter: a trashed personal item loses its folderId, so a per-folder
+// listing would miss it and push would re-create the path. Only items
+// carrying a mys-path are kept, and the organization rule still applies.
+// Push needs this so a path the operator deleted in Bitwarden is not
+// mistaken for a missing one.
+func (rs *RemoteState) LoadTrash(ctx context.Context, c *Client, targets map[string]OrgTarget) error {
+	items, err := c.ListTrashedItems(ctx)
+	if err != nil {
+		return err
+	}
+	rs.Trashed = map[string]bool{}
+	for _, it := range items {
+		if p := PathOf(it); p != "" && orgPlacementAllowed(it, targets) {
+			rs.Trashed[p] = true
+		}
+	}
+	return nil
+}
+
 // PlannedWrite is one create/update decision: the desired item plus the
 // folder it belongs in. FolderID is left empty on the item and resolved
 // against the live vault at execution time, because server folder ids
@@ -165,6 +190,8 @@ type PushPlan struct {
 	Moves         []PlannedMove
 	Prunes        []PlannedPrune
 	Unchanged     int
+	// TrashSkipped lists paths whose only Bitwarden item is in the trash.
+	TrashSkipped []string
 	// Foreign counts namespace items without a mys-path field. Push
 	// never touches them; they are bw-import material.
 	Foreign int
@@ -245,6 +272,10 @@ func BuildPushPlan(entries []*store.Entry, storePaths map[string]bool, remote Re
 		matches := byPath[e.Path]
 		switch len(matches) {
 		case 0:
+			if remote.Trashed[e.Path] {
+				plan.TrashSkipped = append(plan.TrashSkipped, e.Path)
+				continue
+			}
 			if mapped {
 				desired.OrganizationID = target.OrganizationID
 				desired.CollectionIDs = target.CollectionIDs
