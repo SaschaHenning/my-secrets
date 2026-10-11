@@ -110,6 +110,11 @@ func TestInitialise_Integration(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(gnupg) })
 	_ = os.Chmod(gnupg, 0o700)
 	t.Setenv("GNUPGHOME", gnupg)
+	// gopass writes its config under HOME/XDG_CONFIG_HOME; keep it away
+	// from the developer's real one.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
 
 	// Generate a throwaway key so gopass has something to encrypt to.
 	batch := filepath.Join(gnupg, "batch")
