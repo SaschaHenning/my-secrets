@@ -2697,8 +2697,10 @@ func TestSharedReadGate_MidLoopCancelFinalizesObservedRead(t *testing.T) {
 			deadlines,
 		)
 	}
+	// Two operations share this fake session: the listing and the one
+	// decrypt chunk. The cancelled chunk must still close cleanly.
 	closeCalls, closeCtxErr, closeDeadline := session.closeState()
-	if closeCalls != 1 || closeCtxErr != nil || !closeDeadline {
+	if closeCalls != 2 || closeCtxErr != nil || !closeDeadline {
 		t.Fatalf(
 			"session close = calls:%d err:%v deadline:%t",
 			closeCalls,
@@ -2977,5 +2979,100 @@ func TestProductionTeamReadRuntimeIsComplete(t *testing.T) {
 		runtime.newAuditManager == nil ||
 		runtime.identifyCaller == nil {
 		t.Fatal("production team-read runtime is incomplete")
+	}
+}
+
+// A whole-store browse must not hold the access lock for its full
+// duration: a concurrent `mys get` or web copy click waits on that lock.
+func TestBrowseDetailed_ReleasesLockBetweenChunks(t *testing.T) {
+	entries := make([]*store.Entry, 0, 2*browseChunkSize+1)
+	for i := range 2*browseChunkSize + 1 {
+		entries = append(entries, &store.Entry{
+			Path:     fmt.Sprintf("home/e%03d", i),
+			Password: "x",
+		})
+	}
+	app, _, _, _ := gatedApp(t, aiActor(), entries...)
+	held, acquires := false, 0
+	app.teamReads.acquireAnchor = func(
+		ctx context.Context,
+	) (context.Context, func() error, error) {
+		if held {
+			t.Fatal("lock taken while still held")
+		}
+		held = true
+		acquires++
+		return ctx, func() error {
+			held = false
+			return nil
+		}, nil
+	}
+
+	got, err := app.BrowseDetailed(context.Background(), "")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(entries) {
+		t.Fatalf("entries = %d, want %d", len(got), len(entries))
+	}
+	// One listing plus three chunks (full, full, one entry).
+	if acquires != 4 {
+		t.Fatalf("lock acquisitions = %d, want 4", acquires)
+	}
+	if held {
+		t.Fatal("lock still held after browse")
+	}
+}
+
+func TestBrowseBatches_SharedMountsStayOneBatch(t *testing.T) {
+	paths := make([]string, 0, 2*browseChunkSize+3)
+	for i := range browseChunkSize + 1 {
+		paths = append(paths, fmt.Sprintf("jasp/s%03d", i), fmt.Sprintf("home/p%03d", i))
+	}
+	paths = append(paths, "home/last", "team/x")
+
+	batches := browseBatches(paths, func(mount string) bool {
+		return mount == "jasp" || mount == "team"
+	})
+
+	if len(batches) != 3 {
+		t.Fatalf("batches = %d, want 3 (one shared, two private)", len(batches))
+	}
+	if len(batches[0]) != browseChunkSize+2 || batches[0][0] != "jasp/s000" {
+		t.Fatalf("shared batch = %v", batches[0])
+	}
+	if len(batches[1]) != browseChunkSize || len(batches[2]) != 2 {
+		t.Fatalf("private batches = %d + %d", len(batches[1]), len(batches[2]))
+	}
+}
+
+func TestBrowseDetailed_CancelBetweenChunksReturnsNothing(t *testing.T) {
+	entries := make([]*store.Entry, 0, browseChunkSize+1)
+	for i := range browseChunkSize + 1 {
+		entries = append(entries, &store.Entry{Path: fmt.Sprintf("home/e%03d", i), Password: "x"})
+	}
+	app, _, _, _ := gatedApp(t, aiActor(), entries...)
+	ctx, cancel := context.WithCancel(context.Background())
+	acquires := 0
+	app.teamReads.acquireAnchor = func(
+		lockCtx context.Context,
+	) (context.Context, func() error, error) {
+		acquires++
+		// Listing is acquire 1, first chunk 2: cancel inside the first
+		// chunk so the yield before the second chunk sees it.
+		if acquires == 2 {
+			cancel()
+		}
+		return lockCtx, func() error { return nil }, nil
+	}
+
+	got, err := app.BrowseDetailed(ctx, "")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if got != nil {
+		t.Fatalf("partial entries returned: %d", len(got))
 	}
 }

@@ -47,8 +47,8 @@
         <tr class="entry-row" data-search="{{searchBlob .}}">
           <td><a href="/entries/{{.Path}}"><code>{{.Path}}</code></a></td>
           <td>{{if .Kind}}<span class="badge kind-badge">{{.Kind}}</span>{{end}}</td>
-          <td>{{if .Username}}{{.Username}}{{else}}<span class="muted">—</span>{{end}}</td>
-          <td>{{if .Domain}}{{.Domain}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .Username}}<span class="cell-clip" title="{{.Username}}">{{.Username}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .Domain}}<span class="cell-clip" title="{{.Domain}}">{{.Domain}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
           <td>{{range .Tags}}<span class="tag">{{.}}</span>{{end}}</td>
           <td class="muted">{{relativeTime (index $.LastReads .Path)}}</td>
           <td class="entry-actions">

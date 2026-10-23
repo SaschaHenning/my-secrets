@@ -605,25 +605,14 @@ func (a *App) Orgs(ctx context.Context) ([]string, error) {
 func (a *App) BrowseDetailed(
 	ctx context.Context,
 	org string,
-) (resultEntries []*store.Entry, resultErr error) {
+) ([]*store.Entry, error) {
 	d := a.callerDetail()
-	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	paths, batches, err := a.listForBrowse(ctx, d, org)
 	if err != nil {
 		a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultError, err.Error())
 		return nil, err
 	}
-	defer func() {
-		if closeErr := operation.close(ctx); closeErr != nil {
-			resultEntries = nil
-			resultErr = errors.Join(resultErr, closeErr)
-		}
-	}()
-	paths, err := operation.store.List(ctx, org)
-	if err != nil {
-		a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultError, err.Error())
-		return nil, err
-	}
-	entries, err := operation.decryptBatch(ctx, paths, "list_detail")
+	entries, err := a.decryptInChunks(ctx, d, paths, batches, "list_detail")
 	if err != nil {
 		auditContext := ctx
 		if ctx.Err() != nil {
@@ -638,6 +627,131 @@ func (a *App) BrowseDetailed(
 	a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultOK,
 		fmt.Sprintf("%d entries", len(entries)))
 	return entries, nil
+}
+
+// browseChunkSize bounds how long one BrowseDetailed step holds the
+// cross-process access lock: ~0.15s per decrypt on a real store, so a
+// chunk is about 1.2s. Holding the lock for the whole store (571 entries,
+// ~87s measured 2026-10-23) made every `mys get` and every web copy
+// click wait behind the web UI's background refresh.
+const browseChunkSize = 8
+
+// browseLockYield is the pause between chunks. A waiting process polls
+// the lock every 25ms (lockanchor), so the pause must be longer than one
+// poll or this loop re-takes the lock before any waiter gets a turn.
+const browseLockYield = 60 * time.Millisecond
+
+// browsePrepareError marks a failure before the listing ran (lock, policy,
+// team audit), so search audit rows keep stage "prepare" apart from "list".
+type browsePrepareError struct{ err error }
+
+func (e *browsePrepareError) Error() string { return e.err.Error() }
+func (e *browsePrepareError) Unwrap() error { return e.err }
+
+func (a *App) listForBrowse(
+	ctx context.Context,
+	d caller.Detail,
+	org string,
+) (paths []string, batches [][]string, resultErr error) {
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		return nil, nil, &browsePrepareError{err: err}
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			paths, batches = nil, nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	paths, err = operation.store.List(ctx, org)
+	if err != nil {
+		return nil, nil, err
+	}
+	return paths, browseBatches(paths, func(mount string) bool {
+		_, shared := operation.sharedRemote(mount)
+		return shared
+	}), nil
+}
+
+// browseBatches keeps every shared team-mount path in ONE batch, exactly
+// as before chunking: each batch that touches a shared mount writes a
+// signed team-audit commit and push, and that batch's finalize covers all
+// mounts even when one append fails. Only private paths are split into
+// browseChunkSize pieces.
+func browseBatches(paths []string, shared func(mount string) bool) [][]string {
+	sharedPaths := make([]string, 0)
+	private := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if shared(store.OrgOf(path)) {
+			sharedPaths = append(sharedPaths, path)
+		} else {
+			private = append(private, path)
+		}
+	}
+	batches := make([][]string, 0, len(private)/browseChunkSize+2)
+	if len(sharedPaths) > 0 {
+		batches = append(batches, sharedPaths)
+	}
+	for start := 0; start < len(private); start += browseChunkSize {
+		batches = append(batches, private[start:min(start+browseChunkSize, len(private))])
+	}
+	return batches
+}
+
+// decryptInChunks runs one complete access operation (lock, policy,
+// team-audit prepare/finalize) per batch and returns entries in the order
+// of paths. A path removed between the listing and its batch fails the
+// whole call; entriesCache keeps its last good result in that case.
+func (a *App) decryptInChunks(
+	ctx context.Context,
+	d caller.Detail,
+	paths []string,
+	batches [][]string,
+	action string,
+) ([]*store.Entry, error) {
+	byPath := make(map[string]*store.Entry, len(paths))
+	for i, batch := range batches {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(browseLockYield):
+			}
+		}
+		chunk, err := a.decryptChunk(ctx, d, batch, action)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range chunk {
+			byPath[entry.Path] = entry
+		}
+	}
+	entries := make([]*store.Entry, 0, len(byPath))
+	for _, path := range paths {
+		if entry, ok := byPath[path]; ok {
+			entries = append(entries, entry)
+		}
+	}
+	return entries, nil
+}
+
+func (a *App) decryptChunk(
+	ctx context.Context,
+	d caller.Detail,
+	paths []string,
+	action string,
+) (entries []*store.Entry, resultErr error) {
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			entries = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	return operation.decryptBatch(ctx, paths, action)
 }
 
 // BrowseDetailedPaths decrypts exactly the given paths and returns the
@@ -1269,30 +1383,20 @@ func (a *App) SearchByDomain(
 		return nil, nil, nil
 	}
 	d := a.callerDetail()
-	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	paths, batches, err := a.listForBrowse(ctx, d, "")
 	if err != nil {
-		a.writeAudit(
-			ctx, audit.ActionSearch, "", d,
-			audit.ResultError, searchAuditFailure(query, searchAuditStagePrepare),
-		)
-		return nil, nil, err
-	}
-	defer func() {
-		if closeErr := operation.close(ctx); closeErr != nil {
-			matches = nil
-			similar = nil
-			resultErr = errors.Join(resultErr, closeErr)
+		stage := searchAuditStageList
+		var prepareErr *browsePrepareError
+		if errors.As(err, &prepareErr) {
+			stage, err = searchAuditStagePrepare, prepareErr.err
 		}
-	}()
-	paths, err := operation.store.List(ctx, "")
-	if err != nil {
 		a.writeAudit(
 			ctx, audit.ActionSearch, "", d,
-			audit.ResultError, searchAuditFailure(query, searchAuditStageList),
+			audit.ResultError, searchAuditFailure(query, stage),
 		)
 		return nil, nil, err
 	}
-	entries, err := operation.decryptBatch(ctx, paths, "search_domain")
+	entries, err := a.decryptInChunks(ctx, d, paths, batches, "search_domain")
 	if err != nil {
 		a.writeAudit(
 			ctx, audit.ActionSearch, "", d,
