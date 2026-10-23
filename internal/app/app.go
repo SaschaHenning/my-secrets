@@ -641,6 +641,13 @@ const browseChunkSize = 8
 // poll or this loop re-takes the lock before any waiter gets a turn.
 const browseLockYield = 60 * time.Millisecond
 
+// browsePrepareError marks a failure before the listing ran (lock, policy,
+// team audit), so search audit rows keep stage "prepare" apart from "list".
+type browsePrepareError struct{ err error }
+
+func (e *browsePrepareError) Error() string { return e.err.Error() }
+func (e *browsePrepareError) Unwrap() error { return e.err }
+
 func (a *App) listForBrowse(
 	ctx context.Context,
 	d caller.Detail,
@@ -648,7 +655,7 @@ func (a *App) listForBrowse(
 ) (paths []string, batches [][]string, resultErr error) {
 	operation, err := a.beginAccessOperation(ctx, d, true, true)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &browsePrepareError{err: err}
 	}
 	defer func() {
 		if closeErr := operation.close(ctx); closeErr != nil {
@@ -1378,9 +1385,14 @@ func (a *App) SearchByDomain(
 	d := a.callerDetail()
 	paths, batches, err := a.listForBrowse(ctx, d, "")
 	if err != nil {
+		stage := searchAuditStageList
+		var prepareErr *browsePrepareError
+		if errors.As(err, &prepareErr) {
+			stage, err = searchAuditStagePrepare, prepareErr.err
+		}
 		a.writeAudit(
 			ctx, audit.ActionSearch, "", d,
-			audit.ResultError, searchAuditFailure(query, searchAuditStageList),
+			audit.ResultError, searchAuditFailure(query, stage),
 		)
 		return nil, nil, err
 	}
