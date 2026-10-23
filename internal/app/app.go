@@ -605,25 +605,14 @@ func (a *App) Orgs(ctx context.Context) ([]string, error) {
 func (a *App) BrowseDetailed(
 	ctx context.Context,
 	org string,
-) (resultEntries []*store.Entry, resultErr error) {
+) ([]*store.Entry, error) {
 	d := a.callerDetail()
-	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	paths, err := a.listForBrowse(ctx, d, org)
 	if err != nil {
 		a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultError, err.Error())
 		return nil, err
 	}
-	defer func() {
-		if closeErr := operation.close(ctx); closeErr != nil {
-			resultEntries = nil
-			resultErr = errors.Join(resultErr, closeErr)
-		}
-	}()
-	paths, err := operation.store.List(ctx, org)
-	if err != nil {
-		a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultError, err.Error())
-		return nil, err
-	}
-	entries, err := operation.decryptBatch(ctx, paths, "list_detail")
+	entries, err := a.decryptInChunks(ctx, d, paths, "list_detail")
 	if err != nil {
 		auditContext := ctx
 		if ctx.Err() != nil {
@@ -638,6 +627,84 @@ func (a *App) BrowseDetailed(
 	a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultOK,
 		fmt.Sprintf("%d entries", len(entries)))
 	return entries, nil
+}
+
+// browseChunkSize bounds how long one BrowseDetailed step holds the
+// cross-process access lock: ~0.15s per decrypt on a real store, so a
+// chunk is about 1.2s. Holding the lock for the whole store (571 entries,
+// ~87s measured 2026-10-23) made every `mys get` and every web copy
+// click wait behind the web UI's background refresh.
+const browseChunkSize = 8
+
+// browseLockYield is the pause between chunks. A waiting process polls
+// the lock every 25ms (lockanchor), so the pause must be longer than one
+// poll or this loop re-takes the lock before any waiter gets a turn.
+const browseLockYield = 60 * time.Millisecond
+
+func (a *App) listForBrowse(
+	ctx context.Context,
+	d caller.Detail,
+	org string,
+) (paths []string, resultErr error) {
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			paths = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	return operation.store.List(ctx, org)
+}
+
+// decryptInChunks runs one complete access operation (lock, policy,
+// team-audit prepare/finalize) per chunk. A path removed between the
+// listing and its chunk fails the whole browse; callers keep their last
+// good result in that case (entriesCache).
+func (a *App) decryptInChunks(
+	ctx context.Context,
+	d caller.Detail,
+	paths []string,
+	action string,
+) ([]*store.Entry, error) {
+	entries := make([]*store.Entry, 0, len(paths))
+	for start := 0; start < len(paths); start += browseChunkSize {
+		if start > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(browseLockYield):
+			}
+		}
+		end := min(start+browseChunkSize, len(paths))
+		chunk, err := a.decryptChunk(ctx, d, paths[start:end], action)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, chunk...)
+	}
+	return entries, nil
+}
+
+func (a *App) decryptChunk(
+	ctx context.Context,
+	d caller.Detail,
+	paths []string,
+	action string,
+) (entries []*store.Entry, resultErr error) {
+	operation, err := a.beginAccessOperation(ctx, d, true, true)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := operation.close(ctx); closeErr != nil {
+			entries = nil
+			resultErr = errors.Join(resultErr, closeErr)
+		}
+	}()
+	return operation.decryptBatch(ctx, paths, action)
 }
 
 // BrowseDetailedPaths decrypts exactly the given paths and returns the
@@ -1269,22 +1336,7 @@ func (a *App) SearchByDomain(
 		return nil, nil, nil
 	}
 	d := a.callerDetail()
-	operation, err := a.beginAccessOperation(ctx, d, true, true)
-	if err != nil {
-		a.writeAudit(
-			ctx, audit.ActionSearch, "", d,
-			audit.ResultError, searchAuditFailure(query, searchAuditStagePrepare),
-		)
-		return nil, nil, err
-	}
-	defer func() {
-		if closeErr := operation.close(ctx); closeErr != nil {
-			matches = nil
-			similar = nil
-			resultErr = errors.Join(resultErr, closeErr)
-		}
-	}()
-	paths, err := operation.store.List(ctx, "")
+	paths, err := a.listForBrowse(ctx, d, "")
 	if err != nil {
 		a.writeAudit(
 			ctx, audit.ActionSearch, "", d,
@@ -1292,7 +1344,7 @@ func (a *App) SearchByDomain(
 		)
 		return nil, nil, err
 	}
-	entries, err := operation.decryptBatch(ctx, paths, "search_domain")
+	entries, err := a.decryptInChunks(ctx, d, paths, "search_domain")
 	if err != nil {
 		a.writeAudit(
 			ctx, audit.ActionSearch, "", d,

@@ -271,6 +271,16 @@ kbd {
    from under the sticky header and search bar, which then look broken on
    a phone. */
 .org-group { margin-bottom: 2rem; overflow-x: auto; }
+/* A long username or domain must not push the copy buttons out of view;
+   the full value stays in the title tooltip and in the copy button. */
+.cell-clip {
+  display: inline-block;
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
 .kind-badge { background: var(--surface2); color: var(--text); }
 
 .tag-row { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.5rem; }

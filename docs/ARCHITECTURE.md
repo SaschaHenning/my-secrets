@@ -409,6 +409,10 @@ also `go`-warms the cache at startup, so that first cold load is usually
 already done by the time the user navigates. A hit skips the decrypt
 AND its `list_detail` audit row; only successful decrypts are cached, so
 a failed refresh keeps serving the last good result rather than wedging.
+`App.BrowseDetailed` decrypts in chunks of 8 entries, each under its own
+access lock, with a short pause in between: one lock over the whole store
+(~87s on 571 entries) made every `mys get` and every copy click wait for
+the background refresh.
 This is also why login lands on `/` (the start page decrypts nothing —
 instant) rather than `/entries`: landing on `/entries` meant the whole
 store decrypted right after login, which looked like the app hanging.
