@@ -3024,3 +3024,55 @@ func TestBrowseDetailed_ReleasesLockBetweenChunks(t *testing.T) {
 		t.Fatal("lock still held after browse")
 	}
 }
+
+func TestBrowseBatches_SharedMountsStayOneBatch(t *testing.T) {
+	paths := make([]string, 0, 2*browseChunkSize+3)
+	for i := range browseChunkSize + 1 {
+		paths = append(paths, fmt.Sprintf("jasp/s%03d", i), fmt.Sprintf("home/p%03d", i))
+	}
+	paths = append(paths, "home/last", "team/x")
+
+	batches := browseBatches(paths, func(mount string) bool {
+		return mount == "jasp" || mount == "team"
+	})
+
+	if len(batches) != 3 {
+		t.Fatalf("batches = %d, want 3 (one shared, two private)", len(batches))
+	}
+	if len(batches[0]) != browseChunkSize+2 || batches[0][0] != "jasp/s000" {
+		t.Fatalf("shared batch = %v", batches[0])
+	}
+	if len(batches[1]) != browseChunkSize || len(batches[2]) != 2 {
+		t.Fatalf("private batches = %d + %d", len(batches[1]), len(batches[2]))
+	}
+}
+
+func TestBrowseDetailed_CancelBetweenChunksReturnsNothing(t *testing.T) {
+	entries := make([]*store.Entry, 0, browseChunkSize+1)
+	for i := range browseChunkSize + 1 {
+		entries = append(entries, &store.Entry{Path: fmt.Sprintf("home/e%03d", i), Password: "x"})
+	}
+	app, _, _, _ := gatedApp(t, aiActor(), entries...)
+	ctx, cancel := context.WithCancel(context.Background())
+	acquires := 0
+	app.teamReads.acquireAnchor = func(
+		lockCtx context.Context,
+	) (context.Context, func() error, error) {
+		acquires++
+		// Listing is acquire 1, first chunk 2: cancel inside the first
+		// chunk so the yield before the second chunk sees it.
+		if acquires == 2 {
+			cancel()
+		}
+		return lockCtx, func() error { return nil }, nil
+	}
+
+	got, err := app.BrowseDetailed(ctx, "")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if got != nil {
+		t.Fatalf("partial entries returned: %d", len(got))
+	}
+}

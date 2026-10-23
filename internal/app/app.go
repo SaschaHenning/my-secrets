@@ -607,12 +607,12 @@ func (a *App) BrowseDetailed(
 	org string,
 ) ([]*store.Entry, error) {
 	d := a.callerDetail()
-	paths, err := a.listForBrowse(ctx, d, org)
+	paths, batches, err := a.listForBrowse(ctx, d, org)
 	if err != nil {
 		a.writeAudit(ctx, audit.ActionListDetail, orgPath(org), d, audit.ResultError, err.Error())
 		return nil, err
 	}
-	entries, err := a.decryptInChunks(ctx, d, paths, "list_detail")
+	entries, err := a.decryptInChunks(ctx, d, paths, batches, "list_detail")
 	if err != nil {
 		auditContext := ctx
 		if ctx.Err() != nil {
@@ -645,45 +645,85 @@ func (a *App) listForBrowse(
 	ctx context.Context,
 	d caller.Detail,
 	org string,
-) (paths []string, resultErr error) {
+) (paths []string, batches [][]string, resultErr error) {
 	operation, err := a.beginAccessOperation(ctx, d, true, true)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() {
 		if closeErr := operation.close(ctx); closeErr != nil {
-			paths = nil
+			paths, batches = nil, nil
 			resultErr = errors.Join(resultErr, closeErr)
 		}
 	}()
-	return operation.store.List(ctx, org)
+	paths, err = operation.store.List(ctx, org)
+	if err != nil {
+		return nil, nil, err
+	}
+	return paths, browseBatches(paths, func(mount string) bool {
+		_, shared := operation.sharedRemote(mount)
+		return shared
+	}), nil
+}
+
+// browseBatches keeps every shared team-mount path in ONE batch, exactly
+// as before chunking: each batch that touches a shared mount writes a
+// signed team-audit commit and push, and that batch's finalize covers all
+// mounts even when one append fails. Only private paths are split into
+// browseChunkSize pieces.
+func browseBatches(paths []string, shared func(mount string) bool) [][]string {
+	sharedPaths := make([]string, 0)
+	private := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if shared(store.OrgOf(path)) {
+			sharedPaths = append(sharedPaths, path)
+		} else {
+			private = append(private, path)
+		}
+	}
+	batches := make([][]string, 0, len(private)/browseChunkSize+2)
+	if len(sharedPaths) > 0 {
+		batches = append(batches, sharedPaths)
+	}
+	for start := 0; start < len(private); start += browseChunkSize {
+		batches = append(batches, private[start:min(start+browseChunkSize, len(private))])
+	}
+	return batches
 }
 
 // decryptInChunks runs one complete access operation (lock, policy,
-// team-audit prepare/finalize) per chunk. A path removed between the
-// listing and its chunk fails the whole browse; callers keep their last
-// good result in that case (entriesCache).
+// team-audit prepare/finalize) per batch and returns entries in the order
+// of paths. A path removed between the listing and its batch fails the
+// whole call; entriesCache keeps its last good result in that case.
 func (a *App) decryptInChunks(
 	ctx context.Context,
 	d caller.Detail,
 	paths []string,
+	batches [][]string,
 	action string,
 ) ([]*store.Entry, error) {
-	entries := make([]*store.Entry, 0, len(paths))
-	for start := 0; start < len(paths); start += browseChunkSize {
-		if start > 0 {
+	byPath := make(map[string]*store.Entry, len(paths))
+	for i, batch := range batches {
+		if i > 0 {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(browseLockYield):
 			}
 		}
-		end := min(start+browseChunkSize, len(paths))
-		chunk, err := a.decryptChunk(ctx, d, paths[start:end], action)
+		chunk, err := a.decryptChunk(ctx, d, batch, action)
 		if err != nil {
 			return nil, err
 		}
-		entries = append(entries, chunk...)
+		for _, entry := range chunk {
+			byPath[entry.Path] = entry
+		}
+	}
+	entries := make([]*store.Entry, 0, len(byPath))
+	for _, path := range paths {
+		if entry, ok := byPath[path]; ok {
+			entries = append(entries, entry)
+		}
 	}
 	return entries, nil
 }
@@ -1336,7 +1376,7 @@ func (a *App) SearchByDomain(
 		return nil, nil, nil
 	}
 	d := a.callerDetail()
-	paths, err := a.listForBrowse(ctx, d, "")
+	paths, batches, err := a.listForBrowse(ctx, d, "")
 	if err != nil {
 		a.writeAudit(
 			ctx, audit.ActionSearch, "", d,
@@ -1344,7 +1384,7 @@ func (a *App) SearchByDomain(
 		)
 		return nil, nil, err
 	}
-	entries, err := a.decryptInChunks(ctx, d, paths, "search_domain")
+	entries, err := a.decryptInChunks(ctx, d, paths, batches, "search_domain")
 	if err != nil {
 		a.writeAudit(
 			ctx, audit.ActionSearch, "", d,
