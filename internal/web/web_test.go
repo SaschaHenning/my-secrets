@@ -1763,7 +1763,7 @@ func TestHandleEntries_ColdSlowLoadAnswersAtOnce(t *testing.T) {
 		{Path: "jasp/c", Org: "jasp", Username: "c"},
 	}
 	a, f := newFakeApp(t, "human", entries...)
-	f.GetDelay = 300 * time.Millisecond
+	f.GetDelay = 600 * time.Millisecond
 
 	port := freePort(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1797,8 +1797,8 @@ func TestHandleEntries_ColdSlowLoadAnswersAtOnce(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if took := time.Since(start); took > 600*time.Millisecond {
-		t.Errorf("login landed after %s; the cold load (900ms) must not hold the response", took)
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("login landed after %s; the cold load (1.8s) must not hold the response", took)
 	}
 	if resp.StatusCode != http.StatusOK || resp.Request.URL.Path != "/entries" {
 		t.Fatalf("landed on %s with %d, want /entries 200", resp.Request.URL.Path, resp.StatusCode)
