@@ -58,18 +58,15 @@ const idleTickInterval = 30 * time.Second
 // actually received.
 const touchIDWriteBudget = 45 * time.Second
 
-// entriesWriteBudget is how long /entries gets to decrypt and render.
-// handleEntries calls App.BrowseDetailed(ctx, ""), which decrypts EVERY
-// policy-visible entry one at a time — for a real store (as opposed to
-// the handful of fixture entries in tests), this routinely exceeds the
-// server's normal 10s WriteTimeout. Without this override the request's
-// context is cancelled mid-decrypt (surfacing as a wall of "context
-// canceled" errors from the remaining Store.Get calls) and the
-// connection is torn down before any response reaches the browser — the
-// page silently "loads nothing". 2 minutes is a generous ceiling for a
-// personal store; if this genuinely isn't enough, the fix is caching
-// decrypted metadata between loads, not raising this further.
-const entriesWriteBudget = 2 * time.Minute
+// entriesColdWait is how long a /entries request on a cold cache waits for
+// the full load before answering with the self-reloading loading page. A
+// real store takes over a minute (571 entries, ~87s); holding the request
+// that long looked like a dead login, and every repeated click cancelled
+// the decrypt again (#115). A var so tests can shrink it.
+var entriesColdWait = 2 * time.Second
+
+// errEntriesLoading means the full load is still running.
+var errEntriesLoading = errors.New("entries still loading")
 
 func init() {
 	funcs := template.FuncMap{
@@ -588,8 +585,8 @@ const entriesCacheTTL = 2 * time.Minute
 // Serving strategy is stale-while-revalidate:
 //   - cache present (fresh or stale) → returned immediately; a stale
 //     result additionally kicks off one background refresh.
-//   - cache absent (cold) → the caller blocks once on a synchronous
-//     decrypt (bounded by entriesWriteBudget).
+//   - cache absent (cold) → one background load (joining a running warm),
+//     the caller waits at most entriesColdWait for it.
 //
 // warm() pre-populates it at server startup so even that first cold load
 // is usually already done by the time the user navigates.
@@ -607,6 +604,11 @@ type entriesCache struct {
 	// push out.
 	fresh      time.Time
 	refreshing bool
+	// awaited: a page is waiting on the cold load in flight. Only then is
+	// its failure kept in loadErr for that page; a failed startup warm
+	// nobody watched is just retried by the next visit.
+	awaited bool
+	loadErr error
 	// lifetime cancels background work at shutdown, tracker lets serveWith
 	// wait for it before App.Close pulls the store and audit DB out from
 	// under a running decrypt. Both nil in tests (plain goroutines then).
@@ -649,28 +651,60 @@ func (c *entriesCache) get(ctx context.Context, a *app.App) ([]*store.Entry, err
 		c.refreshing = true
 		c.goBackground(func(ctx context.Context) { c.refresh(ctx, a) })
 	}
-	c.mu.Unlock()
-
 	if cached != nil {
+		c.mu.Unlock()
 		return cached, nil // fresh or stale — served immediately
 	}
-	// Cold cache: block this one request on a full decrypt. (A concurrent
-	// startup warm may briefly race this into a second decrypt — correct,
-	// just transiently wasteful, and only in the ~30s before the first
-	// load completes.)
-	return c.load(ctx, a)
+	// Cold. A failure a page waited for is reported once; the visit after
+	// it starts a new load instead of repeating the old error forever.
+	if err := c.loadErr; err != nil && !c.refreshing {
+		c.loadErr = nil
+		c.mu.Unlock()
+		return nil, err
+	}
+	// The server's context, never the request's: the browser drops a
+	// navigation when the user clicks again, and that used to kill the
+	// decrypt each time, so it never finished (#115).
+	if !c.refreshing {
+		c.refreshing = true
+		c.goBackground(func(ctx context.Context) { c.refresh(ctx, a) })
+	}
+	c.awaited = true
+	c.mu.Unlock()
+
+	wait, cancel := context.WithTimeout(ctx, entriesColdWait)
+	defer cancel()
+	c.waitIdle(wait)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.entries != nil:
+		return c.entries, nil
+	case !c.refreshing && c.loadErr != nil:
+		err := c.loadErr
+		c.loadErr = nil
+		return nil, err
+	default:
+		return nil, errEntriesLoading
+	}
 }
 
 // load decrypts the whole store and, on success, replaces the cache.
 func (c *entriesCache) load(ctx context.Context, a *app.App) ([]*store.Entry, error) {
 	entries, err := a.BrowseDetailed(ctx, "")
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if err != nil {
+		if c.awaited {
+			c.loadErr = err
+		}
+		c.awaited = false
 		return nil, err
 	}
-	c.mu.Lock()
 	c.entries, c.at = entries, time.Now()
 	c.fresh = c.at
-	c.mu.Unlock()
+	c.awaited, c.loadErr = false, nil
 	return entries, nil
 }
 
@@ -857,28 +891,28 @@ func handleEntries(a *app.App, cache *entriesCache) http.HandlerFunc {
 		ctx := r.Context()
 		initial := strings.TrimSpace(r.URL.Query().Get("q"))
 
-		extendWriteDeadline(w, entriesWriteBudget)
 		entries, err := cache.get(ctx, a)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Best-effort: a query error just means "last read" shows as
-		// blank for this render, not a failed page.
-		lastReads, _ := a.Audit.LastAccessByPath(ctx)
-
-		// Clock only: the date would always be today's.
-		stand := ""
-		if t := cache.freshness(); !t.IsZero() {
-			stand = t.Local().Format("15:04:05")
-		}
 		data := map[string]any{
-			"Page":      "entries",
-			"Query":     initial,
-			"Groups":    groupByOrg(entries),
-			"LastReads": lastReads,
-			"Stand":     stand,
+			"Page":  "entries",
+			"Query": initial,
+		}
+		switch {
+		case errors.Is(err, errEntriesLoading):
+			w.Header().Set("Refresh", "3")
+			data["Loading"] = true
+		case err != nil:
+			w.WriteHeader(http.StatusInternalServerError)
+			data["LoadError"] = err.Error()
+			data["Retry"] = r.URL.RequestURI()
+		default:
+			// Best-effort: a query error just means "last read" shows as
+			// blank for this render, not a failed page.
+			data["LastReads"], _ = a.Audit.LastAccessByPath(ctx)
+			data["Groups"] = groupByOrg(entries)
+			// Clock only: the date would always be today's.
+			if t := cache.freshness(); !t.IsZero() {
+				data["Stand"] = t.Local().Format("15:04:05")
+			}
 		}
 		if err := templates.ExecuteTemplate(w, "entries.html", data); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

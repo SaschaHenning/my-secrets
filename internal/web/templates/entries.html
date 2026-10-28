@@ -21,17 +21,21 @@
     <input type="search" id="search" value="{{.Query}}" placeholder="path, domain, username, tag…" aria-label="Search entries" autofocus autocomplete="off">
     <div class="bar-actions">
       {{if .Stand}}<span class="freshness" title="Zeitpunkt des letzten Ladens oder der letzten erkannten Store-Änderung">Stand {{.Stand}}</span>{{end}}
-      <form method="post" action="/entries/refresh" id="refresh-form">
+      {{if not .Loading}}<form method="post" action="/entries/refresh" id="refresh-form">
         <input type="hidden" name="q" value="{{.Query}}">
         <button type="submit" class="btn-refresh" title="Prüft den Store sofort auf Änderungen">Aktualisieren</button>
-      </form>
+      </form>{{end}}
     </div>
   </div>
   {{if .Groups}}
   <p class="kbd-hint"><kbd>/</kbd> Suche fokussieren · <kbd>↓</kbd><kbd>↑</kbd> auswählen · <kbd>Enter</kbd> Passwort kopieren · <kbd>⇧ Enter</kbd> öffnen · <kbd>⌥ Enter</kbd> Nutzername · <kbd>Esc</kbd> Suche zurücksetzen</p>
   {{end}}
 
-  {{if not .Groups}}
+  {{if .Loading}}
+    <p class="empty" role="status">Einträge werden entschlüsselt … bei einem großen Store dauert das über eine Minute. Die Seite lädt sich von selbst neu.</p>
+  {{else if .LoadError}}
+    <p class="empty" role="alert" style="color:#f87171">Laden fehlgeschlagen: {{.LoadError}} · <a href="{{.Retry}}" class="btn-link">Erneut versuchen</a></p>
+  {{else if not .Groups}}
     <p class="empty">no entries yet — run `mys add` to create your first one</p>
   {{end}}
 
