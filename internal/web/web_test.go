@@ -1748,27 +1748,22 @@ func TestServe_PWAAssetsAreServed(t *testing.T) {
 	}
 }
 
-// TestHandleEntries_SlowDecryptDoesNotHitWriteTimeout is a regression
-// test for a real-world bug found on a real store: with enough entries
-// and real decrypt latency, /entries used to take longer than the
-// server's default 10s WriteTimeout. The request's context got cancelled
-// mid-decrypt (surfacing as a wall of "context canceled" errors from the
-// remaining Store.Get calls) and the connection was torn down before any
-// response reached the browser — the page silently "loaded nothing".
-// Simulates 3 entries at 4s of decrypt latency each (12s total, past the
-// old 10s window, comfortably inside entriesWriteBudget) through a real
-// net/http server — httptest.ResponseRecorder doesn't support write
-// deadlines at all, so this can't be a table test against the handler
-// directly.
-func TestHandleEntries_SlowDecryptDoesNotHitWriteTimeout(t *testing.T) {
+// TestHandleEntries_ColdSlowLoadAnswersAtOnce is the regression test for
+// #115: the installed app starts on /entries, so a login with a cold
+// cache landed on a full-store decrypt (over a minute on a real store) and
+// looked stuck. It must answer at once with a self-reloading page, and
+// the background load must still fill the cache. Runs through a real
+// net/http server so the server's WriteTimeout is part of the test.
+func TestHandleEntries_ColdSlowLoadAnswersAtOnce(t *testing.T) {
 	withStubTouchID(t, func(context.Context) error { return nil })
+	withColdWait(t, 50*time.Millisecond)
 	entries := []*store.Entry{
 		{Path: "jasp/a", Org: "jasp", Username: "a"},
 		{Path: "jasp/b", Org: "jasp", Username: "b"},
 		{Path: "jasp/c", Org: "jasp", Username: "c"},
 	}
 	a, f := newFakeApp(t, "human", entries...)
-	f.GetDelay = 4 * time.Second
+	f.GetDelay = 600 * time.Millisecond
 
 	port := freePort(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1781,16 +1776,7 @@ func TestHandleEntries_SlowDecryptDoesNotHitWriteTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := &http.Client{
-		Timeout: 20 * time.Second,
-		Jar:     jar,
-		// Without this, the client follows the login POST's 303 redirect
-		// straight into GET /entries, running the slow decrypt path once
-		// there and again for the explicit GET below — doubling the
-		// test's cost and moving the failure (without the fix) to the
-		// login call instead of the intended assertion.
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
+	client := &http.Client{Timeout: 20 * time.Second, Jar: jar}
 
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 	deadline := time.Now().Add(3 * time.Second)
@@ -1802,26 +1788,109 @@ func TestHandleEntries_SlowDecryptDoesNotHitWriteTimeout(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 
-	loginResp, err := client.Post(base+"/login", "application/x-www-form-urlencoded", nil)
+	// The app's real entry point: login with next=/entries, following the
+	// redirect like the browser does.
+	start := time.Now()
+	resp, err := client.PostForm(base+"/login", url.Values{"next": {"/entries"}})
 	if err != nil {
 		t.Fatalf("login: %v", err)
 	}
-	loginResp.Body.Close()
-
-	resp, err := client.Get(base + "/entries")
-	if err != nil {
-		t.Fatalf("GET /entries failed, likely truncated by the server's WriteTimeout: %v", err)
-	}
-	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%q", resp.StatusCode, body)
+	resp.Body.Close()
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("login landed after %s; the cold load (1.8s) must not hold the response", took)
 	}
-	for _, want := range []string{"jasp/a", "jasp/b", "jasp/c"} {
-		if !strings.Contains(string(body), want) {
-			t.Errorf("entries page missing %q despite slow decrypts: %s", want, body)
+	if resp.StatusCode != http.StatusOK || resp.Request.URL.Path != "/entries" {
+		t.Fatalf("landed on %s with %d, want /entries 200", resp.Request.URL.Path, resp.StatusCode)
+	}
+	if got := resp.Header.Get("Refresh"); got != "3" {
+		t.Errorf("Refresh header = %q, want \"3\"", got)
+	}
+	if !strings.Contains(string(body), "werden entschlüsselt") || strings.Contains(string(body), "jasp/a") {
+		t.Errorf("want the loading page, got: %s", body)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		resp, err := client.Get(base + "/entries")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if strings.Contains(string(body), "jasp/c") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background load never filled the cache: %s", body)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestEntriesCache_CancelledRequestDoesNotStopLoad: a second login click
+// drops the first navigation. The load it started must finish anyway, or
+// a slow store never loads at all (#115).
+func TestEntriesCache_CancelledRequestDoesNotStopLoad(t *testing.T) {
+	a, f := cacheTestApp(t, &store.Entry{Path: "jasp/a", Org: "jasp"}, &store.Entry{Path: "jasp/b", Org: "jasp"})
+	f.GetDelay = 100 * time.Millisecond
+	cache := newEntriesCache()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := cache.get(ctx, a); !errors.Is(err, errEntriesLoading) {
+		t.Fatalf("cancelled cold get: err = %v, want errEntriesLoading", err)
+	}
+	waitFor(t, "load started by a cancelled request to finish", func() bool {
+		n, refreshing := cache.snapshot()
+		return n == 2 && !refreshing
+	})
+}
+
+// TestHandleEntries_LoadErrorShownOnceThenRetried: a failed load a page
+// waited for shows as an error with a retry link once; the next visit
+// loads again. A failed startup warm nobody waited for is retried
+// silently instead of being shown days later.
+func TestHandleEntries_LoadErrorShownOnceThenRetried(t *testing.T) {
+	a, f := newFakeApp(t, "human", sampleWebEntries()...)
+	cache := newEntriesCache()
+
+	f.ListErr = errors.New("store unreachable")
+	cache.warm(context.Background(), a)
+	f.ListErr = nil
+	w := httptest.NewRecorder()
+	handleEntries(a, cache)(w, httptest.NewRequest("GET", "/entries", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "jasp/github") {
+		t.Fatalf("visit after a failed warm: status %d, want 200 with entries; body=%q", w.Code, w.Body.String())
+	}
+
+	cache = newEntriesCache()
+	f.ListErr = errors.New("store unreachable")
+	w = httptest.NewRecorder()
+	handleEntries(a, cache)(w, httptest.NewRequest("GET", "/entries?q=aws", nil))
+	body := w.Body.String()
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%q", w.Code, body)
+	}
+	for _, want := range []string{"Laden fehlgeschlagen", "store unreachable", `href="/entries?q=aws"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("error page missing %q: %s", want, body)
 		}
 	}
+
+	f.ListErr = nil
+	w = httptest.NewRecorder()
+	handleEntries(a, cache)(w, httptest.NewRequest("GET", "/entries", nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "jasp/github") {
+		t.Fatalf("retry visit: status %d, want 200 with entries; body=%q", w.Code, w.Body.String())
+	}
+}
+
+func withColdWait(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := entriesColdWait
+	entriesColdWait = d
+	t.Cleanup(func() { entriesColdWait = prev })
 }
 
 // TestSWJS_NeverCaches guards the security-load-bearing constraint on the
