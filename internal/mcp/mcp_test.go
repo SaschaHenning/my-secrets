@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
@@ -211,6 +213,54 @@ func TestToolsCall_CredsList(t *testing.T) {
 	if strings.Contains(text, "private/bank") {
 		t.Errorf("policy-denied path must not appear: %q", text)
 	}
+}
+
+func TestToolsCall_CredsList_DomainTimeout(t *testing.T) {
+	req := &rpcRequest{
+		ID: json.RawMessage(`1`),
+		Params: json.RawMessage(
+			`{"name":"creds_list","arguments":{"domain":"example.com"}}`,
+		),
+	}
+
+	t.Run("deadline", func(t *testing.T) {
+		a, fakeStore := newFakeApp(t, &store.Entry{
+			Path:     "jasp/example",
+			Domain:   "example.com",
+			Password: "test-only",
+		})
+		fakeStore.GetDelay = time.Second
+
+		started := time.Now()
+		resp := handleDomainQueryWithTimeout(
+			context.Background(), a, req.ID, "example.com", nil, 20*time.Millisecond,
+		)
+		if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+			t.Fatalf("domain timeout took %s", elapsed)
+		}
+		if resp.Error == nil || resp.Error.Code != -32000 {
+			t.Fatalf("want server error -32000, got %+v", resp.Error)
+		}
+		if want := "domain search timed out after 20ms"; resp.Error.Message != want {
+			t.Fatalf("error message = %q, want %q", resp.Error.Message, want)
+		}
+	})
+
+	t.Run("ordinary backend error", func(t *testing.T) {
+		a, fakeStore := newFakeApp(t)
+		fakeStore.ListErr = errors.New("backend failed")
+
+		resp := handleDomainQueryWithTimeout(
+			context.Background(), a, req.ID, "example.com", nil, time.Second,
+		)
+		if resp.Error == nil || resp.Error.Code != -32000 {
+			t.Fatalf("want server error -32000, got %+v", resp.Error)
+		}
+		if resp.Error.Message != "backend failed" {
+			t.Fatalf("error message = %q, want backend error", resp.Error.Message)
+		}
+	})
+
 }
 
 func TestToolsCall_CredsSearch(t *testing.T) {

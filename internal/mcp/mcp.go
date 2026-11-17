@@ -17,6 +17,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 )
@@ -173,6 +174,8 @@ type toolCallParams struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
+const credsListDomainTimeout = 10 * time.Second
+
 func handleToolCall(ctx context.Context, a *app.App, req *rpcRequest) *rpcResponse {
 	var p toolCallParams
 	if err := json.Unmarshal(req.Params, &p); err != nil {
@@ -296,11 +299,29 @@ func textContent(text string) map[string]any {
 // substring + fuzzy tier with tier + hint attached so the AI caller can
 // reason about its near-miss. Passwords never appear in either list.
 func handleDomainQuery(ctx context.Context, a *app.App, id json.RawMessage, query string, includeSimilar *bool) *rpcResponse {
+	return handleDomainQueryWithTimeout(
+		ctx, a, id, query, includeSimilar, credsListDomainTimeout,
+	)
+}
+
+func handleDomainQueryWithTimeout(
+	ctx context.Context,
+	a *app.App,
+	id json.RawMessage,
+	query string,
+	includeSimilar *bool,
+	timeout time.Duration,
+) *rpcResponse {
 	wantSimilar := true
 	if includeSimilar != nil {
 		wantSimilar = *includeSimilar
 	}
-	matches, sim, err := a.SearchByDomain(ctx, query, wantSimilar)
+	searchCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	matches, sim, err := a.SearchByDomain(searchCtx, query, wantSimilar)
+	if errors.Is(searchCtx.Err(), context.DeadlineExceeded) {
+		return errorResp(id, -32000, "domain search timed out after "+timeout.String())
+	}
 	if err != nil {
 		return errorResp(id, -32000, err.Error())
 	}
