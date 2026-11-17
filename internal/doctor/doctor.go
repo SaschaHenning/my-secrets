@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/audit"
+	"github.com/SaschaHenning/my-secrets/internal/gopassutil"
 	"github.com/SaschaHenning/my-secrets/internal/policy"
 )
 
@@ -164,19 +165,11 @@ func passwordStoreDir() (string, error) {
 // which every parser that used to treat the whole stdout as data now has
 // to strip.
 func filterGopassOutput(s string) string {
-	var last string
-	for _, line := range strings.Split(s, "\n") {
-		l := strings.TrimSpace(line)
-		if l == "" {
-			continue
-		}
-		// Skip the banner — works with emoji warnings as well as plain.
-		if strings.Contains(l, "Running '") && strings.Contains(l, "' in ") {
-			continue
-		}
-		last = l
+	lines := gopassutil.StripGopassBanner(s)
+	if len(lines) == 0 {
+		return ""
 	}
-	return last
+	return lines[len(lines)-1]
 }
 
 // CheckStore — check #1: gopass store directory exists.
@@ -348,15 +341,7 @@ func CheckGitRemote(ctx context.Context) Check {
 		c.Remedy = "configure a remote with `gopass git remote add origin <url>`"
 		return c
 	}
-	// Strip the „Running '...'"-banner gopass prints before the actual
-	// git output.
-	var lines []string
-	for _, l := range trimmedLines(string(out)) {
-		if strings.Contains(l, "Running '") && strings.Contains(l, "' in ") {
-			continue
-		}
-		lines = append(lines, l)
-	}
+	lines := gopassutil.StripGopassBanner(string(out))
 	if len(lines) == 0 {
 		c.Status = StatusWarn
 		c.Message = "no git remote configured"
@@ -678,14 +663,4 @@ func gopassBinary() string {
 		return p
 	}
 	return ""
-}
-
-func trimmedLines(s string) []string {
-	out := []string{}
-	for _, line := range strings.Split(s, "\n") {
-		if t := strings.TrimSpace(line); t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
 }

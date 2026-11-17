@@ -31,6 +31,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/SaschaHenning/my-secrets/internal/gopassutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1032,23 +1033,11 @@ func currentGitBranch(ctx context.Context, r Runner, mount string) string {
 	if err != nil {
 		return ""
 	}
-	// gopass prefixes git subcommand output with a „⚠ Running '<cmd>'
-	// in <path>..." banner on stdout (same quirk handled in
-	// internal/doctor). Strip those banner lines and take the last
-	// real line as the branch name — otherwise the banner text leaks
-	// into the refspec and `git pull origin <banner>` fails with
-	// „fatal: invalid refspec".
-	var branch string
-	for _, l := range strings.Split(string(out), "\n") {
-		l = strings.TrimSpace(l)
-		if l == "" {
-			continue
-		}
-		if strings.Contains(l, "Running '") && strings.Contains(l, "' in ") {
-			continue
-		}
-		branch = l
+	lines := gopassutil.StripGopassBanner(string(out))
+	if len(lines) == 0 {
+		return ""
 	}
+	branch := lines[len(lines)-1]
 	if branch == "" || branch == "HEAD" {
 		return ""
 	}
