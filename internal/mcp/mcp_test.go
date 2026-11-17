@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 	"github.com/SaschaHenning/my-secrets/internal/audit"
@@ -259,6 +260,48 @@ func TestToolsCall_CredsSearch_MissingQuery(t *testing.T) {
 	}
 	if r.Error == nil || r.Error.Code != -32602 {
 		t.Errorf("want invalid-params, got %+v", r.Error)
+	}
+}
+
+func TestToolsCall_CredsSearch_TimesOut(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments string
+	}{
+		{name: "initial search", arguments: `{"query":"alice"}`},
+		{name: "similar search", arguments: `{"query":"github","include_similar":true}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, fakeStore := newFakeApp(t, &store.Entry{
+				Path:     "jasp/github",
+				Username: "alice",
+				Password: "test-only",
+			})
+			fakeStore.GetDelay = time.Second
+			req := &rpcRequest{
+				ID: json.RawMessage(`1`),
+				Params: json.RawMessage(
+					`{"name":"creds_search","arguments":` + tt.arguments + `}`,
+				),
+			}
+
+			started := time.Now()
+			resp := handleToolCallWithSearchTimeout(
+				context.Background(), a, req, 20*time.Millisecond,
+			)
+
+			if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+				t.Fatalf("search timeout took %s", elapsed)
+			}
+			if resp.Error == nil || resp.Error.Code != -32000 {
+				t.Fatalf("want server error -32000, got %+v", resp.Error)
+			}
+			if want := "search timed out after 20ms"; resp.Error.Message != want {
+				t.Fatalf("error message = %q, want %q", resp.Error.Message, want)
+			}
+		})
 	}
 }
 
