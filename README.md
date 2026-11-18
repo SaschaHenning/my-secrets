@@ -847,7 +847,9 @@ liest oder schreibt. Wartet ein Aufruf länger als 3 s, schreibt er
 `mys: warte auf die Sperre, gehalten von PID …` nach stderr und bricht nach
 2 Minuten mit Fehler ab. Das Limit setzt `MYS_LOCK_WAIT_TIMEOUT` (Go-Dauer,
 z. B. `5m`). Der MCP-Server bricht eine laufende Suche ab, wenn der Client sie
-per `notifications/cancelled` storniert oder die Verbindung schließt.
+per `notifications/cancelled` storniert; nach dem Schließen der Verbindung
+bekommt offene Arbeit noch 10 s. Überlappen sich Leser länger als das Limit,
+scheitern schreibende Befehle mit Fehler statt endlos zu warten.
 
 ## Projektstruktur
 

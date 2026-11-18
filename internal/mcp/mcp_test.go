@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -787,6 +788,9 @@ func TestCancelledNotificationStopsRunningSearch(t *testing.T) {
 }
 
 func TestStdioEOFCancelsRunningSearch(t *testing.T) {
+	previous := stdioEOFGrace
+	stdioEOFGrace = 200 * time.Millisecond
+	t.Cleanup(func() { stdioEOFGrace = previous })
 	a, f := slowSearchApp(t)
 	in, writer := io.Pipe()
 	var out bytes.Buffer
@@ -803,7 +807,56 @@ func TestStdioEOFCancelsRunningSearch(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("search kept decrypting after the client closed stdin")
 	}
+	if strings.Contains(out.String(), `"result"`) {
+		t.Fatalf("cancelled search returned a result: %q", out.String())
+	}
+}
+
+// A piped one-shot caller closes stdin right after writing; its quick
+// requests must still be answered (review finding on PR #125).
+func TestStdioEOFStillAnswersQueuedRequests(t *testing.T) {
+	a := newAuditOnlyApp(t)
+	var requests strings.Builder
+	for id := 1; id <= 5; id++ {
+		requests.WriteString(`{"jsonrpc":"2.0","id":` + strconv.Itoa(id) + `,"method":"ping"}` + "\n")
+	}
+	var out bytes.Buffer
+	if err := serve(context.Background(), a, strings.NewReader(requests.String()), &out, true); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("responses = %d, want 5: %q", len(lines), out.String())
+	}
+}
+
+// A cancel for a request still waiting in the queue must stop it before it
+// runs; otherwise it runs later with the lock held.
+func TestCancelForQueuedRequestSkipsIt(t *testing.T) {
+	a, f := slowSearchApp(t)
+	in, writer := io.Pipe()
+	var out bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- serve(context.Background(), a, in, &out, false) }()
+	_, _ = io.WriteString(writer, slowSearchRequest+"\n")
+	waitForDecrypt(t, f)
+	queued := strings.Replace(slowSearchRequest, `"id":7`, `"id":9`, 1)
+	_, _ = io.WriteString(writer, queued+"\n"+
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}`+"\n"+
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}`+"\n")
+	_ = writer.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued cancelled search still ran")
+	}
 	if out.Len() != 0 {
-		t.Fatalf("wrote a response to a gone client: %q", out.String())
+		t.Fatalf("cancelled requests got responses: %q", out.String())
+	}
+	if calls := f.GetCallCount(); calls > 2 {
+		t.Fatalf("decrypts = %d, the queued search must not start", calls)
 	}
 }

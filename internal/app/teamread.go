@@ -24,6 +24,8 @@ var (
 	// ErrTeamAuditUnavailable is the generic AI-facing failure for every
 	// config, mount-resolution, preflight, append, and snapshot error.
 	ErrTeamAuditUnavailable = errors.New("shared read audit unavailable")
+	// ErrAccessLockBusy is what AI callers see when the lock wait times out.
+	ErrAccessLockBusy = errors.New("access lock busy, retry later")
 )
 
 const teamAuditWarning = "warning: shared read audit unavailable; access continued because the audit is advisory\n"
@@ -256,9 +258,12 @@ func (a *App) beginAccessOperation(
 		if release != nil {
 			anchorErr = errors.Join(anchorErr, release())
 		}
-		// A lock timeout names only the holder PID, never secret data, so
-		// AI callers see it too instead of a generic audit failure.
 		if errors.Is(anchorErr, lockanchor.ErrWaitTimeout) {
+			// AI callers get a fixed text: holder PIDs and the limit would
+			// let them probe operator activity by timing.
+			if actor.Kind == caller.KindAI {
+				return nil, ErrAccessLockBusy
+			}
 			return nil, fmt.Errorf("acquire access lock anchor: %w", anchorErr)
 		}
 		if actor.Kind == caller.KindAI {

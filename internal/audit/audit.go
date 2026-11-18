@@ -133,7 +133,10 @@ func OpenWithKeyStore(path string, ks KeyStore) (*Log, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir audit dir: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
+	// busy_timeout per connection: parallel mys readers (#124) write this
+	// DB from separate processes, and SQLite otherwise fails at once with
+	// SQLITE_BUSY, which loses the audit row.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
 	if err != nil {
 		return nil, fmt.Errorf("open audit db: %w", err)
 	}

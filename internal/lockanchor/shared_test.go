@@ -1,10 +1,14 @@
+//go:build darwin || linux
+
 package lockanchor
 
 import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,6 +18,10 @@ import (
 func isolateHolders(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	dir := t.TempDir()
+	// The registry ignores directories open to group or others.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	notice := &bytes.Buffer{}
 	previousDir, previousOutput, previousDelay := holderDir, noticeOutput, waitNoticeDelay
 	holderDir = func() string { return dir }
@@ -154,6 +162,35 @@ func TestReleaseRemovesHolderRecord(t *testing.T) {
 	}
 	if got := holders(); len(got) != 0 {
 		t.Fatalf("holders after release = %v", got)
+	}
+}
+
+func TestRegistryIgnoresSharedDirectoryAndSymlinks(t *testing.T) {
+	isolateHolders(t)
+	dir := holderDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	removeOpen := registerHolder(true)
+	defer removeOpen()
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("registry wrote into a group-readable directory: %v", entries)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next := fmt.Sprintf("%d-%d", os.Getpid(), holderSeq.Load()+1)
+	if err := os.Symlink(target, filepath.Join(dir, next)); err != nil {
+		t.Fatal(err)
+	}
+	removeLinked := registerHolder(true)
+	defer removeLinked()
+	if content, _ := os.ReadFile(target); string(content) != "keep" {
+		t.Fatalf("registry followed a planted symlink: target now %q", content)
 	}
 }
 

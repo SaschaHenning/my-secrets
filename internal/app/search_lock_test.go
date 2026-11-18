@@ -2,10 +2,13 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/SaschaHenning/my-secrets/internal/caller"
 	"github.com/SaschaHenning/my-secrets/internal/lockanchor"
 	"github.com/SaschaHenning/my-secrets/internal/store"
 )
@@ -66,5 +69,24 @@ func TestGetCompletesWhileSearchDecrypts(t *testing.T) {
 	case <-searchDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("search ignored cancellation")
+	}
+}
+
+func TestLockTimeoutHidesHolderDetailsFromAI(t *testing.T) {
+	timeout := func(context.Context) (context.Context, func() error, error) {
+		return nil, nil, fmt.Errorf("%w after 2m0s (held by PID 4242)", lockanchor.ErrWaitTimeout)
+	}
+	aiApp, _, _, _ := gatedApp(t, aiActor(), &store.Entry{Path: "jasp/a"})
+	aiApp.teamReads.acquireReadAnchor = timeout
+	_, err := aiApp.Get(context.Background(), "jasp/a")
+	if !errors.Is(err, ErrAccessLockBusy) || strings.Contains(err.Error(), "4242") {
+		t.Fatalf("AI lock timeout error = %v, want ErrAccessLockBusy without PID", err)
+	}
+
+	humanApp, _, _, _ := gatedApp(t, caller.Detail{Kind: caller.KindHuman}, &store.Entry{Path: "jasp/a"})
+	humanApp.teamReads.acquireReadAnchor = timeout
+	_, err = humanApp.Get(context.Background(), "jasp/a")
+	if !errors.Is(err, lockanchor.ErrWaitTimeout) || !strings.Contains(err.Error(), "PID 4242") {
+		t.Fatalf("human lock timeout error = %v, want holder PID", err)
 	}
 }

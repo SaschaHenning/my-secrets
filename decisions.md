@@ -63,14 +63,21 @@ lohnenden Angriffsziel auf die Secrets.
 ## 2026-11-18 — Lesezugriffe teilen sich die Sperre, Warten ist begrenzt (#124)
 
 Lesende Operationen (`get`, `ls`, `search`, Browse, History) nehmen den Lock-Anker
-geteilt (`flock LOCK_SH`), schreibende (`add`, `rotate`, `rm`, Sync, Policy-Setup)
-weiter exklusiv. Damit schließt ein laufender Schreibvorgang Leser weiter aus
-(Policy und Store-Commit bleiben während eines Reads stabil), aber eine minutenlange
-Suche blockiert kein `get` mehr. Eine verschachtelte exklusive Anforderung unter
+geteilt (`flock LOCK_SH`), schreibende (`add`, `rotate`, `rm`, Sync-Push, Policy-Setup)
+weiter exklusiv. Damit schließt ein laufender Schreibvorgang aus `mys` Leser weiter aus,
+aber eine minutenlange Suche blockiert kein `get` mehr. `mys sync pull` nimmt die Sperre
+bisher gar nicht (Folge-Issue #126); bei Team-Mounts fängt der Snapshot-Abgleich des
+Team-Audits das fail-closed ab. Eine verschachtelte exklusive Anforderung unter
 einem geteilten Lease scheitert hart (`ErrSharedLeaseUpgrade`) statt still zu wachsen.
 Wer wartet, sieht nach 3 s die PID des Halters und bricht nach 2 min ab
 (`MYS_LOCK_WAIT_TIMEOUT`). Der MCP-Server bricht eine laufende Anfrage bei
-`notifications/cancelled` und beim Schließen von stdin ab.
+`notifications/cancelled` ab und gibt nach dem Schließen von stdin noch 10 s Zeit.
+Das SQLite-Audit bekommt `busy_timeout`, weil parallele Leser jetzt gleichzeitig
+schreiben und sonst Zeilen mit `SQLITE_BUSY` verlieren.
+
+Bewusst in Kauf genommen: `flock` kennt keinen Schreiber-Vorrang. Überlappen sich
+Leser länger als das Warte-Limit, scheitert `add`/`rotate` mit klarem Fehler statt
+unbegrenzt zu warten. MCP-Suchen sind auf 10 s begrenzt, daher selten.
 
 Verworfen: (a) Sperre zwischen einzelnen Entschlüsselungen freigeben — zerreißt den
 Team-Audit-Snapshot, der für die ganze Suche gilt; (b) nur ein Timeout auf die Suche —

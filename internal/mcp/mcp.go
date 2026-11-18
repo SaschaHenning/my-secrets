@@ -30,12 +30,16 @@ func Serve(ctx context.Context, a *app.App, in io.Reader, out io.Writer) error {
 	return serve(ctx, a, in, out, false)
 }
 
-// ServeStdio is Serve for a real stdio client: closing stdin is the MCP
-// shutdown signal, so it cancels in-flight work instead of letting a search
-// keep decrypting for a client that is gone.
+// ServeStdio is Serve for a real stdio client. Closing stdin is the MCP
+// shutdown signal, and a gone client cannot read a result, so work still
+// queued or running at EOF gets stdioEOFGrace to finish before it is
+// cancelled. Piped one-shot calls of quick tools still get their answers.
 func ServeStdio(ctx context.Context, a *app.App, in io.Reader, out io.Writer) error {
 	return serve(ctx, a, in, out, true)
 }
+
+// stdioEOFGrace matches the search timeout: nothing legitimate needs longer.
+var stdioEOFGrace = credsSearchTimeout
 
 func serve(
 	ctx context.Context,
@@ -48,7 +52,7 @@ func serve(
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	enc := json.NewEncoder(out)
-	var current inflight
+	current := newInflight()
 	// Reading runs beside request handling so notifications/cancelled and
 	// EOF reach a handler that is still busy.
 	queue := make(chan string, 256)
@@ -74,23 +78,24 @@ func serve(
 			}
 		}
 		if cancelOnEOF {
-			stop()
+			time.AfterFunc(stdioEOFGrace, stop)
 		}
 		readDone <- sc.Err()
 	}()
 	for line := range queue {
-		if ctx.Err() != nil {
-			break
-		}
 		var req rpcRequest
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			_ = enc.Encode(errorResp(nil, -32700, "parse error: "+err.Error()))
 			continue
 		}
-		requestCtx, serverStopped := current.begin(ctx, req.ID)
+		requestCtx, skip := current.begin(ctx, req.ID)
+		if skip {
+			continue
+		}
 		resp := handle(requestCtx, a, &req)
-		// MCP: a request the client cancelled gets no response.
-		if current.end() || serverStopped() {
+		// MCP: a request the client cancelled while it ran gets no
+		// response; one that finished first is answered normally.
+		if current.end(requestCtx.Err() != nil) {
 			continue
 		}
 		if resp != nil {
@@ -109,48 +114,71 @@ func serve(
 	return nil
 }
 
-// inflight tracks the one request being handled so the reader goroutine can
-// cancel it on notifications/cancelled.
+// maxPendingCancels bounds cancels for IDs not yet started, so a client
+// cancelling unknown IDs cannot grow the set without limit.
+const maxPendingCancels = 1024
+
+// inflight tracks the one request being handled and cancels that arrive for
+// requests still queued, so the reader goroutine can stop either.
 type inflight struct {
 	mu        sync.Mutex
 	id        string
 	stop      context.CancelFunc
 	cancelled bool
+	pending   map[string]struct{}
 }
 
+func newInflight() *inflight {
+	return &inflight{pending: make(map[string]struct{})}
+}
+
+// begin starts a request; skip is true when the client already cancelled it.
 func (f *inflight) begin(
 	ctx context.Context,
 	id json.RawMessage,
-) (context.Context, func() bool) {
-	requestCtx, stop := context.WithCancel(ctx)
+) (requestCtx context.Context, skip bool) {
+	normalized := normalizeID(id)
 	f.mu.Lock()
-	f.id = normalizeID(id)
+	defer f.mu.Unlock()
+	if _, cancelled := f.pending[normalized]; cancelled && normalized != "" {
+		delete(f.pending, normalized)
+		return nil, true
+	}
+	requestCtx, stop := context.WithCancel(ctx)
+	f.id = normalized
 	f.stop = stop
 	f.cancelled = false
-	f.mu.Unlock()
-	return requestCtx, func() bool { return ctx.Err() != nil }
+	return requestCtx, false
 }
 
-// end clears the slot and reports whether the client cancelled the request.
-func (f *inflight) end() bool {
+// end clears the slot and reports whether to drop the response: only when
+// the client cancelled and the handler ran under the cancelled context.
+func (f *inflight) end(handlerSawCancel bool) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.stop != nil {
 		f.stop()
 	}
-	cancelled := f.cancelled
+	drop := f.cancelled && handlerSawCancel
 	f.id, f.stop, f.cancelled = "", nil, false
-	return cancelled
+	return drop
 }
 
 func (f *inflight) cancel(id string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.stop == nil || id == "" || id != f.id {
+	if id == "" {
 		return
 	}
-	f.cancelled = true
-	f.stop()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stop != nil && id == f.id {
+		f.cancelled = true
+		f.stop()
+		return
+	}
+	if len(f.pending) >= maxPendingCancels {
+		f.pending = make(map[string]struct{})
+	}
+	f.pending[id] = struct{}{}
 }
 
 func normalizeID(id json.RawMessage) string {
