@@ -18,6 +18,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
@@ -57,6 +58,12 @@ func serve(
 	// EOF reach a handler that is still busy.
 	queue := make(chan string, 256)
 	readDone := make(chan error, 1)
+	var graceTimer atomic.Pointer[time.Timer]
+	defer func() {
+		if timer := graceTimer.Load(); timer != nil {
+			timer.Stop()
+		}
+	}()
 	go func() {
 		defer close(queue)
 		sc := bufio.NewScanner(in)
@@ -78,11 +85,15 @@ func serve(
 			}
 		}
 		if cancelOnEOF {
-			time.AfterFunc(stdioEOFGrace, stop)
+			graceTimer.Store(time.AfterFunc(stdioEOFGrace, stop))
 		}
 		readDone <- sc.Err()
 	}()
 	for line := range queue {
+		// After the EOF grace the client is gone: run nothing more.
+		if ctx.Err() != nil {
+			break
+		}
 		var req rpcRequest
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			_ = enc.Encode(errorResp(nil, -32700, "parse error: "+err.Error()))
@@ -175,6 +186,8 @@ func (f *inflight) cancel(id string) {
 		f.stop()
 		return
 	}
+	// Wiping on overflow can let a cancelled queued request run; only a
+	// client spamming cancels for unknown IDs gets there.
 	if len(f.pending) >= maxPendingCancels {
 		f.pending = make(map[string]struct{})
 	}

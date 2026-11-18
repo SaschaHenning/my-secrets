@@ -31,14 +31,24 @@ func registerHolder(shared bool) func() {
 	if shared {
 		mode = "shared"
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%d-%d", os.Getpid(), holderSeq.Add(1)))
-	// O_EXCL|O_NOFOLLOW: a planted symlink must not redirect the write.
-	fd, err := unix.Open(
-		path,
-		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC,
-		0o600,
-	)
-	if err != nil {
+	var path string
+	fd := -1
+	// A stale record of a reused PID can hold the name; try the next seq.
+	for attempt := 0; attempt < 4 && fd < 0; attempt++ {
+		path = filepath.Join(dir, fmt.Sprintf("%d-%d", os.Getpid(), holderSeq.Add(1)))
+		// O_EXCL|O_NOFOLLOW: a planted symlink must not redirect the write.
+		opened, err := unix.Open(
+			path,
+			unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC,
+			0o600,
+		)
+		if err == nil {
+			fd = opened
+		} else if err != unix.EEXIST {
+			return func() {}
+		}
+	}
+	if fd < 0 {
 		return func() {}
 	}
 	file := os.NewFile(uintptr(fd), path)
