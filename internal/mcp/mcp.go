@@ -17,6 +17,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 )
@@ -173,7 +174,18 @@ type toolCallParams struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
+const credsSearchTimeout = 10 * time.Second
+
 func handleToolCall(ctx context.Context, a *app.App, req *rpcRequest) *rpcResponse {
+	return handleToolCallWithSearchTimeout(ctx, a, req, credsSearchTimeout)
+}
+
+func handleToolCallWithSearchTimeout(
+	ctx context.Context,
+	a *app.App,
+	req *rpcRequest,
+	searchTimeout time.Duration,
+) *rpcResponse {
 	var p toolCallParams
 	if err := json.Unmarshal(req.Params, &p); err != nil {
 		return errorResp(req.ID, -32602, "invalid params: "+err.Error())
@@ -213,7 +225,12 @@ func handleToolCall(ctx context.Context, a *app.App, req *rpcRequest) *rpcRespon
 		if args.Query == "" {
 			return errorResp(req.ID, -32602, "query is required")
 		}
-		paths, err := a.Search(ctx, args.Query)
+		searchCtx, cancel := context.WithTimeout(ctx, searchTimeout)
+		defer cancel()
+		paths, err := a.Search(searchCtx, args.Query)
+		if errors.Is(searchCtx.Err(), context.DeadlineExceeded) {
+			return errorResp(req.ID, -32000, "search timed out after "+searchTimeout.String())
+		}
 		if err != nil {
 			return errorResp(req.ID, -32000, err.Error())
 		}
@@ -230,7 +247,11 @@ func handleToolCall(ctx context.Context, a *app.App, req *rpcRequest) *rpcRespon
 		// wantSimilar is true, otherwise it stays an empty array.
 		similar := []map[string]any{}
 		if wantSimilar {
-			if _, sim, derr := a.SearchByDomain(ctx, args.Query, true); derr == nil {
+			_, sim, derr := a.SearchByDomain(searchCtx, args.Query, true)
+			if errors.Is(searchCtx.Err(), context.DeadlineExceeded) {
+				return errorResp(req.ID, -32000, "search timed out after "+searchTimeout.String())
+			}
+			if derr == nil {
 				similar = renderSimilar(sim)
 			}
 		}
