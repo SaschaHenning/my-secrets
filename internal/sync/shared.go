@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/SaschaHenning/my-secrets/internal/gopassutil"
 	"github.com/SaschaHenning/my-secrets/internal/teamaudit"
 	"github.com/SaschaHenning/my-secrets/internal/teamkeys"
 )
@@ -805,28 +806,13 @@ func commitSharedMetadata(ctx context.Context, runner Runner, mount string, trac
 	if err != nil {
 		return fmt.Errorf("inspect staged shared team keys: %w", err)
 	}
-	if len(gopassPayloadLines(out)) == 0 {
+	if len(gopassutil.StripGopassBanner(string(out))) == 0 {
 		return nil
 	}
 	if _, err := GopassGit(ctx, runner, mount, "commit", "-m", "Update shared team keys"); err != nil {
 		return fmt.Errorf("commit shared team keys: %w", err)
 	}
 	return nil
-}
-
-func gopassPayloadLines(out []byte) []string {
-	var lines []string
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if strings.Contains(line, "Running '") && strings.Contains(line, "' in ") {
-			continue
-		}
-		lines = append(lines, line)
-	}
-	return lines
 }
 
 // SyncSharedMountWithRetry syncs one explicitly shared mount and retries
