@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -130,10 +131,23 @@ func OpenWithKeyStore(path string, ks KeyStore) (*Log, error) {
 			return nil, err
 		}
 	}
+	// The DSN below appends query parameters; a ? or # in the path would
+	// silently open a different file.
+	if strings.ContainsAny(path, "?#") {
+		return nil, fmt.Errorf("audit db path must not contain ? or #: %q", path)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir audit dir: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
+	// busy_timeout per connection: parallel mys readers (#124) write this
+	// DB from separate processes, and SQLite otherwise fails at once with
+	// SQLITE_BUSY, which loses the audit row. _txlock=immediate takes the
+	// write lock at BEGIN, so the signed path's prev_hash read cannot go
+	// stale (SQLITE_BUSY_SNAPSHOT is not retried by busy_timeout).
+	db, err := sql.Open(
+		"sqlite",
+		path+"?_pragma=busy_timeout(10000)&_txlock=immediate",
+	)
 	if err != nil {
 		return nil, fmt.Errorf("open audit db: %w", err)
 	}
@@ -221,14 +235,12 @@ func (l *Log) Write(ctx context.Context, e Entry) (int64, error) {
 		return res.LastInsertId()
 	}
 
-	// Signed path: wrap in an IMMEDIATE transaction so the prev_hash read
-	// and the INSERT are atomic with respect to concurrent writers.
+	// Signed path: the DSN's _txlock=immediate makes this an IMMEDIATE
+	// transaction, so the prev_hash read and the INSERT are atomic with
+	// respect to concurrent writers.
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("audit begin: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		// Some sqlite drivers auto-begin; ignore "cannot start a transaction within a transaction".
 	}
 	committed := false
 	defer func() {

@@ -225,8 +225,12 @@ func directoryMode(mode uint32) os.FileMode {
 	return permissions
 }
 
-func tryLock(anchor *os.File) (bool, error) {
-	err := unix.Flock(int(anchor.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+func tryLock(anchor *os.File, shared bool) (bool, error) {
+	mode := unix.LOCK_EX
+	if shared {
+		mode = unix.LOCK_SH
+	}
+	err := unix.Flock(int(anchor.Fd()), mode|unix.LOCK_NB)
 	if err == nil {
 		return true, nil
 	}

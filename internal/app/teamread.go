@@ -24,6 +24,8 @@ var (
 	// ErrTeamAuditUnavailable is the generic AI-facing failure for every
 	// config, mount-resolution, preflight, append, and snapshot error.
 	ErrTeamAuditUnavailable = errors.New("shared read audit unavailable")
+	// ErrAccessLockBusy is what AI callers see when the lock wait times out.
+	ErrAccessLockBusy = errors.New("access lock busy, retry later")
 )
 
 const teamAuditWarning = "warning: shared read audit unavailable; access continued because the audit is advisory\n"
@@ -42,9 +44,13 @@ type teamReadRuntime struct {
 	loadSyncConfig   func() (*syncpkg.Config, error)
 	loadSharedPolicy func(string) (*policy.Policy, string, error)
 	acquireAnchor    acquireAnchorContextFunc
-	openStore        func(context.Context, []string) (*accessStoreSession, error)
-	resolveMountPath func(context.Context, string) (string, error)
-	newAuditManager  func(
+	// acquireReadAnchor takes the anchor in shared mode for read-only
+	// operations so concurrent get/ls/search no longer queue behind each
+	// other. Nil falls back to acquireAnchor (exclusive).
+	acquireReadAnchor acquireAnchorContextFunc
+	openStore         func(context.Context, []string) (*accessStoreSession, error)
+	resolveMountPath  func(context.Context, string) (string, error)
+	newAuditManager   func(
 		string,
 		syncpkg.TeamAuditConfig,
 		string,
@@ -148,8 +154,9 @@ func productionTeamReadRuntimeWithBoundStore(
 			shared, _, hash, err := policy.LoadShared(mount)
 			return shared, hash, err
 		},
-		acquireAnchor:    lockanchor.AcquireContext,
-		resolveMountPath: storeDependencies.resolveMountPath,
+		acquireAnchor:     lockanchor.AcquireContext,
+		acquireReadAnchor: lockanchor.AcquireSharedContext,
+		resolveMountPath:  storeDependencies.resolveMountPath,
 		newAuditManager: func(
 			mount string,
 			auditConfig syncpkg.TeamAuditConfig,
@@ -242,10 +249,22 @@ func (a *App) beginAccessOperation(
 		return nil, ErrTeamAuditUnavailable
 	}
 
-	operationCtx, release, anchorErr := a.teamReads.acquireAnchor(ctx)
+	acquire := a.teamReads.acquireAnchor
+	if readOnly && a.teamReads.acquireReadAnchor != nil {
+		acquire = a.teamReads.acquireReadAnchor
+	}
+	operationCtx, release, anchorErr := acquire(ctx)
 	if anchorErr != nil {
 		if release != nil {
 			anchorErr = errors.Join(anchorErr, release())
+		}
+		if errors.Is(anchorErr, lockanchor.ErrWaitTimeout) {
+			// AI callers get a fixed text: holder PIDs and the limit would
+			// let them probe operator activity by timing.
+			if actor.Kind == caller.KindAI {
+				return nil, ErrAccessLockBusy
+			}
+			return nil, fmt.Errorf("acquire access lock anchor: %w", anchorErr)
 		}
 		if actor.Kind == caller.KindAI {
 			return nil, ErrTeamAuditUnavailable

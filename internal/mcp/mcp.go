@@ -17,39 +17,205 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 )
 
 // Serve blocks, reading JSON-RPC requests from in and writing responses to
-// out, until in returns io.EOF or ctx is cancelled.
+// out, until in returns io.EOF or ctx is cancelled. Requests already read
+// before EOF still run to completion.
 func Serve(ctx context.Context, a *app.App, in io.Reader, out io.Writer) error {
+	return serve(ctx, a, in, out, false)
+}
+
+// ServeStdio is Serve for a real stdio client. Closing stdin is the MCP
+// shutdown signal, and a gone client cannot read a result, so work still
+// queued or running at EOF gets stdioEOFGrace to finish before it is
+// cancelled. Piped one-shot calls of quick tools still get their answers.
+func ServeStdio(ctx context.Context, a *app.App, in io.Reader, out io.Writer) error {
+	return serve(ctx, a, in, out, true)
+}
+
+// stdioEOFGrace matches the search timeout: nothing legitimate needs longer.
+var stdioEOFGrace = credsSearchTimeout
+
+func serve(
+	ctx context.Context,
+	a *app.App,
+	in io.Reader,
+	out io.Writer,
+	cancelOnEOF bool,
+) error {
 	a.AuditMCPStart(ctx)
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	enc := json.NewEncoder(out)
-	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	current := newInflight()
+	// Reading runs beside request handling so notifications/cancelled and
+	// EOF reach a handler that is still busy.
+	queue := make(chan string, 256)
+	readDone := make(chan error, 1)
+	var graceTimer atomic.Pointer[time.Timer]
+	defer func() {
+		if timer := graceTimer.Load(); timer != nil {
+			timer.Stop()
+		}
+	}()
+	go func() {
+		defer close(queue)
+		sc := bufio.NewScanner(in)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			if id, ok := cancelledRequestID(line); ok {
+				current.cancel(id)
+				continue
+			}
+			select {
+			case queue <- line:
+			case <-ctx.Done():
+				readDone <- nil
+				return
+			}
+		}
+		if cancelOnEOF {
+			graceTimer.Store(time.AfterFunc(stdioEOFGrace, stop))
+		}
+		readDone <- sc.Err()
+	}()
+	for line := range queue {
+		// After the EOF grace the client is gone: run nothing more.
+		if ctx.Err() != nil {
+			break
 		}
 		var req rpcRequest
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			_ = enc.Encode(errorResp(nil, -32700, "parse error: "+err.Error()))
 			continue
 		}
-		resp := handle(ctx, a, &req)
+		requestCtx, skip := current.begin(ctx, req.ID)
+		if skip {
+			continue
+		}
+		resp := handle(requestCtx, a, &req)
+		// MCP: a request the client cancelled while it ran gets no
+		// response; one that finished first is answered normally.
+		if current.end(requestCtx.Err() != nil) {
+			continue
+		}
 		if resp != nil {
 			if err := enc.Encode(resp); err != nil {
 				return err
 			}
 		}
 	}
-	if err := sc.Err(); err != nil && !errors.Is(err, io.EOF) {
-		return err
+	select {
+	case err := <-readDone:
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+	default:
 	}
 	return nil
+}
+
+// maxPendingCancels bounds cancels for IDs not yet started, so a client
+// cancelling unknown IDs cannot grow the set without limit.
+const maxPendingCancels = 1024
+
+// inflight tracks the one request being handled and cancels that arrive for
+// requests still queued, so the reader goroutine can stop either.
+type inflight struct {
+	mu        sync.Mutex
+	id        string
+	stop      context.CancelFunc
+	cancelled bool
+	pending   map[string]struct{}
+}
+
+func newInflight() *inflight {
+	return &inflight{pending: make(map[string]struct{})}
+}
+
+// begin starts a request; skip is true when the client already cancelled it.
+func (f *inflight) begin(
+	ctx context.Context,
+	id json.RawMessage,
+) (requestCtx context.Context, skip bool) {
+	normalized := normalizeID(id)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, cancelled := f.pending[normalized]; cancelled && normalized != "" {
+		delete(f.pending, normalized)
+		return nil, true
+	}
+	requestCtx, stop := context.WithCancel(ctx)
+	f.id = normalized
+	f.stop = stop
+	f.cancelled = false
+	return requestCtx, false
+}
+
+// end clears the slot and reports whether to drop the response: only when
+// the client cancelled and the handler ran under the cancelled context.
+func (f *inflight) end(handlerSawCancel bool) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stop != nil {
+		f.stop()
+	}
+	drop := f.cancelled && handlerSawCancel
+	f.id, f.stop, f.cancelled = "", nil, false
+	return drop
+}
+
+func (f *inflight) cancel(id string) {
+	if id == "" {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stop != nil && id == f.id {
+		f.cancelled = true
+		f.stop()
+		return
+	}
+	// Wiping on overflow can let a cancelled queued request run; only a
+	// client spamming cancels for unknown IDs gets there.
+	if len(f.pending) >= maxPendingCancels {
+		f.pending = make(map[string]struct{})
+	}
+	f.pending[id] = struct{}{}
+}
+
+func normalizeID(id json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(id))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	return trimmed
+}
+
+// cancelledRequestID recognises an MCP notifications/cancelled message and
+// returns the request ID it names.
+func cancelledRequestID(line string) (string, bool) {
+	var note struct {
+		Method string `json:"method"`
+		Params struct {
+			RequestID json.RawMessage `json:"requestId"`
+		} `json:"params"`
+	}
+	if json.Unmarshal([]byte(line), &note) != nil ||
+		note.Method != "notifications/cancelled" {
+		return "", false
+	}
+	return normalizeID(note.Params.RequestID), true
 }
 
 type rpcRequest struct {
