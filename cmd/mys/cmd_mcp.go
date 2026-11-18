@@ -25,7 +25,7 @@ func mcpCmd() *cobra.Command {
 				return err
 			}
 			defer a.Close(ctx)
-			return mcp.Serve(ctx, a, os.Stdin, os.Stdout)
+			return mcp.ServeStdio(ctx, a, os.Stdin, os.Stdout)
 		},
 	}
 }

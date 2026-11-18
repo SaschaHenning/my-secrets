@@ -19,7 +19,7 @@ func validateLockedAnchor(_ *os.File, _ string) error {
 	)
 }
 
-func tryLock(_ *os.File) (bool, error) {
+func tryLock(_ *os.File, _ bool) (bool, error) {
 	return false, errors.New(
 		"secure cross-process locking is unsupported on this platform",
 	)

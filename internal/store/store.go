@@ -354,7 +354,9 @@ func OpenBound(
 		ctx,
 		mounts,
 		resolve,
-		lockanchor.Acquire,
+		// Shared: the session only excludes mutations. Writers hold the
+		// exclusive anchor already and pass it down as a nested lease.
+		lockanchor.AcquireShared,
 		func(ctx context.Context) (Interface, error) {
 			return open(ctx)
 		},
@@ -538,6 +540,11 @@ func (s *Store) SearchObserved(
 	allowed = make([]string, 0)
 	denied = make([]string, 0)
 	for _, p := range all {
+		// Each decrypt can take seconds under gpg-agent load; stop at once
+		// when the caller timed out or went away.
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		pathMatches := strings.Contains(strings.ToLower(p), q)
 		if allow != nil && !allow(p) {
 			// Policy denies this path. Never decrypt, and never surface it

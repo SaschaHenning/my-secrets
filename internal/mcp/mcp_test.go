@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -729,5 +730,80 @@ func TestEmptyLinesSkipped(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
 	if len(lines) != 1 {
 		t.Errorf("expected exactly one response, got %d: %v", len(lines), lines)
+	}
+}
+
+func slowSearchApp(t *testing.T) (*app.App, *fake.Store) {
+	t.Helper()
+	a, f := newFakeApp(t,
+		&store.Entry{Path: "jasp/alpha", URL: "https://alpha.test"},
+		&store.Entry{Path: "jasp/beta", URL: "https://beta.test"},
+	)
+	f.GetDelay = 30 * time.Second
+	return a, f
+}
+
+func waitForDecrypt(t *testing.T, f *fake.Store) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for f.GetCallCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("search never started decrypting")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+const slowSearchRequest = `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"creds_search","arguments":{"query":"zzz","include_similar":false}}}`
+
+func TestCancelledNotificationStopsRunningSearch(t *testing.T) {
+	a, f := slowSearchApp(t)
+	in, writer := io.Pipe()
+	var out bytes.Buffer
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() { done <- serve(context.Background(), a, in, &out, false) }()
+	_, _ = io.WriteString(writer, slowSearchRequest+"\n")
+	waitForDecrypt(t, f)
+	_, _ = io.WriteString(writer,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}`+"\n"+
+			`{"jsonrpc":"2.0","id":8,"method":"ping"}`+"\n")
+	_ = writer.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled search kept running")
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("cancellation took %s", elapsed)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 1 || !strings.Contains(lines[0], `"id":8`) {
+		t.Fatalf("responses = %q, want only the ping reply", lines)
+	}
+}
+
+func TestStdioEOFCancelsRunningSearch(t *testing.T) {
+	a, f := slowSearchApp(t)
+	in, writer := io.Pipe()
+	var out bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- serve(context.Background(), a, in, &out, true) }()
+	_, _ = io.WriteString(writer, slowSearchRequest+"\n")
+	waitForDecrypt(t, f)
+	_ = writer.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("search kept decrypting after the client closed stdin")
+	}
+	if out.Len() != 0 {
+		t.Fatalf("wrote a response to a gone client: %q", out.String())
 	}
 }

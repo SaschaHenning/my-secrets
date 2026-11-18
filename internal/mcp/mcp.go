@@ -17,39 +17,164 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/SaschaHenning/my-secrets/internal/app"
 )
 
 // Serve blocks, reading JSON-RPC requests from in and writing responses to
-// out, until in returns io.EOF or ctx is cancelled.
+// out, until in returns io.EOF or ctx is cancelled. Requests already read
+// before EOF still run to completion.
 func Serve(ctx context.Context, a *app.App, in io.Reader, out io.Writer) error {
+	return serve(ctx, a, in, out, false)
+}
+
+// ServeStdio is Serve for a real stdio client: closing stdin is the MCP
+// shutdown signal, so it cancels in-flight work instead of letting a search
+// keep decrypting for a client that is gone.
+func ServeStdio(ctx context.Context, a *app.App, in io.Reader, out io.Writer) error {
+	return serve(ctx, a, in, out, true)
+}
+
+func serve(
+	ctx context.Context,
+	a *app.App,
+	in io.Reader,
+	out io.Writer,
+	cancelOnEOF bool,
+) error {
 	a.AuditMCPStart(ctx)
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	enc := json.NewEncoder(out)
-	sc := bufio.NewScanner(in)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	var current inflight
+	// Reading runs beside request handling so notifications/cancelled and
+	// EOF reach a handler that is still busy.
+	queue := make(chan string, 256)
+	readDone := make(chan error, 1)
+	go func() {
+		defer close(queue)
+		sc := bufio.NewScanner(in)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			if id, ok := cancelledRequestID(line); ok {
+				current.cancel(id)
+				continue
+			}
+			select {
+			case queue <- line:
+			case <-ctx.Done():
+				readDone <- nil
+				return
+			}
+		}
+		if cancelOnEOF {
+			stop()
+		}
+		readDone <- sc.Err()
+	}()
+	for line := range queue {
+		if ctx.Err() != nil {
+			break
 		}
 		var req rpcRequest
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			_ = enc.Encode(errorResp(nil, -32700, "parse error: "+err.Error()))
 			continue
 		}
-		resp := handle(ctx, a, &req)
+		requestCtx, serverStopped := current.begin(ctx, req.ID)
+		resp := handle(requestCtx, a, &req)
+		// MCP: a request the client cancelled gets no response.
+		if current.end() || serverStopped() {
+			continue
+		}
 		if resp != nil {
 			if err := enc.Encode(resp); err != nil {
 				return err
 			}
 		}
 	}
-	if err := sc.Err(); err != nil && !errors.Is(err, io.EOF) {
-		return err
+	select {
+	case err := <-readDone:
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+	default:
 	}
 	return nil
+}
+
+// inflight tracks the one request being handled so the reader goroutine can
+// cancel it on notifications/cancelled.
+type inflight struct {
+	mu        sync.Mutex
+	id        string
+	stop      context.CancelFunc
+	cancelled bool
+}
+
+func (f *inflight) begin(
+	ctx context.Context,
+	id json.RawMessage,
+) (context.Context, func() bool) {
+	requestCtx, stop := context.WithCancel(ctx)
+	f.mu.Lock()
+	f.id = normalizeID(id)
+	f.stop = stop
+	f.cancelled = false
+	f.mu.Unlock()
+	return requestCtx, func() bool { return ctx.Err() != nil }
+}
+
+// end clears the slot and reports whether the client cancelled the request.
+func (f *inflight) end() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stop != nil {
+		f.stop()
+	}
+	cancelled := f.cancelled
+	f.id, f.stop, f.cancelled = "", nil, false
+	return cancelled
+}
+
+func (f *inflight) cancel(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stop == nil || id == "" || id != f.id {
+		return
+	}
+	f.cancelled = true
+	f.stop()
+}
+
+func normalizeID(id json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(id))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	return trimmed
+}
+
+// cancelledRequestID recognises an MCP notifications/cancelled message and
+// returns the request ID it names.
+func cancelledRequestID(line string) (string, bool) {
+	var note struct {
+		Method string `json:"method"`
+		Params struct {
+			RequestID json.RawMessage `json:"requestId"`
+		} `json:"params"`
+	}
+	if json.Unmarshal([]byte(line), &note) != nil ||
+		note.Method != "notifications/cancelled" {
+		return "", false
+	}
+	return normalizeID(note.Params.RequestID), true
 }
 
 type rpcRequest struct {

@@ -16,9 +16,21 @@ type leaseContextKey struct{}
 type leaseState struct {
 	mu     sync.Mutex
 	active bool
+	shared bool
 	nested int
 	ready  *sync.Cond
 }
+
+// ErrSharedLeaseUpgrade reports a nested exclusive request under a shared
+// lease. Upgrading in place would deadlock against the process's own shared
+// flock, and silently granting it would let a mutation run beside readers.
+var ErrSharedLeaseUpgrade = errors.New(
+	"cannot take the exclusive lock inside a shared read lease",
+)
+
+// ErrWaitTimeout reports that another mys process kept the lock longer than
+// the bounded wait allows.
+var ErrWaitTimeout = errors.New("timed out waiting for the mys lock")
 
 type metadata struct {
 	anchorUID        int
@@ -44,11 +56,35 @@ func Acquire(ctx context.Context) (func() error, error) {
 	return release, err
 }
 
+// AcquireShared takes the anchor in shared mode: shared holders run beside
+// each other, exclusive holders exclude them. Read-only operations use it so
+// a long search no longer blocks every get.
+func AcquireShared(ctx context.Context) (func() error, error) {
+	_, release, err := AcquireSharedContext(ctx)
+	return release, err
+}
+
+// AcquireSharedContext is AcquireShared plus the capability context. A
+// nested shared request reuses any active lease; a nested exclusive request
+// under a shared lease fails with ErrSharedLeaseUpgrade.
+func AcquireSharedContext(
+	ctx context.Context,
+) (context.Context, func() error, error) {
+	return acquire(ctx, true)
+}
+
 // AcquireContext is Acquire plus an explicit capability context. Passing the
 // returned context to a nested Acquire call reuses this one active lease. A
 // caller without that exact context still waits for the kernel lock.
 func AcquireContext(
 	ctx context.Context,
+) (context.Context, func() error, error) {
+	return acquire(ctx, false)
+}
+
+func acquire(
+	ctx context.Context,
+	shared bool,
 ) (context.Context, func() error, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -57,7 +93,11 @@ func AcquireContext(
 		return nil, nil, waitError(err)
 	}
 	if inherited := leaseFromContext(ctx); inherited != nil {
-		if nestedRelease, acquired := inherited.acquireNested(); acquired {
+		nestedRelease, acquired, err := inherited.acquireNested(shared)
+		if err != nil {
+			return nil, nil, err
+		}
+		if acquired {
 			return ctx, nestedRelease, nil
 		}
 	}
@@ -67,10 +107,15 @@ func AcquireContext(
 		return nil, nil, fmt.Errorf("open stable lock anchor: %w", err)
 	}
 
+	waitLimit := waitTimeout()
+	deadline := time.NewTimer(waitLimit)
+	defer deadline.Stop()
+	notice := time.NewTimer(waitNoticeDelay)
+	defer notice.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		acquired, lockErr := tryLock(anchor)
+		acquired, lockErr := tryLock(anchor, shared)
 		if lockErr != nil {
 			return nil, nil, errors.Join(
 				fmt.Errorf("acquire stable lock anchor: %w", lockErr),
@@ -84,13 +129,14 @@ func AcquireContext(
 					closeLockedAnchor(anchor),
 				)
 			}
-			lease := newLeaseState()
+			lease := newLeaseState(shared)
 			lockedContext := context.WithValue(
 				ctx,
 				leaseContextKey{},
 				lease,
 			)
-			return lockedContext, releaseOnce(anchor, lease), nil
+			removeHolder := registerHolder(shared)
+			return lockedContext, releaseOnce(anchor, lease, removeHolder), nil
 		}
 		select {
 		case <-ctx.Done():
@@ -98,6 +144,18 @@ func AcquireContext(
 				waitError(ctx.Err()),
 				anchor.Close(),
 			)
+		case <-deadline.C:
+			return nil, nil, errors.Join(
+				fmt.Errorf(
+					"%w after %s (%s)",
+					ErrWaitTimeout,
+					waitLimit,
+					describeHolders(),
+				),
+				anchor.Close(),
+			)
+		case <-notice.C:
+			printWaitNotice()
 		case <-ticker.C:
 		}
 	}
@@ -111,20 +169,24 @@ func leaseFromContext(ctx context.Context) *leaseState {
 	return lease
 }
 
-func newLeaseState() *leaseState {
-	lease := &leaseState{active: true}
+func newLeaseState(shared bool) *leaseState {
+	lease := &leaseState{active: true, shared: shared}
 	lease.ready = sync.NewCond(&lease.mu)
 	return lease
 }
 
-func (lease *leaseState) acquireNested() (func() error, bool) {
+func (lease *leaseState) acquireNested(shared bool) (func() error, bool, error) {
 	if lease == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	lease.mu.Lock()
 	if !lease.active {
 		lease.mu.Unlock()
-		return nil, false
+		return nil, false, nil
+	}
+	if lease.shared && !shared {
+		lease.mu.Unlock()
+		return nil, false, ErrSharedLeaseUpgrade
 	}
 	lease.nested++
 	lease.mu.Unlock()
@@ -140,7 +202,7 @@ func (lease *leaseState) acquireNested() (func() error, bool) {
 			lease.mu.Unlock()
 		})
 		return nil
-	}, true
+	}, true, nil
 }
 
 func (lease *leaseState) deactivateAndWait() {
@@ -209,12 +271,17 @@ func waitError(err error) error {
 	return fmt.Errorf("wait for stable lock anchor: %w", err)
 }
 
-func releaseOnce(anchor *os.File, lease *leaseState) func() error {
+func releaseOnce(
+	anchor *os.File,
+	lease *leaseState,
+	removeHolder func(),
+) func() error {
 	var once sync.Once
 	var releaseErr error
 	return func() error {
 		once.Do(func() {
 			lease.deactivateAndWait()
+			removeHolder()
 			releaseErr = closeLockedAnchor(anchor)
 		})
 		return releaseErr

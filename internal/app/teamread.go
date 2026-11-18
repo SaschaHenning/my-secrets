@@ -42,9 +42,13 @@ type teamReadRuntime struct {
 	loadSyncConfig   func() (*syncpkg.Config, error)
 	loadSharedPolicy func(string) (*policy.Policy, string, error)
 	acquireAnchor    acquireAnchorContextFunc
-	openStore        func(context.Context, []string) (*accessStoreSession, error)
-	resolveMountPath func(context.Context, string) (string, error)
-	newAuditManager  func(
+	// acquireReadAnchor takes the anchor in shared mode for read-only
+	// operations so concurrent get/ls/search no longer queue behind each
+	// other. Nil falls back to acquireAnchor (exclusive).
+	acquireReadAnchor acquireAnchorContextFunc
+	openStore         func(context.Context, []string) (*accessStoreSession, error)
+	resolveMountPath  func(context.Context, string) (string, error)
+	newAuditManager   func(
 		string,
 		syncpkg.TeamAuditConfig,
 		string,
@@ -148,8 +152,9 @@ func productionTeamReadRuntimeWithBoundStore(
 			shared, _, hash, err := policy.LoadShared(mount)
 			return shared, hash, err
 		},
-		acquireAnchor:    lockanchor.AcquireContext,
-		resolveMountPath: storeDependencies.resolveMountPath,
+		acquireAnchor:     lockanchor.AcquireContext,
+		acquireReadAnchor: lockanchor.AcquireSharedContext,
+		resolveMountPath:  storeDependencies.resolveMountPath,
 		newAuditManager: func(
 			mount string,
 			auditConfig syncpkg.TeamAuditConfig,
@@ -242,10 +247,19 @@ func (a *App) beginAccessOperation(
 		return nil, ErrTeamAuditUnavailable
 	}
 
-	operationCtx, release, anchorErr := a.teamReads.acquireAnchor(ctx)
+	acquire := a.teamReads.acquireAnchor
+	if readOnly && a.teamReads.acquireReadAnchor != nil {
+		acquire = a.teamReads.acquireReadAnchor
+	}
+	operationCtx, release, anchorErr := acquire(ctx)
 	if anchorErr != nil {
 		if release != nil {
 			anchorErr = errors.Join(anchorErr, release())
+		}
+		// A lock timeout names only the holder PID, never secret data, so
+		// AI callers see it too instead of a generic audit failure.
+		if errors.Is(anchorErr, lockanchor.ErrWaitTimeout) {
+			return nil, fmt.Errorf("acquire access lock anchor: %w", anchorErr)
 		}
 		if actor.Kind == caller.KindAI {
 			return nil, ErrTeamAuditUnavailable

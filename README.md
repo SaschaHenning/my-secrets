@@ -839,6 +839,16 @@ Gültige „aus"-Werte für `MYS_AUTO_SYNC`: `0`, `false`, `off`, `no`
 (case-insensitive). Alles andere (einschließlich „unset") bedeutet
 eingeschaltet.
 
+## Parallele Aufrufe und Sperre
+
+Lesende Befehle (`get`, `ls`, `search`, Web-UI, MCP) laufen nebeneinander;
+schreibende (`add`, `rotate`, `rm`, Sync) warten, bis kein anderer `mys`-Prozess
+liest oder schreibt. Wartet ein Aufruf länger als 3 s, schreibt er
+`mys: warte auf die Sperre, gehalten von PID …` nach stderr und bricht nach
+2 Minuten mit Fehler ab. Das Limit setzt `MYS_LOCK_WAIT_TIMEOUT` (Go-Dauer,
+z. B. `5m`). Der MCP-Server bricht eine laufende Suche ab, wenn der Client sie
+per `notifications/cancelled` storniert oder die Verbindung schließt.
+
 ## Projektstruktur
 
 ```
