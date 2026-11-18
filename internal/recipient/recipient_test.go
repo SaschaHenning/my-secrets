@@ -227,6 +227,16 @@ type stubResp struct {
 	err error
 }
 
+type nonInteractiveGopassRunner struct{}
+
+func (nonInteractiveGopassRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if name == "gopass" {
+		// gopass confirms recipient changes even when a fingerprint is supplied.
+		args = append([]string{"--yes"}, args...)
+	}
+	return execRunner{}.Run(ctx, name, args...)
+}
+
 func (s *stubRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	key := name + " " + strings.Join(args, " ")
 	s.calls = append(s.calls, key)
@@ -966,6 +976,10 @@ func TestIntegration_ImportAndAdd(t *testing.T) {
 	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "data"))
+	t.Setenv("GIT_AUTHOR_NAME", "my-secrets test")
+	t.Setenv("GIT_AUTHOR_EMAIL", "test@mys.local")
+	t.Setenv("GIT_COMMITTER_NAME", "my-secrets test")
+	t.Setenv("GIT_COMMITTER_EMAIL", "test@mys.local")
 	// An inherited GOPASS_CONFIG/GOPASS_HOMEDIR beats HOME and XDG_*.
 	for _, k := range []string{"GOPASS_CONFIG", "GOPASS_HOMEDIR"} {
 		t.Setenv(k, "")
@@ -1014,6 +1028,8 @@ Expire-Date: 1y
 	if outb, err := initCmd.CombinedOutput(); err != nil {
 		t.Skipf("gopass init failed: %v\n%s", err, outb)
 	}
+	restore := WithRunner(nonInteractiveGopassRunner{})
+	t.Cleanup(restore)
 
 	// 3. Generate a SECOND key, export it, and run Import+Add.
 	batch2File := filepath.Join(root, "keygen2")
